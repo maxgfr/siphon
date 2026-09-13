@@ -630,3 +630,22 @@ footer.legal p { margin: 0 0 7px; }
   font-weight: 700;
   text-decoration: none;
 }
+
+/* ------------------------------------------------------------- playlists */
+
+.playlist-choice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
+}
+.playlist-choice .seg span { padding: 6px 12px; }
+.playlist-note {
+  width: 100%;
+  margin: 0;
+  font: 500 11.5px/1.4 var(--mono);
+  color: var(--muted);
+}

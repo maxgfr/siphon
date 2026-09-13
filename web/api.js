@@ -109,8 +109,11 @@ export class ServerBackend {
     return this.#json('/api/probe', { method: 'POST', body: JSON.stringify({ url }) });
   }
 
-  async start(url, preset) {
-    const job = await this.#json('/api/jobs', { method: 'POST', body: JSON.stringify({ url, preset }) });
+  async start(url, preset, { playlist = false } = {}) {
+    const job = await this.#json('/api/jobs', {
+      method: 'POST',
+      body: JSON.stringify({ url, preset, playlist }),
+    });
     return { kind: 'job', id: job.id };
   }
 
@@ -209,7 +212,7 @@ export class PublicBackend {
     return null; // cobalt returns no metadata before the download
   }
 
-  async start(url, preset) {
+  async start(url, preset, _options = {}) {
     if (!this.base) {
       throw new BackendError('No instance set.', { hint: 'Open settings and add one.', retryable: false });
     }

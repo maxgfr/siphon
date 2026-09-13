@@ -34,6 +34,7 @@ let probeToken = 0;
 let activeJob = null;
 let pollTimer = null;
 let lastProbe = null;
+let wantPlaylist = false;
 const recent = [];
 
 /* ---------------------------------------------------------------- settings */
@@ -146,7 +147,10 @@ function renderPreview(info, { loading = false } = {}) {
     host.innerHTML = '';
     return;
   }
-  const meta = [info.uploader, formatDuration(info.duration), info.extractor].filter(Boolean).join(' · ');
+  const meta = info.isPlaylist
+    ? [info.uploader, `${info.count} videos`].filter(Boolean).join(' · ')
+    : [info.uploader, formatDuration(info.duration), info.extractor].filter(Boolean).join(' · ');
+
   host.hidden = false;
   host.className = 'preview';
   host.innerHTML =
@@ -156,7 +160,49 @@ function renderPreview(info, { loading = false } = {}) {
     '<div class="preview-body">' +
     `<p class="preview-title">${escapeHtml(info.title || 'Untitled')}</p>` +
     (meta ? `<p class="preview-meta">${escapeHtml(meta)}</p>` : '') +
+    (info.isPlaylist ? playlistChoiceHtml(info) : '') +
     '</div>';
+
+  if (info.isPlaylist) {
+    for (const input of host.querySelectorAll('input[name="scope"]')) {
+      input.addEventListener('change', (event) => {
+        wantPlaylist = event.target.value === 'all';
+        renderPlaylistNote(info);
+      });
+    }
+    renderPlaylistNote(info);
+  }
+}
+
+/**
+ * A link can be a video *inside* a playlist, so taking the whole thing is
+ * offered, never assumed — the surprise of fifty downloads is worse than the
+ * mild annoyance of one extra tap.
+ */
+function playlistChoiceHtml(info) {
+  const capped = Math.min(info.count, info.limit);
+  return (
+    '<div class="playlist-choice">' +
+    '<div class="seg" role="radiogroup" aria-label="How much of this playlist">' +
+    `<label><input type="radio" name="scope" value="one" ${wantPlaylist ? '' : 'checked'} /><span>This one</span></label>` +
+    `<label><input type="radio" name="scope" value="all" ${wantPlaylist ? 'checked' : ''} /><span>All ${capped}</span></label>` +
+    '</div>' +
+    '<p class="playlist-note" id="playlistNote"></p>' +
+    '</div>'
+  );
+}
+
+function renderPlaylistNote(info) {
+  const note = $('playlistNote');
+  if (!note) return;
+  if (!wantPlaylist) {
+    note.textContent = 'Only the video this link points at.';
+    return;
+  }
+  note.textContent =
+    info.count > info.limit
+      ? `Capped at ${info.limit} of ${info.count} — arrives as one .zip`
+      : `${info.count} files, arriving as one .zip`;
 }
 
 function renderFeedback(html = '') {
@@ -205,6 +251,7 @@ const STAGE_TEXT = {
   // A bar that silently jumps back to zero reads as a bug. Naming the reason
   // turns the same event into the app visibly working around YouTube.
   retrying: 'YouTube asked for a login — trying another client',
+  packing: 'Packing the zip…',
   downloading: 'Downloading',
   processing: 'Converting…',
   ready: 'Ready',
@@ -218,6 +265,11 @@ function renderProgress(job) {
   if (!stage || !fill) return;
 
   stage.textContent = STAGE_TEXT[job.stage] || 'Working…';
+  // On a playlist the percentage restarts per item, so the item counter is the
+  // only number that actually moves forward.
+  if (job.isPlaylist && job.itemsTotal) {
+    stage.textContent = `${STAGE_TEXT[job.stage] || 'Working…'} ${job.itemsDone || 1}/${job.itemsTotal}`;
+  }
 
   // A percentage is only shown while it means something. During conversion
   // yt-dlp has no total to report, so the bar goes indeterminate rather than
@@ -313,6 +365,7 @@ function scheduleProbe() {
 
 async function runProbe(url) {
   const token = ++probeToken;
+  wantPlaylist = false;
   renderPreview(null, { loading: true });
   try {
     const info = await backend.probe(url);
@@ -346,7 +399,7 @@ async function startDownload() {
   renderAction();
 
   try {
-    const started = await backend.start(url, settings.preset);
+    const started = await backend.start(url, settings.preset, { playlist: wantPlaylist });
 
     if (started.kind === 'direct') {
       // Public instances stream the file themselves: hand it to the browser and

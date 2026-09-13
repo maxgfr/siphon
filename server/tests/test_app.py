@@ -402,3 +402,97 @@ class TestCookies:
         TestClient(server_app.app).post("/api/cookies", json={"cookies": NETSCAPE_JAR})
         message = server_app.humanize_error(Exception("ERROR: Sign in to confirm you're not a bot"))
         assert "expired" in message.lower()
+
+
+# ---------------------------------------------------------------- playlists
+
+class TestPlaylists:
+    @staticmethod
+    def _job(**kwargs) -> "server_app.Job":
+        return server_app.Job(id="j1", url="https://example.com/list", preset="video_720", **kwargs)
+
+    def test_a_single_video_stays_a_single_video(self) -> None:
+        """
+        A watch link can carry a &list=, so taking the playlist must be an
+        explicit request — never inferred from the URL.
+        """
+        options = server_app.build_options(self._job(), None)
+        assert options["noplaylist"] is True
+        assert "playlistend" not in options
+
+    def test_asking_for_the_playlist_lifts_the_restriction(self) -> None:
+        options = server_app.build_options(self._job(is_playlist=True), None)
+        assert options["noplaylist"] is False
+        assert options["playlistend"] == server_app.PLAYLIST_LIMIT
+
+    def test_one_dead_video_does_not_abandon_the_rest(self) -> None:
+        assert server_app.build_options(self._job(is_playlist=True), None)["ignoreerrors"] is True
+        # But a single download should still fail loudly rather than silently.
+        assert server_app.build_options(self._job(), None).get("ignoreerrors") is not True
+
+    def test_playlist_files_are_numbered(self) -> None:
+        """Track order is only recoverable from the filenames."""
+        assert "%(playlist_index)03d" in server_app.outtmpl_for(self._job(is_playlist=True))
+        assert "playlist_index" not in server_app.outtmpl_for(self._job())
+
+    def test_titles_are_truncated_on_bytes_not_characters(self) -> None:
+        # A CJK title of 150 characters is 450 bytes, well past the 255-byte
+        # limit most filesystems enforce.
+        for template in (server_app.outtmpl_for(self._job()), server_app.outtmpl_for(self._job(is_playlist=True))):
+            assert "B]" in template.replace(")s", "]").replace("(", "[") or "B" in template
+            assert ".150B" in template or ".120B" in template
+
+
+class TestMediaCollection:
+    def test_only_media_is_collected(self, tmp_path) -> None:
+        """
+        Leftovers must not be mistaken for the download. A stray thumbnail in
+        the archive is noise; a stray thumbnail picked as *the* file is a bug.
+        """
+        for name in ("001 - a.mp4", "002 - b.mp4", "a.webp", "a.en.vtt", "a.info.json"):
+            (tmp_path / name).write_bytes(b"x")
+        found = [p.name for p in server_app.media_files(tmp_path)]
+        assert found == ["001 - a.mp4", "002 - b.mp4"]
+
+    def test_collection_is_ordered(self, tmp_path) -> None:
+        """Numbered names must come back in playlist order, not disk order."""
+        for name in ("003 - c.mp3", "001 - a.mp3", "002 - b.mp3"):
+            (tmp_path / name).write_bytes(b"x")
+        assert [p.name for p in server_app.media_files(tmp_path)] == [
+            "001 - a.mp3",
+            "002 - b.mp3",
+            "003 - c.mp3",
+        ]
+
+
+# ------------------------------------------------------------------- audio
+
+class TestAudioTagging:
+    """
+    An untagged file lands in a music library as "Unknown Artist" with a blank
+    cover — the difference between a download you keep and one you redo by hand.
+    """
+
+    @pytest.mark.parametrize("preset", ["audio_mp3", "audio_m4a"])
+    def test_audio_is_tagged_and_given_a_cover(self, preset: str) -> None:
+        opts = server_app.PRESETS[preset]["opts"]
+        keys = [pp["key"] for pp in opts["postprocessors"]]
+        assert "FFmpegMetadata" in keys
+        assert "EmbedThumbnail" in keys
+        # EmbedThumbnail needs the image on disk to attach.
+        assert opts["writethumbnail"] is True
+
+    @pytest.mark.parametrize("preset", ["audio_mp3", "audio_m4a"])
+    def test_the_postprocessor_order_is_the_one_that_works(self, preset: str) -> None:
+        """
+        Extract, then tag, then attach the cover. Embedding before the extract
+        would attach to the container that is about to be thrown away.
+        """
+        keys = [pp["key"] for pp in server_app.PRESETS[preset]["opts"]["postprocessors"]]
+        assert keys.index("FFmpegExtractAudio") < keys.index("FFmpegMetadata")
+        assert keys.index("FFmpegMetadata") < keys.index("EmbedThumbnail")
+
+    @pytest.mark.parametrize("preset", ["video_best", "video_1080", "video_720", "video_480"])
+    def test_video_keeps_its_metadata_and_chapters(self, preset: str) -> None:
+        pps = server_app.PRESETS[preset]["opts"]["postprocessors"]
+        assert any(pp["key"] == "FFmpegMetadata" and pp.get("add_chapters") for pp in pps)

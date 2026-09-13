@@ -209,6 +209,30 @@ your Pages URL so it stops accepting requests from anywhere:
 ALLOWED_ORIGINS=https://maxgfr.github.io docker compose up -d
 ```
 
+## Playlists and albums
+
+Paste a playlist, a channel or an album and siphon offers to take the lot. It is
+offered, never assumed: a `watch?v=…&list=…` link is a video that happens to sit
+in a playlist, so **This one** stays the default and **All 40** is one tap away.
+
+Everything arrives as a single `.zip`, because a browser can only be handed one
+file. Inside, tracks are numbered in playlist order — that ordering exists
+nowhere else once the files are on your disk. The archive is stored rather than
+deflated: media is already compressed, so deflating it would burn CPU over a
+whole playlist to save nothing.
+
+A dead video in the middle does not abandon the other thirty-nine, and
+`PLAYLIST_LIMIT` (50 by default) stops one paste turning into hours of disk.
+When a playlist is longer than the cap, the interface says so before you start
+rather than quietly delivering less than it promised.
+
+## Tagged audio, not just converted audio
+
+MP3 and M4A downloads carry their title, artist, date and cover art. An untagged
+file lands in a music library as "Unknown Artist" with a blank square, which is
+the difference between a download you keep and one you redo by hand. Video keeps
+its metadata and chapter marks too.
+
 ## Making YouTube work
 
 YouTube turns anonymous downloads away with *"Sign in to confirm you're not a
@@ -290,6 +314,7 @@ All server-side, all environment variables:
 | `ALLOW_PRIVATE_HOSTS` | off | Lets the server fetch from private/LAN addresses. Off by default — see below. |
 | `COOKIES_FILE` | inside `DOWNLOAD_DIR` | Where the uploaded YouTube session is kept. Put it on a volume so it survives a restart. |
 | `POT_PROVIDER_URL` | *(unset)* | Address of a proof-of-origin provider, e.g. `http://potoken:4416`. Unset means the plugin stays inert. |
+| `PLAYLIST_LIMIT` | `50` | Most items one playlist download will fetch. |
 | `PORT` | `8000` | Listen port. |
 
 ### Security

@@ -24,6 +24,7 @@ import shutil
 import socket
 import tempfile
 import threading
+import zipfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -60,6 +61,11 @@ COOKIES_FILE = Path(os.environ.get("COOKIES_FILE", "")) if os.environ.get("COOKI
 # offers it to the plugin; when unset, nothing changes.
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "").strip().rstrip("/")
 
+# A playlist is the one input that can turn a tap into hours of disk and
+# bandwidth, so it is capped rather than trusted. Raise it if you know what you
+# are asking for.
+PLAYLIST_LIMIT = int(os.environ.get("PLAYLIST_LIMIT", "50"))
+
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "3"))
 JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", str(60 * 60)))
 # Opt-in escape hatch for the one legitimate private-address case: pulling from
@@ -91,7 +97,11 @@ PRESETS: dict[str, dict[str, Any]] = {
     "video_best": {
         "label": "Best quality",
         "kind": "video",
-        "opts": {"format": "bv*+ba/b", "merge_output_format": "mp4"},
+        "opts": {
+            "format": "bv*+ba/b",
+            "merge_output_format": "mp4",
+            "postprocessors": [{"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True}],
+        },
     },
     "video_1080": {
         "label": "1080p",
@@ -99,6 +109,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "opts": {
             "format": "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b",
             "merge_output_format": "mp4",
+            "postprocessors": [{"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True}],
         },
     },
     "video_720": {
@@ -107,6 +118,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "opts": {
             "format": "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
             "merge_output_format": "mp4",
+            "postprocessors": [{"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True}],
         },
     },
     "video_480": {
@@ -115,15 +127,23 @@ PRESETS: dict[str, dict[str, Any]] = {
         "opts": {
             "format": "bv*[height<=480]+ba/b[height<=480]/bv*+ba/b",
             "merge_output_format": "mp4",
+            "postprocessors": [{"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True}],
         },
     },
+    # Audio gets tagged, not just converted. An untagged file lands in a music
+    # library as "Unknown Artist" with a blank cover, which is the difference
+    # between a download you keep and one you re-do by hand. Order matters:
+    # extract first, then write tags, then attach the cover to the tagged file.
     "audio_mp3": {
         "label": "MP3",
         "kind": "audio",
         "opts": {
             "format": "ba/b",
+            "writethumbnail": True,
             "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"},
+                {"key": "FFmpegMetadata", "add_metadata": True},
+                {"key": "EmbedThumbnail", "already_have_thumbnail": False},
             ],
         },
     },
@@ -132,8 +152,11 @@ PRESETS: dict[str, dict[str, Any]] = {
         "kind": "audio",
         "opts": {
             "format": "ba[ext=m4a]/ba/b",
+            "writethumbnail": True,
             "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "0"}
+                {"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "0"},
+                {"key": "FFmpegMetadata", "add_metadata": True},
+                {"key": "EmbedThumbnail", "already_have_thumbnail": False},
             ],
         },
     },
@@ -271,6 +294,11 @@ class Job:
     # far less alarming than a progress bar that silently restarts.
     client: str | None = None
     attempts: int = 0
+    # Playlists: which item is being fetched, out of how many. Without these the
+    # bar would restart at every track and look like a fault.
+    is_playlist: bool = False
+    items_done: int = 0
+    items_total: int = 0
 
     @property
     def directory(self) -> Path:
@@ -291,6 +319,9 @@ class Job:
             "error": self.error,
             "client": self.client,
             "attempts": self.attempts,
+            "isPlaylist": self.is_playlist,
+            "itemsDone": self.items_done,
+            "itemsTotal": self.items_total,
         }
 
 
@@ -313,8 +344,26 @@ def sweep_expired() -> None:
 # ------------------------------------------------------------------ download
 
 
+# What gets zipped up at the end. Anything else in the directory is a leftover
+# (a stray thumbnail, a subtitle yt-dlp could not embed) and is not the download.
+MEDIA_SUFFIXES = frozenset(
+    {".mp4", ".mkv", ".webm", ".mov", ".avi", ".mp3", ".m4a", ".opus", ".flac", ".wav", ".ogg", ".aac"}
+)
+
+
+def media_files(directory: Path) -> list[Path]:
+    return sorted(p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES)
+
+
 def _hook(job: Job):
     def hook(status: dict[str, Any]) -> None:
+        info = status.get("info_dict") or {}
+        # yt-dlp reports these per item, so they also tell us where we are in a
+        # playlist — there is no separate playlist-level progress callback.
+        if info.get("playlist_index"):
+            job.items_done = int(info["playlist_index"])
+        if info.get("n_entries"):
+            job.items_total = int(info["n_entries"])
         if status.get("status") == "downloading":
             job.stage = "downloading"
             total = status.get("total_bytes") or status.get("total_bytes_estimate")
@@ -341,13 +390,26 @@ def _postprocessor_hook(job: Job):
     return hook
 
 
+def outtmpl_for(job: Job) -> str:
+    """
+    %(title).150B truncates on BYTES, not characters — a CJK title that fits 150
+    characters can still blow past a 255-byte filesystem limit.
+
+    Playlist items are numbered, because "track 3" is only findable if the
+    filenames carry the order the playlist put them in.
+    """
+    if job.is_playlist:
+        return "%(playlist_index)03d - %(title).120B [%(id)s].%(ext)s"
+    return "%(title).150B [%(id)s].%(ext)s"
+
+
 def build_options(job: Job, client: str | None) -> dict[str, Any]:
     preset = PRESETS[job.preset]
     options: dict[str, Any] = {
         # %(title).150B truncates on BYTES, not characters — a CJK title that
         # fits 150 characters can still blow past a 255-byte filesystem limit.
-        "outtmpl": str(job.directory / "%(title).150B [%(id)s].%(ext)s"),
-        "noplaylist": True,
+        "outtmpl": str(job.directory / outtmpl_for(job)),
+        "noplaylist": not job.is_playlist,
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
@@ -360,6 +422,10 @@ def build_options(job: Job, client: str | None) -> dict[str, Any]:
         "postprocessor_hooks": [_postprocessor_hook(job)],
         **preset["opts"],
     }
+    if job.is_playlist:
+        options["playlistend"] = PLAYLIST_LIMIT
+        # One dead video must not abandon the other forty-nine.
+        options["ignoreerrors"] = True
     if have_cookies():
         options["cookiefile"] = str(COOKIES_PATH)
     args = extractor_args(client)
@@ -400,17 +466,43 @@ def run_job(job: Job) -> None:
                         entries = [e for e in info.get("entries", []) if e]
                         if not entries:
                             raise yt_dlp.utils.DownloadError("That playlist is empty.")
-                        info = entries[0]
-                    job.title = info.get("title")
-                    job.thumbnail = info.get("thumbnail")
+                        if job.is_playlist:
+                            # Name the job — and so the archive — after the
+                            # playlist, not after whichever track happened to
+                            # be first.
+                            job.title = info.get("title") or entries[0].get("title")
+                            job.thumbnail = entries[0].get("thumbnail")
+                            info = None
+                        else:
+                            info = entries[0]
+                    if info is not None:
+                        job.title = info.get("title")
+                        job.thumbnail = info.get("thumbnail")
 
                 # Trust the directory over yt-dlp's reported path: postprocessors
                 # rename the file (.webm -> .mp3) after the info dict is built, so
                 # the recorded name is routinely the one that no longer exists.
-                files = [p for p in job.directory.iterdir() if p.is_file()]
+                files = media_files(job.directory)
                 if not files:
                     raise FileNotFoundError("yt-dlp produced no file.")
-                chosen = max(files, key=lambda p: p.stat().st_size)
+
+                if len(files) > 1:
+                    # A browser can only be handed one file, so a playlist comes
+                    # back as an archive. Stored, not deflated: every one of
+                    # these is already compressed, so deflating would burn CPU
+                    # over a playlist's worth of data to save nothing.
+                    job.stage = "packing"
+                    label = re.sub(r'[^\w\s.-]', "", job.title or "playlist").strip() or "playlist"
+                    archive = job.directory / f"{label[:80]}.zip"
+                    with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as bundle:
+                        for item in files:
+                            bundle.write(item, arcname=item.name)
+                            item.unlink()
+                    job.items_total = job.items_total or len(files)
+                    job.items_done = job.items_total
+                    chosen = archive
+                else:
+                    chosen = files[0]
                 job.filename = chosen.name
                 job.progress = 1.0
                 job.stage = "ready"
@@ -469,6 +561,7 @@ def humanize_error(exc: Exception) -> str:
 class JobRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     preset: str = "video_best"
+    playlist: bool = False
 
 
 class ProbeRequest(BaseModel):
@@ -598,7 +691,19 @@ async def probe(body: ProbeRequest, authorization: str | None = Header(default=N
     url = assert_fetchable(body.url)
 
     def extract() -> dict[str, Any]:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}) as ydl:
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            # Look at the playlist without extracting every entry: a 200-track
+            # album would otherwise mean 200 round trips before the page can
+            # show a title. Single videos are unaffected — flat extraction only
+            # applies to entries inside a playlist.
+            "extract_flat": "in_playlist",
+        }
+        if have_cookies():
+            options["cookiefile"] = str(COOKIES_PATH)
+        with yt_dlp.YoutubeDL(options) as ydl:
             return ydl.extract_info(url, download=False)
 
     try:
@@ -612,7 +717,22 @@ async def probe(body: ProbeRequest, authorization: str | None = Header(default=N
         entries = [e for e in info.get("entries", []) if e]
         if not entries:
             raise HTTPException(status_code=400, detail="That playlist is empty.")
-        info = entries[0]
+        first = entries[0]
+        return {
+            "title": info.get("title") or first.get("title"),
+            "uploader": info.get("uploader") or info.get("channel") or first.get("uploader"),
+            "duration": None,
+            "thumbnail": info.get("thumbnails", [{}])[-1].get("url") if info.get("thumbnails") else first.get("thumbnail"),
+            "extractor": info.get("extractor_key"),
+            "isLive": False,
+            # The UI needs all three: whether to offer the choice at all, how
+            # many it would fetch, and how many it will actually get once the
+            # cap applies — promising 200 and delivering 50 would be a lie.
+            "isPlaylist": True,
+            "count": len(entries),
+            "limit": PLAYLIST_LIMIT,
+            "firstTitle": first.get("title"),
+        }
 
     return {
         "title": info.get("title"),
@@ -621,6 +741,7 @@ async def probe(body: ProbeRequest, authorization: str | None = Header(default=N
         "thumbnail": info.get("thumbnail"),
         "extractor": info.get("extractor_key"),
         "isLive": bool(info.get("is_live")),
+        "isPlaylist": False,
     }
 
 
@@ -696,7 +817,7 @@ async def create_job(body: JobRequest, authorization: str | None = Header(defaul
         active = sum(1 for job in JOBS.values() if job.state in ("queued", "running"))
         if active >= MAX_CONCURRENT_JOBS * 4:
             raise HTTPException(status_code=429, detail="Too many downloads in flight. Try again shortly.")
-        job = Job(id=uuid.uuid4().hex[:16], url=url, preset=body.preset)
+        job = Job(id=uuid.uuid4().hex[:16], url=url, preset=body.preset, is_playlist=body.playlist)
         JOBS[job.id] = job
 
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
