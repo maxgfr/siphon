@@ -52,6 +52,40 @@ mobile that only exists on Firefox for Android.
 That is why this project offers your own server first and a public instance as a
 fallback: those are the two options that actually exist.
 
+## The shortest setup: you are the client
+
+You do not have to host anything. Put the interface on GitHub Pages, run yt-dlp
+on the computer you are sitting at, and point one at the other:
+
+```sh
+docker compose up -d                      # yt-dlp, on your machine, port 8000
+```
+
+Then open the Pages URL, go to **Settings → Use this computer**, and Save.
+
+The video now goes from the site straight to your disk. The only thing that
+comes off the internet is a few kilobytes of static HTML. No hosted backend, no
+bandwidth bill, and no third party ever sees which links you paste.
+
+This works because browsers treat `localhost` as a secure context, so an HTTPS
+page is allowed to call it — the usual mixed-content rule does not apply.
+Chrome adds a Private Network Access preflight on top, which the server answers
+(`allow_private_network`), and the origin allow-list still decides who may call:
+set `ALLOWED_ORIGINS` to your Pages URL and a page on any other domain is
+refused by the browser before the request is sent.
+
+Verified in a real browser: a page on `https://maxgfr.github.io` drove yt-dlp on
+`http://127.0.0.1`, with no mixed-content or private-network block, and the file
+arrived. The same page served from a different hostname was refused.
+
+**On a phone this particular trick cannot work** — there is nothing running on
+the phone. Two options there:
+
+- Same Wi-Fi as your computer: open `http://<your-computer-ip>:8000` in the
+  phone's browser. The container serves the interface too, so everything is
+  one plain-HTTP origin and there is no mixed content to block.
+- Anywhere else: deploy the server, below.
+
 ## Deploy the server in one click
 
 The frontend needs a backend with an HTTPS hostname. Two ways to get one without

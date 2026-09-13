@@ -183,3 +183,61 @@ def test_error_text_drops_the_bug_report_boilerplate() -> None:
     )
     assert "report this issue" not in message
     assert message == "something broke"
+
+
+# ------------------------------------------------------- private network
+
+def test_preflight_allows_a_public_page_to_call_this_machine() -> None:
+    """
+    The "UI on GitHub Pages, yt-dlp on your own computer" path.
+
+    Chrome guards public-to-private requests behind a Private Network Access
+    preflight and drops the request before the server sees it unless that
+    preflight is answered. Verified end to end in a real browser; this pins the
+    header so a CORS refactor cannot quietly remove it.
+    """
+    client = TestClient(server_app.app)
+    response = client.options(
+        "/api/health",
+        headers={
+            "Origin": server_app.ALLOWED_ORIGINS[0],
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Private-Network": "true",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers.get("access-control-allow-private-network") == "true"
+
+
+def test_private_network_still_obeys_the_origin_allow_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answering the PNA preflight must not become a way around ALLOWED_ORIGINS."""
+    from starlette.middleware.cors import CORSMiddleware
+    from fastapi import FastAPI
+
+    scoped = FastAPI()
+    scoped.add_middleware(
+        CORSMiddleware,
+        allow_origins=["https://maxgfr.github.io"],
+        allow_methods=["GET"],
+        allow_headers=["*"],
+        allow_private_network=True,
+    )
+
+    @scoped.get("/api/health")
+    async def _health() -> dict[str, bool]:
+        return {"ok": True}
+
+    client = TestClient(scoped)
+    refused = client.options(
+        "/api/health",
+        headers={
+            "Origin": "https://somewhere-else.example",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Private-Network": "true",
+        },
+    )
+    # Starlette still echoes the private-network header on a refusal, but the
+    # header a browser actually gates on is access-control-allow-origin — and a
+    # 400 without it is a rejected preflight, so the request is never sent.
+    assert refused.status_code == 400
+    assert "access-control-allow-origin" not in refused.headers

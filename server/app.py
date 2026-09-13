@@ -359,12 +359,24 @@ class ProbeRequest(BaseModel):
 
 
 app = FastAPI(title="yt-dlp-web", docs_url="/api/docs", openapi_url="/api/openapi.json")
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    # What makes "UI on GitHub Pages, yt-dlp on your own machine" work. Browsers
+    # allow an HTTPS page to call http://localhost — localhost counts as a
+    # secure context — but Chrome additionally guards public-to-private requests
+    # behind a Private Network Access preflight, and refuses the request before
+    # the server sees it unless the preflight is answered. This grants nothing on
+    # its own: the origin check above is still what decides who may call.
+    allow_private_network=True,
+    # The preflight is cached, so a download does not pay two round trips to a
+    # machine that is already on this desk.
+    max_age=3600,
 )
 
 

@@ -515,6 +515,16 @@ function init() {
   $('closeSettings').addEventListener('click', () => $('settings').close());
   $('modeServer').addEventListener('change', syncSettingsFields);
   $('modePublic').addEventListener('change', syncSettingsFields);
+  $('useLocalhost').addEventListener('click', () => {
+    // 8000 is what docker-compose publishes, so this is the right guess far
+    // more often than not — and it is one tap instead of typing a URL on a
+    // keyboard that wants to autocapitalise it.
+    $('serverUrl').value = 'http://127.0.0.1:8000';
+    $('modeServer').checked = true;
+    syncSettingsFields();
+    testConnection();
+  });
+
   $('testConnection').addEventListener('click', testConnection);
   $('saveSettings').addEventListener('click', () => {
     settings = draftSettings();

@@ -120,7 +120,16 @@
       <label class="lbl" for="serverUrl">Server address</label>
       <input type="url" id="serverUrl" inputmode="url" autocapitalize="off" autocorrect="off"
              spellcheck="false" placeholder="https://ytdl.example.com" />
-      <p class="hint">Leave empty to use the server this page is served from, when there is one.</p>
+      <button type="button" class="chip-btn" id="useLocalhost" style="margin-top:8px">
+        Use this computer
+      </button>
+      <p class="hint">
+        Running yt-dlp on the machine you are sitting at is the shortest path: the video goes
+        from the site straight to your disk, and nothing but this page comes from the internet.
+        Browsers permit it because <code>localhost</code> counts as secure.
+        <strong>On a phone this will not work</strong> — nothing is running on the phone. Use a
+        deployed server there, or open your computer's own address in the phone's browser.
+      </p>
 
       <label class="lbl" for="serverKey">Access key <span style="font-weight:400;color:var(--muted)">— if the server asks for one</span></label>
       <input type="password" id="serverKey" autocomplete="off" placeholder="Optional" />
