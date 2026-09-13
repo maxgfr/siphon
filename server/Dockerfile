@@ -14,11 +14,18 @@ WORKDIR /app
 COPY server/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
+# The proof-of-origin plugin. Installed unconditionally but inert unless
+# POT_PROVIDER_URL points at a running provider (docker-compose.potoken.yml),
+# so the image is ready for the hardest YouTube cases without requiring the
+# sidecar for the easy ones.
+RUN pip install --no-cache-dir bgutil-ytdlp-pot-provider
+
 COPY server/ ./server/
 COPY web/ ./web/
 
 ENV WEB_DIR=/app/web \
     DOWNLOAD_DIR=/tmp/siphon \
+    COOKIES_FILE=/tmp/siphon/cookies.txt \
     PORT=8000 \
     PYTHONUNBUFFERED=1
 

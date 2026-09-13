@@ -1,0 +1,23 @@
+# Last resort for YouTube, when the client ladder and cookies both come up
+# against a login wall.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.potoken.yml up -d
+#
+# YouTube's newer clients want a proof-of-origin token minted by its own
+# JavaScript. yt-dlp cannot produce one itself, so this runs the community
+# provider beside it: siphon points every extraction at the sidecar, and the
+# plugin baked into the image picks the tokens up.
+#
+# Costs a container and some memory. Try cookies first — they are free and fix
+# the same failure more often.
+services:
+  potoken:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    init: true
+    restart: unless-stopped
+
+  siphon:
+    environment:
+      POT_PROVIDER_URL: "http://potoken:4416"
+    depends_on:
+      - potoken

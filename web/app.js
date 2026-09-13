@@ -202,6 +202,9 @@ function renderAction() {
 
 const STAGE_TEXT = {
   starting: 'Starting…',
+  // A bar that silently jumps back to zero reads as a bug. Naming the reason
+  // turns the same event into the app visibly working around YouTube.
+  retrying: 'YouTube asked for a login — trying another client',
   downloading: 'Downloading',
   processing: 'Converting…',
   ready: 'Ready',
@@ -233,6 +236,9 @@ function renderProgress(job) {
 
   $('speed').textContent = job.speed ? `${formatBytes(job.speed)}/s` : '';
   $('eta').textContent = job.eta ? `${formatDuration(job.eta)} left` : '';
+  if (job.attempts > 0 && job.client) {
+    $('eta').textContent = `attempt ${job.attempts + 1} · ${job.client}`;
+  }
 }
 
 function renderHistory() {
@@ -469,6 +475,8 @@ function syncSettingsFields() {
   const isPublic = $('modePublic').checked;
   $('serverFields').hidden = isPublic;
   $('publicFields').hidden = !isPublic;
+  // A public instance has no cookie store of ours to write to.
+  $('cookiesBlock').hidden = isPublic;
 }
 
 function setStatus(kind, text) {
@@ -493,6 +501,7 @@ async function testConnection() {
     const info = await makeBackend(draftSettings()).health();
     setStatus('ok', `Reachable — ${info.label}${info.ffmpeg === false ? ', but no ffmpeg' : ''}`);
     showPhoneHint(info.lanUrls || []);
+    setCookieState(info.hasCookies === true);
   } catch (error) {
     setStatus('bad', error instanceof BackendError ? error.message : 'Could not reach it.');
     showPhoneHint([]);
@@ -517,6 +526,42 @@ function showPhoneHint(urls) {
     'so there is nothing else to set up:<br>' +
     urls.map((url) => `<strong style="font-family:var(--mono)">${escapeHtml(url)}</strong>`).join('<br>') +
     '<br>Away from home, put it behind a tunnel or a VPN — see the README.';
+}
+
+/* ------------------------------------------------------------------ cookies */
+
+function setCookieState(present, note = '') {
+  $('cookiesState').textContent = present ? '— stored' : '— not set';
+  $('cookiesClear').hidden = !present;
+  if (note) $('cookiesResult').textContent = note;
+}
+
+async function uploadCookies(file) {
+  const result = $('cookiesResult');
+  if (!file) return;
+  if (file.size > 2_000_000) {
+    result.textContent = 'That file is far too large to be a cookie jar.';
+    return;
+  }
+  result.textContent = 'Uploading…';
+  try {
+    const text = await file.text();
+    const backend = makeBackend(draftSettings());
+    if (!backend.putCookies) throw new BackendError('Cookies only apply to your own server.');
+    const info = await backend.putCookies(text);
+    setCookieState(true, `Stored ${formatBytes(info.bytes)} of cookies. YouTube downloads will use your session.`);
+  } catch (error) {
+    setCookieState(false, error instanceof BackendError ? error.message : 'Could not store that file.');
+  }
+}
+
+async function removeCookies() {
+  try {
+    await makeBackend(draftSettings()).dropCookies();
+    setCookieState(false, 'Removed.');
+  } catch (error) {
+    $('cookiesResult').textContent = error instanceof BackendError ? error.message : 'Could not remove them.';
+  }
 }
 
 /* ------------------------------------------------------------------ install */
@@ -637,6 +682,9 @@ function init() {
     syncSettingsFields();
     testConnection();
   });
+
+  $('cookiesFile').addEventListener('change', (event) => uploadCookies(event.target.files?.[0]));
+  $('cookiesClear').addEventListener('click', removeCookies);
 
   $('testConnection').addEventListener('click', testConnection);
   $('saveSettings').addEventListener('click', () => {

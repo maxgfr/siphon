@@ -100,6 +100,8 @@ export class ServerBackend {
       ffmpeg: body.ffmpeg !== false,
       presets: Array.isArray(body.presets) ? body.presets.map((p) => p.id) : null,
       lanUrls: Array.isArray(body.lanUrls) ? body.lanUrls : [],
+      hasCookies: body.hasCookies === true,
+      potProvider: body.potProvider === true,
     };
   }
 
@@ -123,6 +125,14 @@ export class ServerBackend {
   fileUrl(id) {
     const suffix = this.key ? `?key=${encodeURIComponent(this.key)}` : '';
     return `${this.base}/api/jobs/${encodeURIComponent(id)}/file${suffix}`;
+  }
+
+  putCookies(text) {
+    return this.#json('/api/cookies', { method: 'POST', body: JSON.stringify({ cookies: text }) });
+  }
+
+  dropCookies() {
+    return this.#json('/api/cookies', { method: 'DELETE' });
   }
 
   cancel(id) {

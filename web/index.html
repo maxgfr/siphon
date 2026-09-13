@@ -147,6 +147,28 @@
       <label class="lbl" for="serverKey">Access key <span style="font-weight:400;color:var(--muted)">— if the server asks for one</span></label>
       <input type="password" id="serverKey" autocomplete="off" placeholder="Optional" />
 
+      <div id="cookiesBlock">
+        <label class="lbl">YouTube sign-in <span id="cookiesState" style="font-weight:400;color:var(--muted)"></span></label>
+        <p class="hint">
+          YouTube turns anonymous downloads away with <em>"Sign in to confirm you're not a bot"</em>.
+          siphon already retries with several of YouTube's own clients, and that clears most of it.
+          When it does not, your own session does — export <code>cookies.txt</code> with a
+          Netscape-format cookie extension and upload it here.
+        </p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+          <label class="chip-btn" for="cookiesFile" style="display:grid;place-items:center">
+            Upload cookies.txt
+            <input type="file" id="cookiesFile" accept=".txt,text/plain" hidden />
+          </label>
+          <button type="button" class="chip-btn" id="cookiesClear" hidden>Remove</button>
+        </div>
+        <p class="hint" id="cookiesResult" style="margin-top:8px"></p>
+        <p class="hint">
+          <strong>This is a logged-in session.</strong> Only upload it to a server you control, and
+          use a throwaway account if you would rather not hand over your main one.
+        </p>
+      </div>
+
       <div id="phoneHint" hidden>
         <label class="lbl">On your phone</label>
         <p class="hint" id="phoneHintBody"></p>

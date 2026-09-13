@@ -51,6 +51,15 @@ ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").spl
 # so the frontend can warn you.
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()
 
+# Where the YouTube session lives, when one has been uploaded. Kept outside the
+# per-job directories so the TTL sweep cannot take it with a finished download.
+COOKIES_FILE = Path(os.environ.get("COOKIES_FILE", "")) if os.environ.get("COOKIES_FILE") else None
+
+# An optional sidecar that mints YouTube proof-of-origin tokens
+# (brainicism/bgutil-ytdlp-pot-provider, port 4416). When set, every extraction
+# offers it to the plugin; when unset, nothing changes.
+POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "").strip().rstrip("/")
+
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "3"))
 JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", str(60 * 60)))
 # Opt-in escape hatch for the one legitimate private-address case: pulling from
@@ -61,6 +70,12 @@ ALLOW_PRIVATE_HOSTS = os.environ.get("ALLOW_PRIVATE_HOSTS", "").strip().lower() 
 
 DOWNLOAD_ROOT = Path(os.environ.get("DOWNLOAD_DIR", tempfile.gettempdir())) / "siphon"
 DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+
+COOKIES_PATH = COOKIES_FILE or (DOWNLOAD_ROOT.parent / "siphon-cookies.txt")
+
+
+def have_cookies() -> bool:
+    return COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 0
 
 # Serve the frontend from the same origin when it is present. That is what makes
 # `docker run` a complete product rather than half of one — and it sidesteps
@@ -123,6 +138,59 @@ PRESETS: dict[str, dict[str, Any]] = {
         },
     },
 }
+
+# --------------------------------------------------------- youtube strategy
+
+# What YouTube says when it wants a proof-of-origin token or a login, rather
+# than when the video is genuinely gone. Only these are worth a second attempt
+# with a different client; retrying "video unavailable" just wastes the user's
+# time.
+BOT_WALL_MARKERS = (
+    "sign in to confirm",
+    "not a bot",
+    "po_token",
+    "po token",
+    "proof of origin",
+    "failed to extract any player response",
+    "requested format is not available",
+    "unable to extract player response",
+    "this content isn\u2019t available",
+)
+
+
+def is_bot_wall(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in BOT_WALL_MARKERS)
+
+
+def player_client_chain(has_cookies: bool) -> list[str | None]:
+    """
+    Which YouTube clients to try, in order. None means "yt-dlp's own default",
+    which tracks upstream and is right far more often than anything pinned here.
+
+    The clients YouTube lets through without a token change every few months, so
+    this is a fallback ladder rather than a fixed choice: the first rung is
+    always whatever yt-dlp currently thinks best.
+
+    Cookies change the ladder. The TV client authenticates differently, and
+    pairing it with a logged-in session tends to invalidate that session — so
+    when cookies are present it is left out and the web/mobile clients, which do
+    use the session, are tried instead.
+    """
+    if has_cookies:
+        return [None, "web_safari", "mweb"]
+    return [None, "tv", "web_safari", "android_vr"]
+
+
+def extractor_args(client: str | None) -> dict[str, Any]:
+    args: dict[str, dict[str, list[str]]] = {}
+    if client:
+        args["youtube"] = {"player_client": [client]}
+    if POT_PROVIDER_URL:
+        # Read by the bgutil plugin, if it is installed. Harmless when it is not.
+        args["youtubepot-bgutilhttp"] = {"base_url": [POT_PROVIDER_URL]}
+    return args
+
 
 # ------------------------------------------------------------ url validation
 
@@ -198,6 +266,11 @@ class Job:
     # Set once the postprocessing step starts, so the UI can stop showing a
     # percentage that has already hit 100 and say "converting" instead.
     stage: str = "starting"
+    # Which YouTube client this attempt is using, and how many walls were hit
+    # before it. Both are shown, because "retrying with a different client" is
+    # far less alarming than a progress bar that silently restarts.
+    client: str | None = None
+    attempts: int = 0
 
     @property
     def directory(self) -> Path:
@@ -216,6 +289,8 @@ class Job:
             "thumbnail": self.thumbnail,
             "filename": self.filename,
             "error": self.error,
+            "client": self.client,
+            "attempts": self.attempts,
         }
 
 
@@ -266,57 +341,91 @@ def _postprocessor_hook(job: Job):
     return hook
 
 
+def build_options(job: Job, client: str | None) -> dict[str, Any]:
+    preset = PRESETS[job.preset]
+    options: dict[str, Any] = {
+        # %(title).150B truncates on BYTES, not characters — a CJK title that
+        # fits 150 characters can still blow past a 255-byte filesystem limit.
+        "outtmpl": str(job.directory / "%(title).150B [%(id)s].%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "restrictfilenames": False,
+        "windowsfilenames": True,
+        "concurrent_fragment_downloads": 4,
+        "retries": 5,
+        "fragment_retries": 5,
+        "progress_hooks": [_hook(job)],
+        "postprocessor_hooks": [_postprocessor_hook(job)],
+        **preset["opts"],
+    }
+    if have_cookies():
+        options["cookiefile"] = str(COOKIES_PATH)
+    args = extractor_args(client)
+    if args:
+        options["extractor_args"] = args
+    return options
+
+
 def run_job(job: Job) -> None:
-    """Run one download to completion. Executed on a worker thread."""
+    """
+    Run one download to completion, walking the client ladder if YouTube asks
+    for a login instead of a video.
+
+    The ladder only advances on a bot wall. Every other failure — a private
+    video, a dead link, a missing codec — is final on the first attempt, because
+    trying three more clients would just make the user wait three times as long
+    for the same answer.
+    """
     with RUNNING:
         job.state = "running"
-        job.directory.mkdir(parents=True, exist_ok=True)
-        preset = PRESETS[job.preset]
+        attempts = player_client_chain(have_cookies())
+        last_error: Exception | None = None
 
-        options: dict[str, Any] = {
-            # %(title).150B truncates on BYTES, not characters — a CJK title that
-            # fits 150 characters can still blow past a 255-byte filesystem limit.
-            "outtmpl": str(job.directory / "%(title).150B [%(id)s].%(ext)s"),
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-            "restrictfilenames": False,
-            "windowsfilenames": True,
-            "concurrent_fragment_downloads": 4,
-            "retries": 5,
-            "fragment_retries": 5,
-            "progress_hooks": [_hook(job)],
-            "postprocessor_hooks": [_postprocessor_hook(job)],
-            **preset["opts"],
-        }
+        for index, client in enumerate(attempts):
+            # Each attempt starts from an empty directory: a previous try can
+            # leave a partial file behind, and the "largest file wins" rule
+            # below would happily hand it over.
+            shutil.rmtree(job.directory, ignore_errors=True)
+            job.directory.mkdir(parents=True, exist_ok=True)
+            job.progress = 0.0
+            job.stage = "starting" if index == 0 else "retrying"
+            job.client = client or "default"
 
-        try:
-            with yt_dlp.YoutubeDL(options) as ydl:
-                info = ydl.extract_info(job.url, download=True)
-                if info.get("_type") == "playlist":
-                    entries = [e for e in info.get("entries", []) if e]
-                    if not entries:
-                        raise yt_dlp.utils.DownloadError("That playlist is empty.")
-                    info = entries[0]
-                job.title = info.get("title")
-                job.thumbnail = info.get("thumbnail")
+            try:
+                with yt_dlp.YoutubeDL(build_options(job, client)) as ydl:
+                    info = ydl.extract_info(job.url, download=True)
+                    if info.get("_type") == "playlist":
+                        entries = [e for e in info.get("entries", []) if e]
+                        if not entries:
+                            raise yt_dlp.utils.DownloadError("That playlist is empty.")
+                        info = entries[0]
+                    job.title = info.get("title")
+                    job.thumbnail = info.get("thumbnail")
 
-            # Trust the directory over yt-dlp's reported path: postprocessors
-            # rename the file (.webm -> .mp3) after the info dict is built, so
-            # the recorded name is routinely the one that no longer exists.
-            files = [p for p in job.directory.iterdir() if p.is_file()]
-            if not files:
-                raise FileNotFoundError("yt-dlp produced no file.")
-            chosen = max(files, key=lambda p: p.stat().st_size)
-            job.filename = chosen.name
-            job.progress = 1.0
-            job.stage = "ready"
-            job.state = "done"
-        except Exception as exc:  # noqa: BLE001 — surfaced to the user verbatim
-            job.state = "error"
-            job.stage = "failed"
-            job.error = humanize_error(exc)
+                # Trust the directory over yt-dlp's reported path: postprocessors
+                # rename the file (.webm -> .mp3) after the info dict is built, so
+                # the recorded name is routinely the one that no longer exists.
+                files = [p for p in job.directory.iterdir() if p.is_file()]
+                if not files:
+                    raise FileNotFoundError("yt-dlp produced no file.")
+                chosen = max(files, key=lambda p: p.stat().st_size)
+                job.filename = chosen.name
+                job.progress = 1.0
+                job.stage = "ready"
+                job.state = "done"
+                return
+            except Exception as exc:  # noqa: BLE001 — surfaced to the user verbatim
+                last_error = exc
+                if index + 1 < len(attempts) and is_bot_wall(str(exc)):
+                    job.attempts = index + 1
+                    continue
+                break
+
+        job.state = "error"
+        job.stage = "failed"
+        job.error = humanize_error(last_error or Exception("The download failed."))
 
 
 def humanize_error(exc: Exception) -> str:
@@ -327,11 +436,17 @@ def humanize_error(exc: Exception) -> str:
     text = re.sub(r";\s*please report this issue.*$", "", text, flags=re.S).strip()
 
     lowered = text.lower()
-    if "sign in to confirm" in lowered or "bot" in lowered and "confirm" in lowered:
+    if is_bot_wall(text):
+        if have_cookies():
+            return (
+                "YouTube asked for a login on every client, even with your cookies. They have "
+                "probably expired — export them again from a browser where you are signed in. "
+                "If this server is in a datacentre, its IP range is the more likely cause."
+            )
         return (
-            "The site asked this server to prove it is not a bot. That usually means the "
-            "host's IP is rate-limited — trying again later, or from a server on a different "
-            "network, is the fix."
+            "YouTube asked this server to prove it is not a bot, on every client tried. "
+            "Uploading your YouTube cookies in settings is what fixes this: it lets the "
+            "download use your own signed-in session."
         )
     if "private video" in lowered:
         return "That video is private."
@@ -469,6 +584,8 @@ async def health(request: Request) -> dict[str, Any]:
         "ytDlpVersion": yt_dlp.version.__version__,
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "requiresKey": bool(AUTH_TOKEN),
+        "hasCookies": have_cookies(),
+        "potProvider": bool(POT_PROVIDER_URL),
         "allowsPrivateHosts": ALLOW_PRIVATE_HOSTS,
         "presets": [{"id": key, "label": value["label"], "kind": value["kind"]} for key, value in PRESETS.items()],
     }
@@ -505,6 +622,65 @@ async def probe(body: ProbeRequest, authorization: str | None = Header(default=N
         "extractor": info.get("extractor_key"),
         "isLive": bool(info.get("is_live")),
     }
+
+
+class CookiesRequest(BaseModel):
+    cookies: str = Field(min_length=1, max_length=2_000_000)
+
+
+def looks_like_cookie_jar(text: str) -> bool:
+    """
+    Accept a Netscape cookie jar, reject a paste of something else.
+
+    Checked because the usual mistake is pasting a browser's JSON export, or a
+    single header value, and the failure that produces later is a bot wall —
+    which looks exactly like the problem the cookies were meant to solve.
+    """
+    if "# Netscape HTTP Cookie File" in text or "# HTTP Cookie File" in text:
+        return True
+    # Some exporters omit the header, so also accept the row shape itself:
+    # domain, flag, path, secure, expiry, name, value — seven tab-separated fields.
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if len(line.split("\t")) >= 7:
+            return True
+    return False
+
+
+@app.post("/api/cookies")
+async def put_cookies(body: CookiesRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """
+    Store a YouTube session for yt-dlp to use.
+
+    This is the thing that actually gets past "Sign in to confirm you're not a
+    bot", because it stops the download looking anonymous. It is also the most
+    sensitive data this service will ever hold — a session cookie is a logged-in
+    account — so it is written owner-only and never read back out over the API.
+    """
+    check_auth(authorization)
+    text = body.cookies.strip()
+    if not looks_like_cookie_jar(text):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "That does not look like a cookies.txt file. Use a browser extension that "
+                "exports the Netscape format, not a JSON export."
+            ),
+        )
+    COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    COOKIES_PATH.write_text(text + "\n", encoding="utf-8")
+    COOKIES_PATH.chmod(0o600)
+    return {"stored": True, "bytes": len(text)}
+
+
+@app.delete("/api/cookies")
+async def drop_cookies(authorization: str | None = Header(default=None)) -> dict[str, bool]:
+    check_auth(authorization)
+    existed = COOKIES_PATH.exists()
+    COOKIES_PATH.unlink(missing_ok=True)
+    return {"deleted": existed}
 
 
 @app.post("/api/jobs")

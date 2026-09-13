@@ -241,3 +241,164 @@ def test_private_network_still_obeys_the_origin_allow_list(monkeypatch: pytest.M
     # 400 without it is a rejected preflight, so the request is never sent.
     assert refused.status_code == 400
     assert "access-control-allow-origin" not in refused.headers
+
+
+# --------------------------------------------------------- youtube strategy
+
+class TestClientLadder:
+    """
+    The fallback that turns most YouTube bot walls into a successful download
+    without the user doing anything.
+    """
+
+    def test_first_attempt_defers_to_yt_dlp(self) -> None:
+        # None means "whatever yt-dlp currently defaults to", which tracks the
+        # clients YouTube still accepts far better than anything pinned here.
+        assert server_app.player_client_chain(False)[0] is None
+        assert server_app.player_client_chain(True)[0] is None
+
+    def test_tv_is_tried_when_anonymous(self) -> None:
+        """The TV client is the least scrutinised one without credentials."""
+        assert "tv" in server_app.player_client_chain(False)
+
+    def test_tv_is_never_paired_with_cookies(self) -> None:
+        """
+        The documented footgun: the TV client authenticates differently, and
+        pairing it with a logged-in session tends to invalidate that session —
+        turning the fix into the cause.
+        """
+        assert "tv" not in server_app.player_client_chain(True)
+
+    def test_every_rung_is_distinct(self) -> None:
+        for has_cookies in (True, False):
+            chain = server_app.player_client_chain(has_cookies)
+            assert len(chain) == len(set(chain))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "ERROR: [youtube] abc: Sign in to confirm you're not a bot",
+        "ERROR: [youtube] abc: Some formats require a PO Token",
+        "ERROR: unable to extract player response",
+        "ERROR: Requested format is not available",
+    ],
+)
+def test_bot_walls_are_worth_another_client(message: str) -> None:
+    assert server_app.is_bot_wall(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "ERROR: Video unavailable",
+        "ERROR: Private video. Sign in if you've been granted access",
+        "ERROR: Unsupported URL: https://example.com/x",
+        "ERROR: ffmpeg not found",
+    ],
+)
+def test_real_failures_are_not_retried(message: str) -> None:
+    """
+    Retrying these would only make the user wait four times as long for the
+    same answer — and "Private video" is the trap, because it contains the
+    words "Sign in".
+    """
+    assert not server_app.is_bot_wall(message)
+
+
+def test_extractor_args_pin_the_client(self=None) -> None:
+    assert server_app.extractor_args("tv") == {"youtube": {"player_client": ["tv"]}}
+    assert server_app.extractor_args(None) == {}
+
+
+def test_extractor_args_offer_the_token_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server_app, "POT_PROVIDER_URL", "http://potoken:4416")
+    args = server_app.extractor_args("tv")
+    assert args["youtubepot-bgutilhttp"] == {"base_url": ["http://potoken:4416"]}
+    # Still set even with no client pinned, so the default attempt gets tokens too.
+    assert "youtubepot-bgutilhttp" in server_app.extractor_args(None)
+
+
+# ------------------------------------------------------------------ cookies
+
+NETSCAPE_JAR = (
+    "# Netscape HTTP Cookie File\n"
+    ".youtube.com\tTRUE\t/\tTRUE\t1800000000\tSID\tsomevalue\n"
+)
+
+
+class TestCookies:
+    @pytest.fixture(autouse=True)
+    def _isolate(self, tmp_path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(server_app, "COOKIES_PATH", tmp_path / "cookies.txt")
+
+    def test_a_netscape_jar_is_accepted_and_stored_owner_only(self) -> None:
+        client = TestClient(server_app.app)
+        assert client.post("/api/cookies", json={"cookies": NETSCAPE_JAR}).status_code == 200
+        assert server_app.have_cookies()
+        # A session cookie is a logged-in account; it must not be world-readable.
+        assert server_app.COOKIES_PATH.stat().st_mode & 0o077 == 0
+
+    def test_a_headerless_jar_is_still_accepted(self) -> None:
+        """Several exporters omit the header but write the same rows."""
+        rows = ".youtube.com\tTRUE\t/\tTRUE\t1800000000\tSID\tvalue\n"
+        assert server_app.looks_like_cookie_jar(rows)
+
+    @pytest.mark.parametrize(
+        "junk",
+        [
+            '[{"domain": ".youtube.com", "name": "SID"}]',  # the usual JSON export
+            "SID=abc; HSID=def",  # a copied header value
+            "just some text",
+        ],
+    )
+    def test_the_usual_wrong_pastes_are_refused(self, junk: str) -> None:
+        # Storing these would produce a bot wall later, which looks exactly like
+        # the problem the upload was meant to solve.
+        client = TestClient(server_app.app)
+        response = client.post("/api/cookies", json={"cookies": junk})
+        assert response.status_code == 400
+        assert "cookies.txt" in response.json()["detail"]
+
+    def test_cookies_can_be_removed(self) -> None:
+        client = TestClient(server_app.app)
+        client.post("/api/cookies", json={"cookies": NETSCAPE_JAR})
+        assert client.delete("/api/cookies").json() == {"deleted": True}
+        assert not server_app.have_cookies()
+
+    def test_the_jar_is_never_readable_back_over_the_api(self) -> None:
+        """
+        There is no GET: the server takes a session, it does not hand one out.
+
+        Asserted on the secret rather than the status code — the static mount
+        answers unknown paths, so the exact code is its business; what must hold
+        is that no route ever returns the cookie itself.
+        """
+        client = TestClient(server_app.app)
+        client.post("/api/cookies", json={"cookies": NETSCAPE_JAR})
+        response = client.get("/api/cookies")
+        assert response.status_code != 200
+        assert "somevalue" not in response.text
+        # And it is not reachable as a static file either.
+        assert "somevalue" not in client.get("/cookies.txt").text
+
+    def test_cookies_are_gated_by_the_access_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server_app, "AUTH_TOKEN", "s3cret")
+        client = TestClient(server_app.app)
+        assert client.post("/api/cookies", json={"cookies": NETSCAPE_JAR}).status_code == 401
+        assert client.delete("/api/cookies").status_code == 401
+
+    def test_health_reports_whether_a_session_is_stored(self) -> None:
+        client = TestClient(server_app.app)
+        assert client.get("/api/health").json()["hasCookies"] is False
+        client.post("/api/cookies", json={"cookies": NETSCAPE_JAR})
+        assert client.get("/api/health").json()["hasCookies"] is True
+
+    def test_the_bot_wall_message_points_at_the_actual_fix(self) -> None:
+        wall = Exception("ERROR: Sign in to confirm you're not a bot")
+        assert "cookies" in server_app.humanize_error(wall).lower()
+
+    def test_and_says_something_different_once_cookies_exist(self) -> None:
+        TestClient(server_app.app).post("/api/cookies", json={"cookies": NETSCAPE_JAR})
+        message = server_app.humanize_error(Exception("ERROR: Sign in to confirm you're not a bot"))
+        assert "expired" in message.lower()

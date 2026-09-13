@@ -205,6 +205,73 @@ your Pages URL so it stops accepting requests from anywhere:
 ALLOWED_ORIGINS=https://maxgfr.github.io docker compose up -d
 ```
 
+## Making YouTube work
+
+YouTube turns anonymous downloads away with *"Sign in to confirm you're not a
+bot"*. It scores each request on the IP's history, whether a proof-of-origin
+token is present, and whether there is a session behind it. siphon works through
+that in three escalating steps, and you only reach for the next one if the
+previous fails.
+
+### 1. The client ladder — automatic, nothing to do
+
+YouTube exposes several clients (`tv`, `web_safari`, `android_vr`, `mweb`…) and
+they are not policed equally. The set that works without a token shifts every
+few months.
+
+So a bot wall is not treated as a failure: siphon retries the same download
+against a different client, in order, and only gives up once the ladder is
+exhausted. The first rung is always yt-dlp's own default, because that tracks
+upstream better than anything pinned here. The interface says
+*"YouTube asked for a login — trying another client"* rather than silently
+resetting the bar.
+
+Only bot walls retry. A private video or a dead link fails immediately —
+retrying four times would just make you wait four times as long for the same
+answer.
+
+### 2. Your cookies — for what the ladder cannot clear
+
+Export `cookies.txt` from a browser where you are signed in (any Netscape-format
+cookie extension) and upload it in **Settings → YouTube sign-in**. Downloads then
+carry your own session and stop looking anonymous.
+
+Two details that are easy to get wrong, and that siphon handles for you:
+
+- **The TV client is dropped once cookies exist.** It authenticates differently,
+  and pairing it with a logged-in session tends to invalidate that session — so
+  the fix would become the cause. The ladder changes shape when a jar is present.
+- **A JSON cookie export is rejected, not stored.** Accepting it would produce a
+  bot wall later, which looks exactly like the problem you were trying to solve.
+
+The jar is written owner-only, is never readable back over the API, and is not
+served as a static file. It is still a logged-in session: only upload it to a
+server you control, and consider a throwaway account.
+
+### 3. A proof-of-origin provider — the hard cases
+
+Some clients now want a token minted by YouTube's own JavaScript, which yt-dlp
+cannot produce. The community provider can, as a sidecar:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.potoken.yml up -d
+```
+
+The plugin is already in the image; the overlay starts the provider and points
+siphon at it. Costs a container. Try cookies first.
+
+### If all three fail
+
+It is almost certainly the IP. Datacentre ranges get the strictest treatment, so
+a deployed instance hits this far more often than the same code on your home
+connection — which is why running it on your own machine is the first option in
+this README, not the last.
+
+And check the version: `yt-dlp` is pinned as a floor, not a ceiling, but a
+container built months ago is running a months-old yt-dlp that may still be
+trying a client YouTube has since closed. `docker compose build --pull` is the
+fix, and the interface shows the running version next to the wordmark.
+
 ## Configuration
 
 All server-side, all environment variables:
@@ -217,6 +284,8 @@ All server-side, all environment variables:
 | `JOB_TTL_SECONDS` | `3600` | How long a finished file stays on disk before it is swept. |
 | `DOWNLOAD_DIR` | system temp | Where files land while you fetch them. |
 | `ALLOW_PRIVATE_HOSTS` | off | Lets the server fetch from private/LAN addresses. Off by default — see below. |
+| `COOKIES_FILE` | inside `DOWNLOAD_DIR` | Where the uploaded YouTube session is kept. Put it on a volume so it survives a restart. |
+| `POT_PROVIDER_URL` | *(unset)* | Address of a proof-of-origin provider, e.g. `http://potoken:4416`. Unset means the plugin stays inert. |
 | `PORT` | `8000` | Listen port. |
 
 ### Security
