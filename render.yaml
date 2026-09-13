@@ -1,0 +1,28 @@
+# One-click deploy: https://render.com/deploy?repo=https://github.com/maxgfr/yt-dlp-web
+#
+# Render builds the Dockerfile and gives the service an HTTPS hostname, which is
+# what the frontend needs — a page served over HTTPS cannot call a plain-HTTP
+# backend, so a bare IP or a LAN address will not do.
+services:
+  - type: web
+    name: yt-dlp-web
+    runtime: docker
+    dockerfilePath: ./server/Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      # This service is public the moment it deploys, so it gets a key by
+      # default. Render generates one; read it in the dashboard and paste it
+      # into the app's settings. Without this, anyone who finds the URL can
+      # drive your downloader.
+      - key: AUTH_TOKEN
+        generateValue: true
+      - key: ALLOWED_ORIGINS
+        value: "*"
+      - key: MAX_CONCURRENT_JOBS
+        value: "2"
+      # The free plan has a small disk and sleeps when idle; sweeping sooner
+      # keeps finished files from piling up between wakes.
+      - key: JOB_TTL_SECONDS
+        value: "900"

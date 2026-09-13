@@ -26,7 +26,56 @@ So something has to run yt-dlp. This project is both halves:
 The frontend is useless alone and says so on first load. Point it at a server in
 settings, and it works.
 
-## Quick start
+### "Can't the browser just do it?"
+
+No, and it is worth knowing why before trying:
+
+- `*.googlevideo.com` allows CORS only from `youtube.com`, so a page on your own
+  domain cannot read the bytes.
+- Getting the signed stream URL in the first place means running YouTube's own
+  player JavaScript. [YouTube.js](https://github.com/LuanRT/YouTube.js), the
+  reference InnerTube client, states plainly that browser use requires proxying
+  through your own server, and ships a proxy in its browser example.
+- A service worker is a fake server, but it has no extra network privileges: its
+  requests obey the same CORS rules, JavaScript cannot read an opaque
+  (`mode: "no-cors"`) response body, and the spec forbids answering a navigation
+  with one.
+- `ffmpeg.wasm` is real and useful — it merges video and audio in the browser —
+  but only once you already have the bytes.
+
+Projects advertising a backend-free YouTube downloader are using someone else's
+server underneath: the well-known ffmpeg.wasm one routes through Piped, and the
+large yt-dlp web UIs (MeTube, yt-dlp-web-ui) are all self-hosted. The one genuine
+exception is a browser extension, whose host permissions do bypass CORS — but on
+mobile that only exists on Firefox for Android.
+
+That is why this project offers your own server first and a public instance as a
+fallback: those are the two options that actually exist.
+
+## Deploy the server in one click
+
+The frontend needs a backend with an HTTPS hostname. Two ways to get one without
+touching a terminal for more than a minute:
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/maxgfr/yt-dlp-web)
+
+Render reads `render.yaml`, builds the container, and generates an `AUTH_TOKEN`
+for you — copy it from the dashboard into the app's settings along with the URL.
+The free plan sleeps when idle, so the first download after a pause waits for a
+cold start.
+
+```sh
+# or Fly, which does not sleep the same way
+fly launch --no-deploy
+fly secrets set AUTH_TOKEN=$(openssl rand -hex 16)
+fly deploy
+```
+
+Either way you end up with an `https://…` address. Paste it into
+**Settings → Your own server**, paste the key under it, and the app works from
+any phone, anywhere.
+
+## Quick start (local)
 
 Everything in one container — the image serves the interface *and* the API, so
 there is no CORS to configure and no second thing to deploy:
