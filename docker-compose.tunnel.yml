@@ -17,7 +17,7 @@
 services:
   cloudflared:
     image: cloudflare/cloudflared:latest
-    command: tunnel --no-autoupdate --url http://yt-dlp-web:8000
+    command: tunnel --no-autoupdate --url http://siphon:8000
     depends_on:
-      - yt-dlp-web
+      - siphon
     restart: unless-stopped

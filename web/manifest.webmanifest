@@ -1,6 +1,6 @@
 {
-  "name": "yt-dlp-web",
-  "short_name": "yt-dlp-web",
+  "name": "siphon",
+  "short_name": "siphon",
   "description": "Paste a link, pick a quality, get the file.",
   "start_url": "./",
   "scope": "./",

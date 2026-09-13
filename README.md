@@ -1,4 +1,4 @@
-# yt-dlp-web
+# siphon
 
 Paste a link, pick a quality, get the file. A mobile-first web front end for
 [yt-dlp](https://github.com/yt-dlp/yt-dlp), with nothing to install on the phone.
@@ -45,7 +45,7 @@ No, and it is worth knowing why before trying:
 
 Projects advertising a backend-free YouTube downloader are using someone else's
 server underneath: the well-known ffmpeg.wasm one routes through Piped, and the
-large yt-dlp web UIs (MeTube, yt-dlp-web-ui) are all self-hosted. The one genuine
+large yt-dlp web UIs (MeTube, siphon-ui) are all self-hosted. The one genuine
 exception is a browser extension, whose host permissions do bypass CORS — but on
 mobile that only exists on Firefox for Android.
 
@@ -158,7 +158,7 @@ route 2 is usually the cure.
 The frontend needs a backend with an HTTPS hostname. Two ways to get one without
 touching a terminal for more than a minute:
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/maxgfr/yt-dlp-web)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/maxgfr/siphon)
 
 Render reads `render.yaml`, builds the container, and generates an `AUTH_TOKEN`
 for you — copy it from the dashboard into the app's settings along with the URL.
@@ -182,8 +182,8 @@ Everything in one container — the image serves the interface *and* the API, so
 there is no CORS to configure and no second thing to deploy:
 
 ```sh
-git clone https://github.com/maxgfr/yt-dlp-web
-cd yt-dlp-web
+git clone https://github.com/maxgfr/siphon
+cd siphon
 docker compose up -d
 ```
 

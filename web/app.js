@@ -1,5 +1,5 @@
 /**
- * yt-dlp-web — UI.
+ * siphon — UI.
  *
  * One screen, one job at a time, driven by a small state machine:
  *
@@ -13,7 +13,7 @@
  */
 import { PRESETS, BackendError, makeBackend } from './api.js';
 
-const SETTINGS_KEY = 'yt-dlp-web:settings';
+const SETTINGS_KEY = 'siphon:settings';
 const POLL_MS = 700;
 
 const DEFAULT_SETTINGS = Object.freeze({
@@ -521,7 +521,7 @@ function showPhoneHint(urls) {
 
 /* ------------------------------------------------------------------ install */
 
-const INSTALL_DISMISSED = 'yt-dlp-web:install-dismissed';
+const INSTALL_DISMISSED = 'siphon:install-dismissed';
 let installPrompt = null;
 
 /**

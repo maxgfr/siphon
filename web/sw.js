@@ -9,7 +9,7 @@
  * themselves. Caching a 400 MB video into the Cache API would fill the device's
  * storage quota and, on iOS, get the whole origin's storage evicted.
  */
-const CACHE = 'yt-dlp-web-v1';
+const CACHE = 'siphon-v1';
 const SHELL = ['./', './index.html', './styles.css', './app.js', './api.js', './icon.svg', './manifest.webmanifest'];
 
 self.addEventListener('install', (event) => {

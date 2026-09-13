@@ -1,5 +1,5 @@
 """
-yt-dlp-web — the self-hosted half.
+siphon — the self-hosted half.
 
 A small HTTP wrapper around yt-dlp, meant to sit behind the static frontend in
 web/. It exists because a browser tab cannot do this job itself: the media hosts
@@ -59,7 +59,7 @@ JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", str(60 * 60)))
 # reach it — see assert_fetchable for what it disables.
 ALLOW_PRIVATE_HOSTS = os.environ.get("ALLOW_PRIVATE_HOSTS", "").strip().lower() in ("1", "true", "yes")
 
-DOWNLOAD_ROOT = Path(os.environ.get("DOWNLOAD_DIR", tempfile.gettempdir())) / "yt-dlp-web"
+DOWNLOAD_ROOT = Path(os.environ.get("DOWNLOAD_DIR", tempfile.gettempdir())) / "siphon"
 DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
 # Serve the frontend from the same origin when it is present. That is what makes
@@ -380,7 +380,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="yt-dlp-web",
+    title="siphon",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
     lifespan=lifespan,
@@ -465,7 +465,7 @@ async def health(request: Request) -> dict[str, Any]:
     return {
         "lanUrls": [f"http://{address}:{port}" for address in lan_addresses()],
         "ok": True,
-        "service": "yt-dlp-web",
+        "service": "siphon",
         "ytDlpVersion": yt_dlp.version.__version__,
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "requiresKey": bool(AUTH_TOKEN),

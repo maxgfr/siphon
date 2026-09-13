@@ -1,11 +1,11 @@
-# One-click deploy: https://render.com/deploy?repo=https://github.com/maxgfr/yt-dlp-web
+# One-click deploy: https://render.com/deploy?repo=https://github.com/maxgfr/siphon
 #
 # Render builds the Dockerfile and gives the service an HTTPS hostname, which is
 # what the frontend needs — a page served over HTTPS cannot call a plain-HTTP
 # backend, so a bare IP or a LAN address will not do.
 services:
   - type: web
-    name: yt-dlp-web
+    name: siphon
     runtime: docker
     dockerfilePath: ./server/Dockerfile
     dockerContext: .

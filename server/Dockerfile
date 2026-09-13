@@ -18,18 +18,18 @@ COPY server/ ./server/
 COPY web/ ./web/
 
 ENV WEB_DIR=/app/web \
-    DOWNLOAD_DIR=/tmp/yt-dlp-web \
+    DOWNLOAD_DIR=/tmp/siphon \
     PORT=8000 \
     PYTHONUNBUFFERED=1
 
 # Downloads are written here; keeping it a volume stops a long session from
 # growing the container's writable layer.
-VOLUME ["/tmp/yt-dlp-web"]
+VOLUME ["/tmp/siphon"]
 
 EXPOSE 8000
 
 # Non-root: this process runs a downloader against URLs strangers can supply.
-RUN useradd --create-home --uid 10001 app && mkdir -p /tmp/yt-dlp-web && chown -R app /tmp/yt-dlp-web
+RUN useradd --create-home --uid 10001 app && mkdir -p /tmp/siphon && chown -R app /tmp/siphon
 USER app
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
