@@ -98,6 +98,16 @@ share a link straight from the YouTube app into it.
 
 Needs your computer awake and on the same network.
 
+Installing it is worth the two taps. On Android the browser offers an **Install**
+button and the app then registers as a share target — a link goes from the
+YouTube app into this one without copying anything. On iOS there is no install
+prompt, so the app tells you the route: **Share → Add to Home Screen**.
+
+One iOS quirk is handled rather than ignored: a home-screen web app there has no
+download manager, and a scripted download is silently dropped. So on installed
+iOS the finished file is offered as a link you tap, which opens in Safari where
+saving works. Everywhere else the file just downloads.
+
 ### 2. Tailscale — from anywhere, still your own machine
 
 The best of the three, and free. Install [Tailscale](https://tailscale.com) on

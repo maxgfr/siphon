@@ -8,7 +8,11 @@
 <meta name="description" content="Paste a link, pick a quality, get the file. A mobile-first web front end for yt-dlp, with no app to install." />
 <meta name="theme-color" content="#0e1315" media="(prefers-color-scheme: dark)" />
 <meta name="theme-color" content="#f2f5f5" media="(prefers-color-scheme: light)" />
+<!-- The unprefixed name is the standard one; the apple- form is still what
+     older iOS reads, so both have to be here. -->
+<meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="apple-mobile-web-app-title" content="yt-dlp-web" />
 <link rel="manifest" href="./manifest.webmanifest" />
 <link rel="icon" href="./icon.svg" type="image/svg+xml" />
@@ -60,6 +64,15 @@
     <section class="history" id="history" hidden>
       <span class="section-label">This session</span>
       <ol id="historyList"></ol>
+    </section>
+
+    <section class="install-cta" id="installCta" hidden>
+      <div>
+        <strong id="installTitle"></strong>
+        <p id="installBody"></p>
+      </div>
+      <button class="chip-btn" type="button" id="installBtn" hidden>Install</button>
+      <button class="chip-btn" type="button" id="installDismiss" aria-label="Dismiss">✕</button>
     </section>
 
     <footer class="legal">

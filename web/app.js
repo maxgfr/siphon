@@ -82,6 +82,24 @@ function formatDuration(seconds) {
   return h ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
+/**
+ * Platform facts the UI has to behave differently for.
+ *
+ * iOS is the awkward one: it has no install prompt (the user goes through the
+ * Share sheet by hand), no Web Share Target, and — the part that actually
+ * breaks things — a home-screen web app where a synthetic click on a download
+ * link frequently does nothing at all. So the finished file has to be offered
+ * as a real link the user taps.
+ */
+const platform = {
+  ios: /iphone|ipad|ipod/i.test(navigator.userAgent) ||
+    // iPadOS reports itself as a Mac; the touch points give it away.
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1),
+  get standalone() {
+    return navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
+  },
+};
+
 function looksLikeUrl(value) {
   const text = String(value || '').trim();
   if (!text) return false;
@@ -392,6 +410,24 @@ function finish(entry) {
   state = 'done';
   renderAction();
 
+  recent.unshift(entry);
+  if (recent.length > 8) recent.pop();
+  renderHistory();
+
+  // Inside an iOS home-screen app there is no download manager, and a synthetic
+  // click is silently dropped. The file has to be a link the user taps, opened
+  // out into Safari where saving exists.
+  if (platform.ios && platform.standalone) {
+    renderFeedback(
+      '<div class="notice"><p><strong>Ready.</strong> iOS will not save a file from ' +
+        'inside an installed app, so this opens in Safari — then use the share button ' +
+        'to put it in Files.</p>' +
+        `<a class="save-now" href="${escapeHtml(entry.url)}" target="_blank" rel="noopener">` +
+        'Open and save</a></div>',
+    );
+    return;
+  }
+
   const anchor = document.createElement('a');
   anchor.href = entry.url;
   anchor.download = '';
@@ -399,10 +435,6 @@ function finish(entry) {
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-
-  recent.unshift(entry);
-  if (recent.length > 8) recent.pop();
-  renderHistory();
 
   renderFeedback(
     '<div class="notice"><p><strong>Saved.</strong> Check your downloads. ' +
@@ -487,6 +519,65 @@ function showPhoneHint(urls) {
     '<br>Away from home, put it behind Tailscale or a tunnel — see the README.';
 }
 
+/* ------------------------------------------------------------------ install */
+
+const INSTALL_DISMISSED = 'yt-dlp-web:install-dismissed';
+let installPrompt = null;
+
+/**
+ * Offer installation, which is worth doing here for a concrete reason rather
+ * than habit: installed, the app gets its own icon, opens full screen, and on
+ * Android registers as a share target — so a link goes from the YouTube app
+ * into this one in two taps instead of copy, switch, paste.
+ */
+function setupInstall() {
+  const cta = $('installCta');
+  const button = $('installBtn');
+
+  let dismissed = false;
+  try {
+    dismissed = localStorage.getItem(INSTALL_DISMISSED) === '1';
+  } catch { /* storage off; showing it again is the harmless side */ }
+
+  if (dismissed || platform.standalone) return;
+
+  $('installDismiss').addEventListener('click', () => {
+    cta.hidden = true;
+    try {
+      localStorage.setItem(INSTALL_DISMISSED, '1');
+    } catch { /* nothing to do */ }
+  });
+
+  if (platform.ios) {
+    // No prompt exists on iOS; the Share sheet is the only route, so say so.
+    $('installTitle').textContent = 'Add it to your Home Screen';
+    $('installBody').textContent =
+      'Share button at the bottom of Safari, then "Add to Home Screen". It opens full screen, like an app.';
+    cta.hidden = false;
+    return;
+  }
+
+  window.addEventListener('beforeinstallprompt', (event) => {
+    // Chrome shows its own prompt only if we do not stop it; taking it over
+    // lets the offer sit in the page instead of ambushing the user.
+    event.preventDefault();
+    installPrompt = event;
+    $('installTitle').textContent = 'Install this as an app';
+    $('installBody').textContent =
+      'Own icon, full screen, and you can share links straight from YouTube into it.';
+    button.hidden = false;
+    cta.hidden = false;
+  });
+
+  button.addEventListener('click', async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    await installPrompt.userChoice;
+    installPrompt = null;
+    cta.hidden = true;
+  });
+}
+
 /* --------------------------------------------------------------------- boot */
 
 function readSharedUrl() {
@@ -567,6 +658,7 @@ function init() {
     window.history.replaceState(null, '', location.pathname);
   }
 
+  setupInstall();
   refreshBackendLabel();
 
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
