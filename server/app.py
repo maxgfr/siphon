@@ -396,9 +396,48 @@ async def unsafe_url_handler(_request: Request, exc: UnsafeUrl) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
+def lan_addresses() -> list[str]:
+    """
+    The addresses this machine is reachable at from the rest of the network.
+
+    Answers the question every self-hoster asks next — "fine, but how do I open
+    this on my phone?" — without making them go hunting through ipconfig. Only
+    private ranges are returned: a public address here would be an invitation to
+    open a port, which is not something this should encourage.
+    """
+    found: list[str] = []
+    try:
+        hostname = socket.gethostname()
+        candidates = {info[4][0] for info in socket.getaddrinfo(hostname, None, socket.AF_INET)}
+    except socket.gaierror:
+        candidates = set()
+
+    # getaddrinfo often reports only loopback in a container, so also ask the
+    # routing table which address would be used to reach the outside world.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.168.255.255", 1))
+        candidates.add(probe.getsockname()[0])
+    except OSError:
+        pass
+    finally:
+        probe.close()
+
+    for address in sorted(candidates):
+        try:
+            parsed = ipaddress.ip_address(address)
+        except ValueError:
+            continue
+        if parsed.is_private and not parsed.is_loopback and not parsed.is_link_local:
+            found.append(address)
+    return found
+
+
 @app.get("/api/health")
-async def health() -> dict[str, Any]:
+async def health(request: Request) -> dict[str, Any]:
+    port = request.url.port or (443 if request.url.scheme == "https" else 80)
     return {
+        "lanUrls": [f"http://{address}:{port}" for address in lan_addresses()],
         "ok": True,
         "service": "yt-dlp-web",
         "ytDlpVersion": yt_dlp.version.__version__,

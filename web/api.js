@@ -99,6 +99,7 @@ export class ServerBackend {
       label: `yt-dlp ${body.ytDlpVersion || '?'}`,
       ffmpeg: body.ffmpeg !== false,
       presets: Array.isArray(body.presets) ? body.presets.map((p) => p.id) : null,
+      lanUrls: Array.isArray(body.lanUrls) ? body.lanUrls : [],
     };
   }
 

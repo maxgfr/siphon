@@ -79,12 +79,55 @@ Verified in a real browser: a page on `https://maxgfr.github.io` drove yt-dlp on
 arrived. The same page served from a different hostname was refused.
 
 **On a phone this particular trick cannot work** — there is nothing running on
-the phone. Two options there:
+the phone. See the next section for what to do instead.
 
-- Same Wi-Fi as your computer: open `http://<your-computer-ip>:8000` in the
-  phone's browser. The container serves the interface too, so everything is
-  one plain-HTTP origin and there is no mixed content to block.
-- Anywhere else: deploy the server, below.
+## Using it from your phone
+
+Three routes, easiest first.
+
+### 1. Same Wi-Fi — nothing to set up
+
+Open **Settings → Test** on your computer and the app prints the address to use,
+something like `http://192.168.1.42:8000`. Type that into the phone's browser.
+
+The container serves the interface as well as the API, so the phone gets
+everything from one plain-HTTP origin — no CORS, no mixed content, no
+configuration. Then **Add to Home Screen** and it behaves like an app: its own
+icon, full screen, and on Android it registers as a share target, so you can
+share a link straight from the YouTube app into it.
+
+Needs your computer awake and on the same network.
+
+### 2. Tailscale — from anywhere, still your own machine
+
+The best of the three, and free. Install [Tailscale](https://tailscale.com) on
+both the computer and the phone, sign in to the same account, then:
+
+```sh
+tailscale serve --bg 8000
+```
+
+That publishes the app inside your private network at a real HTTPS address
+(`https://<machine>.<tailnet>.ts.net`, needs MagicDNS and HTTPS enabled once in
+the admin console). Open it on the phone from anywhere — mobile data included.
+No port forwarding, nothing exposed to the internet, and a genuine certificate,
+so **Add to Home Screen** gives you a proper installed app.
+
+A free one-off alternative, with no account, is a quick Cloudflare tunnel —
+but it puts the app on a public URL, so set `AUTH_TOKEN` first:
+
+```sh
+cloudflared tunnel --url http://localhost:8000
+```
+
+### 3. A deployed server — the computer can be off
+
+Deploy it (next section) and the phone works from anywhere with nothing of yours
+running. The trade-off is worth knowing before you pick it: **YouTube treats
+datacenter IP ranges with much more suspicion than home connections**, so a
+hosted instance runs into "Sign in to confirm you're not a bot" far more often
+than the same code on your own machine. If downloads start failing that way,
+route 2 is usually the cure.
 
 ## Deploy the server in one click
 

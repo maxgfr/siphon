@@ -460,9 +460,31 @@ async function testConnection() {
   try {
     const info = await makeBackend(draftSettings()).health();
     setStatus('ok', `Reachable — ${info.label}${info.ffmpeg === false ? ', but no ffmpeg' : ''}`);
+    showPhoneHint(info.lanUrls || []);
   } catch (error) {
     setStatus('bad', error instanceof BackendError ? error.message : 'Could not reach it.');
+    showPhoneHint([]);
   }
+}
+
+/**
+ * Answer "how do I use this from my phone?" with the actual address, rather
+ * than sending the user off to find their own IP. Only shown for a server on
+ * this network — a deployed one is already reachable from anywhere.
+ */
+function showPhoneHint(urls) {
+  const host = $('phoneHint');
+  const body = $('phoneHintBody');
+  if (!urls.length) {
+    host.hidden = true;
+    return;
+  }
+  host.hidden = false;
+  body.innerHTML =
+    'On the same Wi-Fi, open this in the phone\'s browser — it serves the app itself, ' +
+    'so there is nothing else to set up:<br>' +
+    urls.map((url) => `<strong style="font-family:var(--mono)">${escapeHtml(url)}</strong>`).join('<br>') +
+    '<br>Away from home, put it behind Tailscale or a tunnel — see the README.';
 }
 
 /* --------------------------------------------------------------------- boot */
