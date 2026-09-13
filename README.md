@@ -108,27 +108,41 @@ download manager, and a scripted download is silently dropped. So on installed
 iOS the finished file is offered as a link you tap, which opens in Safari where
 saving works. Everywhere else the file just downloads.
 
-### 2. Tailscale — from anywhere, still your own machine
+### 2. From anywhere, still on your own machine
 
-The best of the three, and free. Install [Tailscale](https://tailscale.com) on
-both the computer and the phone, sign in to the same account, then:
+Your phone needs a way to reach your computer once it leaves the Wi-Fi. Pick
+whichever you dislike least — the app does not care which.
 
-```sh
-tailscale serve --bg 8000
-```
-
-That publishes the app inside your private network at a real HTTPS address
-(`https://<machine>.<tailnet>.ts.net`, needs MagicDNS and HTTPS enabled once in
-the admin console). Open it on the phone from anywhere — mobile data included.
-No port forwarding, nothing exposed to the internet, and a genuine certificate,
-so **Add to Home Screen** gives you a proper installed app.
-
-A free one-off alternative, with no account, is a quick Cloudflare tunnel —
-but it puts the app on a public URL, so set `AUTH_TOKEN` first:
+**A tunnel — no VPN, no account, no router settings.** Cloudflare will hand you
+a public HTTPS address that points at your machine:
 
 ```sh
-cloudflared tunnel --url http://localhost:8000
+docker compose -f docker-compose.yml -f docker-compose.tunnel.yml up -d
+docker compose logs cloudflared | grep trycloudflare.com
 ```
+
+That prints the address. Open it on the phone.
+
+Two things to know before you do. It is a **public** URL: anyone who has it can
+use your downloader on your connection, so set `AUTH_TOKEN` in
+`docker-compose.yml` first and put the same value in the app's settings — the
+server prints a warning at startup when it has no key. And the address changes
+every restart, which is the price of needing no account. A named tunnel (a free
+Cloudflare account plus a domain you own) gives a fixed one.
+
+**A mesh VPN — nothing public at all.** Your devices see each other privately and
+the service is never exposed to the internet.
+[Tailscale](https://tailscale.com) is the least work,
+[NetBird](https://github.com/netbirdio/netbird) and
+[ZeroTier](https://github.com/zerotier/ZeroTierOne) are alternatives,
+[Headscale](https://github.com/juanfont/headscale) is a self-hosted control
+server if you want no third party in the loop, and plain WireGuard is the
+do-it-yourself version. All of them need an app on both devices.
+
+**Forwarding a port on your router** also works, but it is the option to reach
+for last: it puts the service on the open internet, you have to obtain a
+certificate yourself, and many ISPs now use carrier-grade NAT, which makes it
+impossible regardless.
 
 ### 3. A deployed server — the computer can be off
 

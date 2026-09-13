@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import os
 import re
 import shutil
@@ -25,9 +26,10 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, AsyncIterator, Literal
 from urllib.parse import urlparse
 
 import yt_dlp
@@ -358,7 +360,31 @@ class ProbeRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
 
 
-app = FastAPI(title="yt-dlp-web", docs_url="/api/docs", openapi_url="/api/openapi.json")
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """
+    Say something once, at boot, if this is running without a key.
+
+    Unset is a perfectly good choice on a laptop or a LAN. It is a bad one the
+    moment a tunnel or a port-forward puts the service on the open internet, and
+    that step happens elsewhere — so the warning belongs where the process can
+    actually be seen starting, rather than in a README nobody re-reads.
+    """
+    if not AUTH_TOKEN:
+        logging.getLogger("uvicorn.error").warning(
+            "AUTH_TOKEN is not set: anyone who can reach this server can use it to download. "
+            "That is fine on localhost or your own LAN. If you are putting this behind a tunnel "
+            "or forwarding a port to it, set AUTH_TOKEN first."
+        )
+    yield
+
+
+app = FastAPI(
+    title="yt-dlp-web",
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
+    lifespan=lifespan,
+)
 
 
 app.add_middleware(

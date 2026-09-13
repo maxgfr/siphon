@@ -516,7 +516,7 @@ function showPhoneHint(urls) {
     'On the same Wi-Fi, open this in the phone\'s browser — it serves the app itself, ' +
     'so there is nothing else to set up:<br>' +
     urls.map((url) => `<strong style="font-family:var(--mono)">${escapeHtml(url)}</strong>`).join('<br>') +
-    '<br>Away from home, put it behind Tailscale or a tunnel — see the README.';
+    '<br>Away from home, put it behind a tunnel or a VPN — see the README.';
 }
 
 /* ------------------------------------------------------------------ install */

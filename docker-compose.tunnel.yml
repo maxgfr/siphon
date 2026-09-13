@@ -1,0 +1,23 @@
+# Reach your own machine from anywhere, without a VPN and without opening a port
+# on your router.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tunnel.yml up -d
+#   docker compose logs cloudflared | grep trycloudflare.com
+#
+# The second command prints the https URL the tunnel got. Open that on the phone.
+#
+# Read this before using it: a quick tunnel is a PUBLIC address. Anyone who has
+# it can drive your downloader, on your connection. AUTH_TOKEN is therefore not
+# optional here — set it in docker-compose.yml first, and enter the same value
+# in the app's settings.
+#
+# The URL also changes every restart. That is the price of needing no account;
+# a named tunnel (a Cloudflare account plus a domain you own) gives a fixed
+# address instead.
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --url http://yt-dlp-web:8000
+    depends_on:
+      - yt-dlp-web
+    restart: unless-stopped
