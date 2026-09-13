@@ -29,10 +29,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # enablement: true turns Pages on for the repository the first time this
-      # runs. Without it the action only *looks up* an existing Pages site, and
-      # a repo that has never had one fails with "Get Pages site failed" — which
-      # is exactly how this workflow failed on its first run.
+      # ONE-TIME MANUAL STEP: Settings -> Pages -> Source: "GitHub Actions".
+      #
+      # enablement: true asks the action to create the Pages site itself, which
+      # it can do in some repositories. It could not here: the workflow's
+      # GITHUB_TOKEN may deploy to Pages but not create the site, and the run
+      # fails with "Create Pages site failed. Resource not accessible by
+      # integration". Creating it needs repository admin, once, by hand.
+      #
+      # Left at true because it is free: once the site exists the action finds
+      # it and never attempts creation again.
       - uses: actions/configure-pages@v5
         with:
           enablement: true

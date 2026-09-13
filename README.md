@@ -196,8 +196,12 @@ needs an HTTPS backend.
 
 ### Using the GitHub Pages frontend instead
 
-If you would rather not expose the interface, publish `web/` to Pages (the
-included workflow does it on every push to `main`) and point it at your server
+**Enable Pages once by hand first:** Settings → Pages → Source → *GitHub
+Actions*. The workflow cannot do this for you — its token may deploy to Pages
+but not create the site, which needs repository admin.
+
+After that, publish `web/` to Pages (the included workflow does it on every push
+to `main`) and point it at your server
 in **Settings → Your own server**. Then set `ALLOWED_ORIGINS` on the server to
 your Pages URL so it stops accepting requests from anywhere:
 
