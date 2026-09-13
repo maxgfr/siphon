@@ -1,0 +1,502 @@
+"""
+yt-dlp-web — the self-hosted half.
+
+A small HTTP wrapper around yt-dlp, meant to sit behind the static frontend in
+web/. It exists because a browser tab cannot do this job itself: the media hosts
+send no CORS headers, and getting a playable stream URL out of YouTube means
+running its signature JavaScript. So the browser asks this service, and this
+service runs the real yt-dlp.
+
+Downloads are jobs rather than one long request. A phone on mobile data will
+drop a 10-minute HTTP response, and a progress bar is the difference between
+"working" and "broken" on a small screen — both need the work to outlive the
+request that started it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import os
+import re
+import shutil
+import socket
+import tempfile
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import urlparse
+
+import yt_dlp
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+# --------------------------------------------------------------------- config
+
+# Comma-separated origins, or "*". The frontend is served from GitHub Pages
+# while this runs somewhere else entirely, so cross-origin is the normal case,
+# not the exception.
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+
+# Optional shared secret. Unset means open — fine on a LAN or behind Tailscale,
+# not fine on a public URL, and the health endpoint reports which one you are in
+# so the frontend can warn you.
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()
+
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "3"))
+JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", str(60 * 60)))
+# Opt-in escape hatch for the one legitimate private-address case: pulling from
+# something on your own LAN (a NAS, a local media server). It is off by default
+# because leaving it on turns this service into an SSRF probe for whoever can
+# reach it — see assert_fetchable for what it disables.
+ALLOW_PRIVATE_HOSTS = os.environ.get("ALLOW_PRIVATE_HOSTS", "").strip().lower() in ("1", "true", "yes")
+
+DOWNLOAD_ROOT = Path(os.environ.get("DOWNLOAD_DIR", tempfile.gettempdir())) / "yt-dlp-web"
+DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+
+# Serve the frontend from the same origin when it is present. That is what makes
+# `docker run` a complete product rather than half of one — and it sidesteps
+# CORS and mixed-content entirely for people who self-host both halves.
+WEB_DIR = Path(os.environ.get("WEB_DIR", Path(__file__).resolve().parent.parent / "web"))
+
+# ------------------------------------------------------------------- presets
+
+# Kept deliberately small. The frontend shows exactly these, and anything not on
+# this list cannot be requested — an arbitrary format string from the client
+# would be a way to smuggle yt-dlp options through.
+PRESETS: dict[str, dict[str, Any]] = {
+    "video_best": {
+        "label": "Best quality",
+        "kind": "video",
+        "opts": {"format": "bv*+ba/b", "merge_output_format": "mp4"},
+    },
+    "video_1080": {
+        "label": "1080p",
+        "kind": "video",
+        "opts": {
+            "format": "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b",
+            "merge_output_format": "mp4",
+        },
+    },
+    "video_720": {
+        "label": "720p",
+        "kind": "video",
+        "opts": {
+            "format": "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
+            "merge_output_format": "mp4",
+        },
+    },
+    "video_480": {
+        "label": "480p",
+        "kind": "video",
+        "opts": {
+            "format": "bv*[height<=480]+ba/b[height<=480]/bv*+ba/b",
+            "merge_output_format": "mp4",
+        },
+    },
+    "audio_mp3": {
+        "label": "MP3",
+        "kind": "audio",
+        "opts": {
+            "format": "ba/b",
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}
+            ],
+        },
+    },
+    "audio_m4a": {
+        "label": "M4A",
+        "kind": "audio",
+        "opts": {
+            "format": "ba[ext=m4a]/ba/b",
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "0"}
+            ],
+        },
+    },
+}
+
+# ------------------------------------------------------------ url validation
+
+
+class UnsafeUrl(ValueError):
+    """The URL is syntactically fine but must not be fetched."""
+
+
+def assert_fetchable(raw: str) -> str:
+    """
+    Reject anything that is not a public http(s) URL.
+
+    This service fetches URLs chosen by whoever can reach it, which is the
+    textbook setup for SSRF: without this check, `http://169.254.169.254/...`
+    would hand out the host's cloud credentials, and yt-dlp's `file://` support
+    would read local disk. Names are resolved here and every resulting address
+    checked, because a public hostname is free to resolve to 127.0.0.1.
+    """
+    url = (raw or "").strip()
+    if not url:
+        raise UnsafeUrl("No URL given.")
+    if len(url) > 2048:
+        raise UnsafeUrl("That URL is too long.")
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise UnsafeUrl("Only http:// and https:// links can be downloaded.")
+    if not parsed.hostname:
+        raise UnsafeUrl("That URL has no host.")
+
+    if ALLOW_PRIVATE_HOSTS:
+        return url
+
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, None)
+    except socket.gaierror as exc:
+        raise UnsafeUrl(f"Could not resolve {parsed.hostname}.") from exc
+
+    for info in infos:
+        address = ipaddress.ip_address(info[4][0])
+        if (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+            or address.is_unspecified
+        ):
+            raise UnsafeUrl("That address is on a private network, so it will not be fetched.")
+    return url
+
+
+# ----------------------------------------------------------------- job model
+
+JobState = Literal["queued", "running", "done", "error"]
+
+
+@dataclass
+class Job:
+    id: str
+    url: str
+    preset: str
+    state: JobState = "queued"
+    progress: float = 0.0
+    speed: float | None = None
+    eta: int | None = None
+    total_bytes: int | None = None
+    title: str | None = None
+    thumbnail: str | None = None
+    filename: str | None = None
+    error: str | None = None
+    created: float = field(default_factory=time.time)
+    # Set once the postprocessing step starts, so the UI can stop showing a
+    # percentage that has already hit 100 and say "converting" instead.
+    stage: str = "starting"
+
+    @property
+    def directory(self) -> Path:
+        return DOWNLOAD_ROOT / self.id
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "state": self.state,
+            "stage": self.stage,
+            "progress": round(self.progress, 3),
+            "speed": self.speed,
+            "eta": self.eta,
+            "totalBytes": self.total_bytes,
+            "title": self.title,
+            "thumbnail": self.thumbnail,
+            "filename": self.filename,
+            "error": self.error,
+        }
+
+
+JOBS: dict[str, Job] = {}
+JOBS_LOCK = threading.Lock()
+RUNNING = threading.Semaphore(MAX_CONCURRENT_JOBS)
+
+
+def sweep_expired() -> None:
+    """Drop finished jobs and their files once they are past the TTL."""
+    cutoff = time.time() - JOB_TTL_SECONDS
+    with JOBS_LOCK:
+        stale = [job for job in JOBS.values() if job.created < cutoff]
+        for job in stale:
+            JOBS.pop(job.id, None)
+    for job in stale:
+        shutil.rmtree(job.directory, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ download
+
+
+def _hook(job: Job):
+    def hook(status: dict[str, Any]) -> None:
+        if status.get("status") == "downloading":
+            job.stage = "downloading"
+            total = status.get("total_bytes") or status.get("total_bytes_estimate")
+            done = status.get("downloaded_bytes") or 0
+            if total:
+                job.total_bytes = int(total)
+                job.progress = min(done / total, 1.0)
+            job.speed = status.get("speed")
+            job.eta = status.get("eta")
+        elif status.get("status") == "finished":
+            # yt-dlp reports "finished" per stream: with separate video and audio
+            # this fires twice, and the merge has not started yet.
+            job.progress = 1.0
+            job.stage = "processing"
+
+    return hook
+
+
+def _postprocessor_hook(job: Job):
+    def hook(status: dict[str, Any]) -> None:
+        if status.get("status") == "started":
+            job.stage = "processing"
+
+    return hook
+
+
+def run_job(job: Job) -> None:
+    """Run one download to completion. Executed on a worker thread."""
+    with RUNNING:
+        job.state = "running"
+        job.directory.mkdir(parents=True, exist_ok=True)
+        preset = PRESETS[job.preset]
+
+        options: dict[str, Any] = {
+            # %(title).150B truncates on BYTES, not characters — a CJK title that
+            # fits 150 characters can still blow past a 255-byte filesystem limit.
+            "outtmpl": str(job.directory / "%(title).150B [%(id)s].%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "restrictfilenames": False,
+            "windowsfilenames": True,
+            "concurrent_fragment_downloads": 4,
+            "retries": 5,
+            "fragment_retries": 5,
+            "progress_hooks": [_hook(job)],
+            "postprocessor_hooks": [_postprocessor_hook(job)],
+            **preset["opts"],
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(job.url, download=True)
+                if info.get("_type") == "playlist":
+                    entries = [e for e in info.get("entries", []) if e]
+                    if not entries:
+                        raise yt_dlp.utils.DownloadError("That playlist is empty.")
+                    info = entries[0]
+                job.title = info.get("title")
+                job.thumbnail = info.get("thumbnail")
+
+            # Trust the directory over yt-dlp's reported path: postprocessors
+            # rename the file (.webm -> .mp3) after the info dict is built, so
+            # the recorded name is routinely the one that no longer exists.
+            files = [p for p in job.directory.iterdir() if p.is_file()]
+            if not files:
+                raise FileNotFoundError("yt-dlp produced no file.")
+            chosen = max(files, key=lambda p: p.stat().st_size)
+            job.filename = chosen.name
+            job.progress = 1.0
+            job.stage = "ready"
+            job.state = "done"
+        except Exception as exc:  # noqa: BLE001 — surfaced to the user verbatim
+            job.state = "error"
+            job.stage = "failed"
+            job.error = humanize_error(exc)
+
+
+def humanize_error(exc: Exception) -> str:
+    """Turn yt-dlp's stderr-shaped messages into something worth showing a user."""
+    text = str(exc)
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    text = re.sub(r"^ERROR:\s*", "", text).strip()
+    text = re.sub(r";\s*please report this issue.*$", "", text, flags=re.S).strip()
+
+    lowered = text.lower()
+    if "sign in to confirm" in lowered or "bot" in lowered and "confirm" in lowered:
+        return (
+            "The site asked this server to prove it is not a bot. That usually means the "
+            "host's IP is rate-limited — trying again later, or from a server on a different "
+            "network, is the fix."
+        )
+    if "private video" in lowered:
+        return "That video is private."
+    if "video unavailable" in lowered:
+        return "That video is unavailable."
+    if "members-only" in lowered or "this video is available to" in lowered:
+        return "That video is members-only."
+    if "unsupported url" in lowered:
+        return "yt-dlp does not recognise that link."
+    if "is not a valid url" in lowered:
+        return "That does not look like a link."
+    if "ffmpeg" in lowered and "not" in lowered:
+        return "ffmpeg is missing on the server, so the streams cannot be merged or converted."
+    return text[:400] or "The download failed."
+
+
+# ---------------------------------------------------------------------- api
+
+
+class JobRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+    preset: str = "video_best"
+
+
+class ProbeRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+
+
+app = FastAPI(title="yt-dlp-web", docs_url="/api/docs", openapi_url="/api/openapi.json")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+
+def check_auth(authorization: str | None) -> None:
+    if not AUTH_TOKEN:
+        return
+    expected = f"Bearer {AUTH_TOKEN}"
+    # Constant-time: a plain == leaks the token one character at a time.
+    import hmac
+
+    if not authorization or not hmac.compare_digest(authorization, expected):
+        raise HTTPException(status_code=401, detail="This server needs an access key.")
+
+
+@app.exception_handler(UnsafeUrl)
+async def unsafe_url_handler(_request: Request, exc: UnsafeUrl) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.get("/api/health")
+async def health() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "service": "yt-dlp-web",
+        "ytDlpVersion": yt_dlp.version.__version__,
+        "ffmpeg": shutil.which("ffmpeg") is not None,
+        "requiresKey": bool(AUTH_TOKEN),
+        "allowsPrivateHosts": ALLOW_PRIVATE_HOSTS,
+        "presets": [{"id": key, "label": value["label"], "kind": value["kind"]} for key, value in PRESETS.items()],
+    }
+
+
+@app.post("/api/probe")
+async def probe(body: ProbeRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """Metadata only, no download — what the UI shows while you pick a quality."""
+    check_auth(authorization)
+    url = assert_fetchable(body.url)
+
+    def extract() -> dict[str, Any]:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    try:
+        info = await asyncio.wait_for(asyncio.to_thread(extract), timeout=60)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="The site took too long to answer.")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=humanize_error(exc))
+
+    if info.get("_type") == "playlist":
+        entries = [e for e in info.get("entries", []) if e]
+        if not entries:
+            raise HTTPException(status_code=400, detail="That playlist is empty.")
+        info = entries[0]
+
+    return {
+        "title": info.get("title"),
+        "uploader": info.get("uploader") or info.get("channel"),
+        "duration": info.get("duration"),
+        "thumbnail": info.get("thumbnail"),
+        "extractor": info.get("extractor_key"),
+        "isLive": bool(info.get("is_live")),
+    }
+
+
+@app.post("/api/jobs")
+async def create_job(body: JobRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    check_auth(authorization)
+    sweep_expired()
+
+    if body.preset not in PRESETS:
+        raise HTTPException(status_code=400, detail=f"Unknown preset: {body.preset}")
+    url = assert_fetchable(body.url)
+
+    with JOBS_LOCK:
+        active = sum(1 for job in JOBS.values() if job.state in ("queued", "running"))
+        if active >= MAX_CONCURRENT_JOBS * 4:
+            raise HTTPException(status_code=429, detail="Too many downloads in flight. Try again shortly.")
+        job = Job(id=uuid.uuid4().hex[:16], url=url, preset=body.preset)
+        JOBS[job.id] = job
+
+    threading.Thread(target=run_job, args=(job,), daemon=True).start()
+    return job.public()
+
+
+@app.get("/api/jobs/{job_id}")
+async def read_job(job_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    check_auth(authorization)
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No such download.")
+    return job.public()
+
+
+@app.get("/api/jobs/{job_id}/file")
+async def read_file(job_id: str, key: str | None = None, authorization: str | None = Header(default=None)):
+    """
+    The actual bytes.
+
+    Takes the key as a query parameter as well as a header: this URL is handed
+    to the browser's own downloader (a plain navigation), which cannot carry an
+    Authorization header.
+    """
+    if AUTH_TOKEN and not authorization:
+        authorization = f"Bearer {key}" if key else None
+    check_auth(authorization)
+
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No such download.")
+    if job.state != "done" or not job.filename:
+        raise HTTPException(status_code=409, detail="That download is not ready yet.")
+
+    path = job.directory / job.filename
+    # The name came from yt-dlp, not the client, but resolve anyway — this is
+    # the one place a path leaves the process.
+    if not path.resolve().is_relative_to(job.directory.resolve()) or not path.exists():
+        raise HTTPException(status_code=404, detail="That file is gone.")
+
+    return FileResponse(path, filename=job.filename, media_type="application/octet-stream")
+
+
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(job_id: str, authorization: str | None = Header(default=None)) -> dict[str, bool]:
+    check_auth(authorization)
+    with JOBS_LOCK:
+        job = JOBS.pop(job_id, None)
+    if job:
+        shutil.rmtree(job.directory, ignore_errors=True)
+    return {"deleted": bool(job)}
+
+
+# Mounted last so /api/* always wins over a same-named static file.
+if WEB_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")

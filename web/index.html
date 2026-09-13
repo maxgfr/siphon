@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark light" />
+<title>yt-dlp-web — download video and audio in your browser</title>
+<meta name="description" content="Paste a link, pick a quality, get the file. A mobile-first web front end for yt-dlp, with no app to install." />
+<meta name="theme-color" content="#0e1315" media="(prefers-color-scheme: dark)" />
+<meta name="theme-color" content="#f2f5f5" media="(prefers-color-scheme: light)" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-title" content="yt-dlp-web" />
+<link rel="manifest" href="./manifest.webmanifest" />
+<link rel="icon" href="./icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="./icon-180.png" />
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+
+<div class="shell">
+  <header class="topbar">
+    <div class="mark">
+      <svg width="30" height="30" viewBox="0 0 32 32" aria-hidden="true">
+        <rect width="32" height="32" rx="9" fill="#5ee0c5" />
+        <path d="M16 7v11.5M16 19.5 10.5 14M16 19.5 21.5 14M8.5 24.5h15"
+              stroke="#052420" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" fill="none" />
+      </svg>
+      <span class="mark-text">
+        <span class="mark-name">yt-dlp-web</span>
+        <span class="mark-sub" id="backendLabel">checking server…</span>
+      </span>
+    </div>
+    <button class="icon-btn" type="button" id="openSettings" aria-label="Settings">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="3.2" />
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+      </svg>
+    </button>
+  </header>
+
+  <main>
+    <h1 class="sr-only">Download video and audio with yt-dlp</h1>
+
+    <div class="field">
+      <label class="sr-only" for="url">Link to download</label>
+      <input type="url" id="url" name="url" inputmode="url" autocomplete="off"
+             autocapitalize="off" autocorrect="off" spellcheck="false"
+             enterkeyhint="go" placeholder="Paste a link" />
+      <button class="chip-btn" type="button" id="paste">Paste</button>
+    </div>
+
+    <div id="preview" hidden></div>
+
+    <span class="section-label" id="qualityLabel">Quality</span>
+    <div class="qualities" id="qualities" role="radiogroup" aria-labelledby="qualityLabel"></div>
+
+    <div id="feedback" aria-live="polite"></div>
+
+    <section class="history" id="history" hidden>
+      <span class="section-label">This session</span>
+      <ol id="historyList"></ol>
+    </section>
+
+    <footer class="legal">
+      <p>Download only what you have the right to download, and respect each site's terms.</p>
+      <p id="privacyNote"></p>
+    </footer>
+  </main>
+</div>
+
+<div class="actionbar">
+  <div class="actionbar-inner" id="actionSlot">
+    <button class="btn-go" type="button" id="go" disabled>
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 4v11M12 15l-5-5M12 15l5-5M5 20h14" />
+      </svg>
+      <span id="goText">Download</span>
+    </button>
+  </div>
+</div>
+
+<dialog class="sheet" id="settings" aria-labelledby="settingsTitle">
+  <div class="sheet-inner">
+    <div class="sheet-head">
+      <h2 id="settingsTitle">Where downloads come from</h2>
+      <button class="icon-btn" type="button" id="closeSettings" aria-label="Close">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.4" stroke-linecap="round" aria-hidden="true">
+          <path d="M6 6l12 12M18 6L6 18" />
+        </svg>
+      </button>
+    </div>
+    <p class="explain">
+      A web page cannot reach a video host directly — browsers block it, and the stream URLs are
+      signed. Something has to run yt-dlp for you. Pick what.
+    </p>
+
+    <div class="mode" role="radiogroup" aria-label="Download source">
+      <label>
+        <input type="radio" name="mode" value="server" id="modeServer" />
+        <span>
+          <b>Your own server</b>
+          <small>Runs yt-dlp itself. Every site yt-dlp supports, real progress, nothing goes
+            through a stranger. Deploy the <code>server/</code> folder from this project.</small>
+        </span>
+      </label>
+      <label>
+        <input type="radio" name="mode" value="public" id="modePublic" />
+        <span>
+          <b>A public instance</b>
+          <small>No server to run. Instances are shared, so they rate-limit, ask for a captcha,
+            or disappear — treat this as the fallback, not the plan.</small>
+        </span>
+      </label>
+    </div>
+
+    <div id="serverFields">
+      <label class="lbl" for="serverUrl">Server address</label>
+      <input type="url" id="serverUrl" inputmode="url" autocapitalize="off" autocorrect="off"
+             spellcheck="false" placeholder="https://ytdl.example.com" />
+      <p class="hint">Leave empty to use the server this page is served from, when there is one.</p>
+
+      <label class="lbl" for="serverKey">Access key <span style="font-weight:400;color:var(--muted)">— if the server asks for one</span></label>
+      <input type="password" id="serverKey" autocomplete="off" placeholder="Optional" />
+    </div>
+
+    <div id="publicFields" hidden>
+      <label class="lbl" for="publicUrl">Instance API</label>
+      <input type="url" id="publicUrl" inputmode="url" autocapitalize="off" autocorrect="off"
+             spellcheck="false" placeholder="https://your-cobalt-instance.example" />
+      <p class="hint">
+        Any <a href="https://github.com/imputnet/cobalt" target="_blank" rel="noopener noreferrer">cobalt</a>
+        instance. There is no official public one, so bring an address you trust — it will see
+        every link you paste.
+      </p>
+
+      <label class="lbl" for="publicKey">API key <span style="font-weight:400;color:var(--muted)">— if the instance asks for one</span></label>
+      <input type="password" id="publicKey" autocomplete="off" placeholder="Optional" />
+    </div>
+
+    <div class="status-line">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">Not checked yet</span>
+    </div>
+
+    <div class="sheet-actions">
+      <button type="button" id="testConnection">Test</button>
+      <button type="button" class="primary" id="saveSettings">Save</button>
+    </div>
+  </div>
+</dialog>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

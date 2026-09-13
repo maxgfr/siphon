@@ -1,0 +1,21 @@
+services:
+  yt-dlp-web:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # Same-origin by default, because this container serves the frontend too.
+      # Add your GitHub Pages URL here if you use the hosted frontend instead.
+      ALLOWED_ORIGINS: "*"
+      # Set this the moment the server is reachable from outside your network.
+      # AUTH_TOKEN: "change-me"
+      MAX_CONCURRENT_JOBS: "3"
+      JOB_TTL_SECONDS: "3600"
+    volumes:
+      - downloads:/tmp/yt-dlp-web
+    restart: unless-stopped
+
+volumes:
+  downloads:

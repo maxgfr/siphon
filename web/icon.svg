@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="yt-dlp-web">
+  <rect width="512" height="512" rx="112" fill="#0e1315"/>
+  <rect x="44" y="44" width="424" height="424" rx="88" fill="#5ee0c5"/>
+  <path d="M256 128v168M256 296l-72-72M256 296l72-72M148 372h216"
+        stroke="#052420" stroke-width="38" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>
