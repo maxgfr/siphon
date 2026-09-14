@@ -69,6 +69,40 @@ Projects advertising a backend-free YouTube downloader are, as far as we can
 tell, all using someone else's server for that last hop. This one is honest
 about which hop that is.
 
+### What actually moves the wall — and what does not
+
+CORS is enforced by whatever is running the page, so changing *that* can lift
+it. Changing where the page runs cannot.
+
+**An emulator or a simulator buys nothing.** Chrome in an Android emulator is
+Chrome: same origin policy, same refusal. The wall is in the browser, not in
+the hardware under it. Nothing is gained by pretending to be a phone.
+
+**A different host for the page does buy something**, because it is no longer a
+browser tab making the request:
+
+| route | lifts CORS | what it costs |
+|---|---|---|
+| [Termux](https://termux.dev) on Android | n/a — real yt-dlp, on the phone | a terminal app, and a build or two |
+| a WebView shell (Capacitor, Cordova) | yes — the native layer fetches | an APK to install and keep signed |
+| a browser extension | yes — host permissions bypass it | desktop, or Firefox for Android only |
+| a relay | no — it satisfies CORS rather than skipping it | one free Worker |
+
+**Termux is the best of these on Android** and needs nothing from this project
+that is not already here: install Python, ffmpeg and yt-dlp, run `server/` on
+the phone, and open `http://localhost:8000` — the container serves the
+interface as well as the API, so there is no CORS to satisfy and no mixed
+content, exactly as in **Quick start** below. `localhost` is a secure context,
+so an installed PWA can call it too. It is the "you are the client" setup with
+the phone as the client. Expect the usual Termux friction on the compiled
+dependencies — plain `uvicorn` rather than `uvicorn[standard]` is the easy path
+— and note this is untested here, unlike the browser-mode results below.
+
+A WebView shell is the only route that is both backend-free *and* works for
+YouTube on a stock phone, because the native HTTP layer is not bound by CORS at
+all. It is not in this repo: it trades "nothing to install" — the premise the
+whole project is built on — for that one site.
+
 ### Browser mode does not do everything
 
 Worth knowing before you switch to it:
@@ -457,9 +491,20 @@ Against yt-dlp 2026.08.19, in a headless Chromium on a Pixel 7 profile:
 
 ### Browser mode
 
-41 unit tests cover the parts that are pure: HLS attribute and playlist
-parsing, byte-range continuation, IV derivation, YouTube URL shapes, page
-scraping precedence, and the whole preset → format decision table.
+54 unit tests cover the parts that can be checked without a network. 41 of them
+are the extractor's pure logic: HLS attribute and playlist parsing, byte-range
+continuation, IV derivation, YouTube URL shapes, page-scraping precedence, and
+the whole preset → format decision table.
+
+The other 13 are the relay. `relay/worker.js` is a plain module with a
+`fetch(request, env)` export and nothing Workers-specific inside, so `node
+--test` calls it directly with a stubbed upstream — which makes the headers it
+chooses to forward directly observable. Covered: preflight reflection, the host
+allow-list (including that `youtube.com.evil.example` does not pass the suffix
+match), the origin allow-list, the refusal of `file://`, loopback, RFC1918 and
+`169.254.169.254`, that cookies and `Authorization` cross in neither direction,
+that a `Range` request and its `206` survive, and that a dead upstream is a 502
+rather than a crash.
 
 Then `npm run test:e2e`, which drives a real headless Chromium with the app on
 one origin and the media on another, so the CORS path under test is the real
@@ -482,10 +527,13 @@ one. All 21 checks pass:
   is in OPFS.
 - No uncaught errors in the page across all of it.
 
-**Not verified here:** the YouTube-through-a-relay path. The environment this
-was built in cannot reach YouTube or a CDN at all, so the InnerTube client, the
-signature solving and the relay were written against the libraries' documented
-behaviour and reviewed, not run. Everything above was run.
+**Not verified here:** how YouTube itself answers. The environment this was
+built in cannot reach YouTube or a CDN at all — the egress gateway refuses the
+connection — so the InnerTube client and the signature solving were written
+against youtubei.js's documented behaviour and reviewed, not run. The relay's
+own decisions are covered by the tests above; what is untested is the reply
+coming back. No emulator would have helped: the block is a network policy, and
+CORS would apply identically inside one anyway.
 
 ## Licence
 

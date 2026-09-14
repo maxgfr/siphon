@@ -159,6 +159,10 @@ export default {
         headers,
         body: request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body,
         redirect: 'follow',
+        // Workers streams a request body without being asked; Node's fetch
+        // refuses to unless told. Harmless there, and it is what lets this
+        // exact file run under `node --test` instead of only in production.
+        duplex: 'half',
       });
     } catch (failure) {
       return deny(`upstream: ${failure?.message || failure}`, request, env, 502);
