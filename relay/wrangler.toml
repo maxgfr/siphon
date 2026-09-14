@@ -1,0 +1,14 @@
+name = "siphon-relay"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+# Which hosts this relay will fetch. Suffix matches, so "googlevideo.com"
+# covers every one of YouTube's numbered media servers. Leave it out to get the
+# defaults in worker.js, which are exactly these.
+ALLOWED_HOSTS = "youtube.com,youtu.be,youtube-nocookie.com,googlevideo.com,ytimg.com,ggpht.com,youtubei.googleapis.com"
+
+# Which pages may use it. SET THIS. Without it, anyone who finds the URL can
+# run their downloads through your worker.
+#
+#   ALLOWED_ORIGINS = "https://yourname.github.io"

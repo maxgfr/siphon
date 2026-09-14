@@ -1,12 +1,21 @@
 /**
- * The two ways this app can actually get a file, behind one interface.
+ * The three ways this app can actually get a file, behind one interface.
  *
- * Both backends answer the same four questions — are you there, what is this
+ * Every backend answers the same four questions — are you there, what is this
  * link, start a download, how is it going — so app.js never branches on which
- * one is in use. Where they genuinely differ is progress: a self-hosted server
- * runs a job we can poll, while a public instance hands back a URL and the
- * browser's own downloader takes it from there.
+ * one is in use. Where they genuinely differ:
+ *
+ *   server    runs yt-dlp; a job to poll, every site yt-dlp knows
+ *   browser   runs the extractor in this page; a job to poll, no server at all
+ *   public    asks a cobalt instance; one URL back, the browser downloads it
+ *
+ * The third has no progress to report, and the second cannot reach hosts that
+ * refuse cross-origin reads. `supports*` flags say so rather than each caller
+ * knowing which is which.
  */
+export { BackendError } from './errors.js';
+import { BackendError } from './errors.js';
+import { BrowserBackend } from './inbrowser.js';
 
 /** The qualities the UI offers. The server validates against its own copy. */
 export const PRESETS = Object.freeze([
@@ -17,16 +26,6 @@ export const PRESETS = Object.freeze([
   { id: 'audio_mp3', label: 'MP3', note: 'audio', kind: 'audio' },
   { id: 'audio_m4a', label: 'M4A', note: 'audio', kind: 'audio' },
 ]);
-
-/** Thrown for anything the user should read as a sentence, not a stack trace. */
-export class BackendError extends Error {
-  constructor(message, { hint = '', retryable = true } = {}) {
-    super(message);
-    this.name = 'BackendError';
-    this.hint = hint;
-    this.retryable = retryable;
-  }
-}
 
 const trimSlash = (value) => String(value || '').trim().replace(/\/+$/, '');
 
@@ -65,6 +64,7 @@ export class ServerBackend {
     this.mode = 'server';
     this.supportsProgress = true;
     this.supportsProbe = true;
+    this.supportsPlaylist = true;
   }
 
   get headers() {
@@ -182,6 +182,7 @@ export class PublicBackend {
     // only progress indicator is the browser's own download UI.
     this.supportsProgress = false;
     this.supportsProbe = false;
+    this.supportsPlaylist = false;
   }
 
   get headers() {
@@ -247,9 +248,13 @@ export class PublicBackend {
   }
 }
 
+/* ------------------------------------------------------------------ browser */
+
+export { BrowserBackend };
+
 /** Build whichever backend the saved settings describe. */
 export function makeBackend(settings) {
-  return settings.mode === 'public'
-    ? new PublicBackend({ base: settings.publicUrl, key: settings.publicKey })
-    : new ServerBackend({ base: settings.serverUrl, key: settings.serverKey });
+  if (settings.mode === 'public') return new PublicBackend({ base: settings.publicUrl, key: settings.publicKey });
+  if (settings.mode === 'browser') return new BrowserBackend({ relay: settings.relayUrl, coreUrl: settings.coreUrl });
+  return new ServerBackend({ base: settings.serverUrl, key: settings.serverKey });
 }
