@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { parseAttributes, parseMaster, parseMedia, isMaster, segmentIv } from '../m3u8.js';
+import { parseAttributes, parseMaster, parseMedia, isMaster, segmentIv } from '../web/m3u8.js';
 
 test('attribute values may contain commas when quoted', () => {
   const attrs = parseAttributes('BANDWIDTH=1280000,CODECS="avc1.64001f,mp4a.40.2",RESOLUTION=1920x1080');

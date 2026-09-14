@@ -11,7 +11,7 @@ import {
   safeFilename,
   titleFromUrl,
   extensionOf,
-} from '../extract.js';
+} from '../web/extract.js';
 
 /* ------------------------------------------------------------------ sniffing */
 

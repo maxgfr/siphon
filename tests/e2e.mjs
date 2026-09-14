@@ -24,7 +24,7 @@ import { extname, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const WEB = join(HERE, '..');
+const WEB = join(HERE, '..', 'web');
 const WORK = join(HERE, '.e2e');
 const MEDIA_DIR = join(WORK, 'media');
 const DOWNLOADS = join(WORK, 'downloads');

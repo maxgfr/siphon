@@ -14,7 +14,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import worker from '../../relay/worker.js';
+import worker from '../relay/worker.js';
 
 const ORIGIN = 'https://maxgfr.github.io';
 

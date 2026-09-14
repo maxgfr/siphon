@@ -460,6 +460,9 @@ The frontend has no build step and no dependencies: plain ES modules, no
 framework, no bundler. Edit and reload. `package.json` exists only so
 `node --test` can reach the extractor; nothing in `web/` imports from it.
 
+Tests live in `tests/`, not under `web/`, because the Pages workflow publishes
+that whole directory — anything left in it is served to the public site.
+
 Where it lives:
 
 | file | what it is |
