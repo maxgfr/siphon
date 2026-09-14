@@ -109,10 +109,10 @@ export class ServerBackend {
     return this.#json('/api/probe', { method: 'POST', body: JSON.stringify({ url }) });
   }
 
-  async start(url, preset, { playlist = false } = {}) {
+  async start(url, preset, { playlist = false, subs = 'off', subLangs = 'en' } = {}) {
     const job = await this.#json('/api/jobs', {
       method: 'POST',
-      body: JSON.stringify({ url, preset, playlist }),
+      body: JSON.stringify({ url, preset, playlist, subs, sub_langs: subLangs }),
     });
     return { kind: 'job', id: job.id };
   }

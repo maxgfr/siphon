@@ -59,11 +59,27 @@
     <span class="section-label" id="qualityLabel">Quality</span>
     <div class="qualities" id="qualities" role="radiogroup" aria-labelledby="qualityLabel"></div>
 
+    <span class="section-label" id="lbl-subs">Subtitles</span>
+    <div class="seg" role="radiogroup" aria-labelledby="lbl-subs">
+      <label><input type="radio" name="subs" value="off" checked /><span>None</span></label>
+      <label><input type="radio" name="subs" value="embed" /><span>In the video</span></label>
+      <label><input type="radio" name="subs" value="files" /><span>Separate files</span></label>
+    </div>
+    <div class="field" id="subLangsField" hidden>
+      <label class="sr-only" for="subLangs">Subtitle languages</label>
+      <input type="text" id="subLangs" spellcheck="false" autocapitalize="off"
+             autocorrect="off" placeholder="en,fr" style="margin-top:8px" />
+      <p class="playlist-note" style="margin-top:6px">
+        Comma-separated. Auto-generated captions are included, since most videos have nothing else.
+      </p>
+    </div>
+
     <div id="feedback" aria-live="polite"></div>
 
-    <section class="history" id="history" hidden>
-      <span class="section-label">This session</span>
-      <ol id="historyList"></ol>
+    <section class="history" id="queue" hidden>
+      <span class="section-label" id="queueLabel">Downloads</span>
+      <ol id="queueList"></ol>
+      <button class="chip-btn" type="button" id="queueClear" style="margin-top:10px">Clear finished</button>
     </section>
 
     <section class="install-cta" id="installCta" hidden>

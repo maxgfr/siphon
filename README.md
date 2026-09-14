@@ -209,6 +209,25 @@ your Pages URL so it stops accepting requests from anywhere:
 ALLOWED_ORIGINS=https://maxgfr.github.io docker compose up -d
 ```
 
+## A queue, not one download at a time
+
+Paste a link, tap Download, and the box clears straight away so the next link can
+go in behind it. Each download becomes its own row with its own progress, and
+several run at once — `MAX_CONCURRENT_JOBS` decides how many.
+
+The rows survive a reload. Finished files stay on the server until the TTL
+sweeps them, so after a refresh siphon asks the server about each one and either
+brings the Save button back or marks the row as gone. A failed row says why and
+offers to try again rather than leaving you to retype the link.
+
+## Subtitles
+
+Off, burned into the container, or as separate `.srt` files beside the video.
+Auto-generated captions are always included in the request: most of YouTube has
+no human subtitles, and asking only for those returns a file with none at all
+and no explanation. Audio presets ignore the setting, since an MP3 has nowhere
+to put them.
+
 ## Playlists and albums
 
 Paste a playlist, a channel or an album and siphon offers to take the lot. It is

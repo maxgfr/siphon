@@ -631,6 +631,44 @@ footer.legal p { margin: 0 0 7px; }
   text-decoration: none;
 }
 
+/* --------------------------------------------------------- segmented rows */
+
+/*
+  A row of mutually exclusive choices, for places where the full card grid used
+  by Quality would be too heavy. The input is visually hidden but keeps its size
+  and stays in the keyboard focus order: a display:none input is unreachable by
+  keyboard, so it is made transparent and stretched over its label instead.
+*/
+.seg { display: flex; flex-wrap: wrap; gap: 7px; }
+.seg label { position: relative; }
+.seg input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+.seg span {
+  display: block;
+  padding: 10px 14px;
+  min-height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.45;
+}
+.seg input:checked + span {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: transparent;
+  font-weight: 650;
+}
+.seg input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 /* ------------------------------------------------------------- playlists */
 
 .playlist-choice {
@@ -649,3 +687,71 @@ footer.legal p { margin: 0 0 7px; }
   font: 500 11.5px/1.4 var(--mono);
   color: var(--muted);
 }
+
+/* ----------------------------------------------------------------- queue */
+
+/*
+  One row per download. Paste, tap, paste again — the row is what makes that
+  safe, because you can see the first one still running while you queue the
+  second. Rows stay put when they finish rather than moving, so the thing you
+  were watching does not jump under your thumb.
+*/
+#queueList li {
+  display: block;
+  padding: 11px 12px;
+}
+.q-top { display: flex; align-items: baseline; gap: 8px; }
+.q-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.q-pct {
+  font: 650 12px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  flex: none;
+}
+.q-bar {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--raised);
+  overflow: hidden;
+  margin-top: 8px;
+}
+.q-fill { height: 100%; width: 0; background: var(--accent); border-radius: inherit; transition: width .25s ease; }
+.q-fill.indeterminate { width: 35%; background: linear-gradient(90deg, transparent, var(--accent), transparent); }
+@media (prefers-reduced-motion: no-preference) {
+  .q-fill.indeterminate { animation: slide 1.1s ease-in-out infinite; }
+}
+.q-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  font: 500 11.5px/1.3 var(--mono);
+  color: var(--muted);
+}
+.q-foot .spacer { margin-left: auto; }
+.q-act {
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink);
+  border-radius: 8px;
+  padding: 7px 11px;
+  font: 600 12px/1 var(--sans);
+  cursor: pointer;
+  min-height: 34px;
+  text-decoration: none;
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+.q-act.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+li.q-error { border-color: var(--danger); background: var(--danger-wash); }
+li.q-error .q-msg { color: var(--danger); }
+.q-msg { font-size: 12px; line-height: 1.45; margin-top: 6px; color: var(--ink-2); }

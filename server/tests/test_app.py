@@ -496,3 +496,70 @@ class TestAudioTagging:
     def test_video_keeps_its_metadata_and_chapters(self, preset: str) -> None:
         pps = server_app.PRESETS[preset]["opts"]["postprocessors"]
         assert any(pp["key"] == "FFmpegMetadata" and pp.get("add_chapters") for pp in pps)
+
+
+# ---------------------------------------------------------------- subtitles
+
+class TestSubtitles:
+    @staticmethod
+    def _job(preset: str = "video_720", **kwargs) -> "server_app.Job":
+        return server_app.Job(id="s1", url="https://example.com/v", preset=preset, **kwargs)
+
+    def test_off_by_default(self) -> None:
+        options = server_app.build_options(self._job(), None)
+        assert "writesubtitles" not in options
+
+    def test_auto_captions_are_included_when_subtitles_are_wanted(self) -> None:
+        """
+        Most of YouTube has no human subtitles. Asking only for those would
+        return a file with no subtitles at all and no explanation.
+        """
+        options = server_app.build_options(self._job(subs="embed"), None)
+        assert options["writesubtitles"] is True
+        assert options["writeautomaticsub"] is True
+
+    def test_languages_are_split_and_trimmed(self) -> None:
+        options = server_app.build_options(self._job(subs="files", sub_langs=" en , fr ,"), None)
+        assert options["subtitleslangs"] == ["en", "fr"]
+
+    def test_embedding_adds_the_postprocessor_and_files_does_not(self) -> None:
+        embed = server_app.build_options(self._job(subs="embed"), None)
+        assert any(pp["key"] == "FFmpegEmbedSubtitle" for pp in embed["postprocessors"])
+        separate = server_app.build_options(self._job(subs="files"), None)
+        assert not any(pp["key"] == "FFmpegEmbedSubtitle" for pp in separate["postprocessors"])
+
+    def test_embedding_does_not_discard_the_metadata_postprocessor(self) -> None:
+        """The subtitle step is appended to the preset's own chain, not swapped in."""
+        options = server_app.build_options(self._job(subs="embed"), None)
+        keys = [pp["key"] for pp in options["postprocessors"]]
+        assert "FFmpegMetadata" in keys
+
+    def test_audio_presets_ignore_subtitles(self) -> None:
+        """An MP3 has nowhere to put them, and fetching them would be waste."""
+        options = server_app.build_options(self._job(preset="audio_mp3", subs="embed"), None)
+        assert "writesubtitles" not in options
+
+    def test_separate_subtitle_files_are_kept(self, tmp_path) -> None:
+        """
+        They were explicitly asked for, so they must survive the media filter —
+        otherwise they are downloaded and then silently dropped.
+        """
+        (tmp_path / "a.mp4").write_bytes(b"x")
+        (tmp_path / "a.en.srt").write_bytes(b"x")
+        (tmp_path / "a.webp").write_bytes(b"x")
+        with_subs = [p.name for p in server_app.media_files(tmp_path, include_subtitles=True)]
+        assert with_subs == ["a.en.srt", "a.mp4"]
+        # And are still treated as leftovers when they were not asked for.
+        assert [p.name for p in server_app.media_files(tmp_path)] == ["a.mp4"]
+
+    def test_an_unknown_value_falls_back_to_off(self) -> None:
+        """The field comes from a client; it is not a free-text yt-dlp option."""
+        client = TestClient(server_app.app)
+        response = client.post(
+            "/api/jobs",
+            json={"url": "http://169.254.169.254/", "preset": "video_720", "subs": "../../etc"},
+        )
+        # Rejected for the URL, which proves it got past validation of `subs`
+        # rather than being accepted as a mode.
+        assert response.status_code == 400
+        assert server_app.Job(id="x", url="u", preset="video_720", subs="off").subs == "off"

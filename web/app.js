@@ -23,16 +23,15 @@ const DEFAULT_SETTINGS = Object.freeze({
   publicUrl: '',
   publicKey: '',
   preset: 'video_best',
+  subs: 'off',
+  subLangs: 'en',
 });
 
 const $ = (id) => document.getElementById(id);
 
 let settings = { ...DEFAULT_SETTINGS };
 let backend = null;
-let state = 'idle';
 let probeToken = 0;
-let activeJob = null;
-let pollTimer = null;
 let lastProbe = null;
 let wantPlaylist = false;
 const recent = [];
@@ -220,94 +219,288 @@ function showError(error) {
   );
 }
 
-/** Swap the action bar between the button and the live progress readout. */
+/** The action bar holds one control: the thing you came to press. */
 function renderAction() {
-  const slot = $('actionSlot');
-  if (state !== 'working') {
-    slot.innerHTML =
-      '<button class="btn-go" type="button" id="go">' +
-      '<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
-      'stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-      '<path d="M12 4v11M12 15l-5-5M12 15l5-5M5 20h14" /></svg>' +
-      '<span id="goText">Download</span></button>';
-    const go = $('go');
-    go.disabled = !looksLikeUrl($('url').value);
-    go.addEventListener('click', startDownload);
-    return;
-  }
+  const go = $('go');
+  if (go) go.disabled = !looksLikeUrl($('url').value);
+}
 
-  slot.innerHTML =
-    '<div class="progress" role="status" aria-live="polite">' +
-    '<div class="progress-head"><span class="progress-stage" id="stage">Starting…</span>' +
-    '<span class="progress-pct" id="pct"></span></div>' +
-    '<div class="bar"><div class="bar-fill indeterminate" id="barFill"></div></div>' +
-    '<p class="progress-foot"><span id="speed"></span><span id="eta"></span>' +
-    '<button type="button" class="cancel" id="cancel">Cancel</button></p></div>';
-  $('cancel').addEventListener('click', cancelDownload);
+/* -------------------------------------------------------------------- queue */
+
+const QUEUE_KEY = 'siphon:queue';
+const QUEUE_MAX = 20;
+
+/** Newest first. Holds running and finished downloads alike — same row, same place. */
+let queue = [];
+let pollTimer = null;
+
+function saveQueue() {
+  try {
+    // Only what is needed to redraw a row and re-find the file on the server.
+    localStorage.setItem(
+      QUEUE_KEY,
+      JSON.stringify(queue.slice(0, QUEUE_MAX).map(({ key, id, url, title, preset, state, error, filename }) => ({
+        key, id, url, title, preset, state, error, filename,
+      }))),
+    );
+  } catch {
+    /* storage off — the queue still works for this session */
+  }
 }
 
 const STAGE_TEXT = {
   starting: 'Starting…',
   // A bar that silently jumps back to zero reads as a bug. Naming the reason
   // turns the same event into the app visibly working around YouTube.
-  retrying: 'YouTube asked for a login — trying another client',
-  packing: 'Packing the zip…',
+  retrying: 'Retrying — YouTube asked for a login',
   downloading: 'Downloading',
   processing: 'Converting…',
+  packing: 'Packing the zip…',
   ready: 'Ready',
   failed: 'Failed',
 };
 
-function renderProgress(job) {
-  const stage = $('stage');
-  const pct = $('pct');
-  const fill = $('barFill');
-  if (!stage || !fill) return;
+function rowLabel(entry) {
+  if (entry.state === 'error') return entry.error || 'Failed';
+  if (entry.state === 'expired') return 'No longer on the server';
+  if (entry.state === 'done') return entry.filename || 'Ready';
+  const stage = STAGE_TEXT[entry.stage] || 'Working…';
+  return entry.itemsTotal ? `${stage} ${entry.itemsDone || 1}/${entry.itemsTotal}` : stage;
+}
 
-  stage.textContent = STAGE_TEXT[job.stage] || 'Working…';
-  // On a playlist the percentage restarts per item, so the item counter is the
-  // only number that actually moves forward.
-  if (job.isPlaylist && job.itemsTotal) {
-    stage.textContent = `${STAGE_TEXT[job.stage] || 'Working…'} ${job.itemsDone || 1}/${job.itemsTotal}`;
+function renderQueue() {
+  const section = $('queue');
+  const list = $('queueList');
+  section.hidden = queue.length === 0;
+  if (queue.length === 0) {
+    // Empty the DOM too, not just hide it: leaving the old rows in place means
+    // they flash back the next time the section is shown.
+    list.innerHTML = '';
+    return;
   }
 
-  // A percentage is only shown while it means something. During conversion
-  // yt-dlp has no total to report, so the bar goes indeterminate rather than
-  // sitting at a lying 100%.
-  const determinate = job.stage === 'downloading' && job.totalBytes;
-  if (determinate) {
-    const percent = Math.round((job.progress || 0) * 100);
-    fill.classList.remove('indeterminate');
-    fill.style.width = `${percent}%`;
-    pct.textContent = `${percent}%`;
-  } else {
-    fill.classList.add('indeterminate');
-    fill.style.width = '';
-    pct.textContent = '';
+  const running = queue.filter((e) => e.state === 'running' || e.state === 'starting').length;
+  $('queueLabel').textContent = running ? `Downloads — ${running} running` : 'Downloads';
+  $('queueClear').hidden = !queue.some((e) => e.state !== 'running' && e.state !== 'starting');
+
+  list.innerHTML = '';
+  for (const entry of queue) {
+    const item = document.createElement('li');
+    if (entry.state === 'error' || entry.state === 'expired') item.className = 'q-error';
+
+    const active = entry.state === 'running' || entry.state === 'starting';
+    const determinate = entry.stage === 'downloading' && entry.totalBytes;
+    const percent = Math.round((entry.progress || 0) * 100);
+
+    const bits = [];
+    if (active && entry.speed) bits.push(`${formatBytes(entry.speed)}/s`);
+    if (active && entry.eta) bits.push(`${formatDuration(entry.eta)} left`);
+    if (!active && entry.totalBytes) bits.push(formatBytes(entry.totalBytes));
+    if (entry.attempts > 0 && entry.client) bits.push(`attempt ${entry.attempts + 1} · ${entry.client}`);
+
+    item.innerHTML =
+      '<div class="q-top">' +
+      `<span class="q-title">${escapeHtml(entry.title || entry.url)}</span>` +
+      (active && determinate ? `<span class="q-pct">${percent}%</span>` : '') +
+      '</div>' +
+      (active
+        ? `<div class="q-bar"><div class="q-fill${determinate ? '' : ' indeterminate'}" style="${determinate ? `width:${percent}%` : ''}"></div></div>`
+        : '') +
+      `<p class="q-msg">${escapeHtml(rowLabel(entry))}</p>` +
+      '<div class="q-foot">' +
+      `<span>${escapeHtml(bits.join(' · '))}</span>` +
+      '<span class="spacer"></span>' +
+      (entry.state === 'done' && entry.fileUrl
+        ? `<a class="q-act primary" href="${escapeHtml(entry.fileUrl)}" download>Save</a>`
+        : '') +
+      (active ? `<button class="q-act" type="button" data-cancel="${entry.key}">Cancel</button>` : '') +
+      (entry.state === 'error' ? `<button class="q-act" type="button" data-retry="${entry.key}">Try again</button>` : '') +
+      '</div>';
+    list.appendChild(item);
   }
 
-  $('speed').textContent = job.speed ? `${formatBytes(job.speed)}/s` : '';
-  $('eta').textContent = job.eta ? `${formatDuration(job.eta)} left` : '';
-  if (job.attempts > 0 && job.client) {
-    $('eta').textContent = `attempt ${job.attempts + 1} · ${job.client}`;
+  for (const button of list.querySelectorAll('[data-cancel]')) {
+    button.addEventListener('click', () => cancelEntry(button.dataset.cancel));
+  }
+  for (const button of list.querySelectorAll('[data-retry]')) {
+    button.addEventListener('click', () => retryEntry(button.dataset.retry));
   }
 }
 
-function renderHistory() {
-  const section = $('history');
-  const list = $('historyList');
-  section.hidden = recent.length === 0;
-  list.innerHTML = '';
-  for (const entry of recent) {
-    const item = document.createElement('li');
-    item.innerHTML =
-      '<div class="h-body">' +
-      `<div class="h-title">${escapeHtml(entry.title)}</div>` +
-      `<div class="h-meta">${escapeHtml(entry.meta)}</div>` +
-      '</div>' +
-      `<a class="h-save" href="${escapeHtml(entry.url)}" download>Save</a>`;
-    list.appendChild(item);
+function findEntry(key) {
+  return queue.find((entry) => entry.key === key);
+}
+
+function cancelEntry(key) {
+  const entry = findEntry(key);
+  if (!entry) return;
+  if (entry.id) backend.cancel?.(entry.id);
+  queue = queue.filter((item) => item !== entry);
+  saveQueue();
+  renderQueue();
+}
+
+function retryEntry(key) {
+  const entry = findEntry(key);
+  if (!entry) return;
+  queue = queue.filter((item) => item !== entry);
+  renderQueue();
+  enqueue(entry.url, { preset: entry.preset });
+}
+
+/* ----------------------------------------------------------------- running */
+
+/**
+ * Add one download and return immediately.
+ *
+ * The URL box is cleared as soon as the job is accepted, because the whole
+ * point of a queue is that you can paste the next link while the first is still
+ * going. Nothing here waits.
+ */
+async function enqueue(url, { preset = settings.preset, playlist = wantPlaylist } = {}) {
+  const entry = {
+    key: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    url,
+    title: lastProbe?.title || url,
+    preset,
+    state: 'starting',
+    stage: 'starting',
+    progress: 0,
+  };
+  queue.unshift(entry);
+  if (queue.length > QUEUE_MAX) queue.length = QUEUE_MAX;
+  renderQueue();
+
+  try {
+    const started = await backend.start(url, preset, {
+      playlist,
+      subs: settings.subs,
+      subLangs: settings.subLangs,
+    });
+    if (started.kind === 'direct') {
+      // A public instance streams the file itself; there is no job to follow.
+      entry.state = 'done';
+      entry.stage = 'ready';
+      entry.fileUrl = started.url;
+      entry.filename = started.filename || entry.title;
+      handOver(entry);
+    } else {
+      entry.id = started.id;
+      entry.state = 'running';
+      startPolling();
+    }
+  } catch (error) {
+    entry.state = 'error';
+    entry.error = error instanceof BackendError ? error.message : String(error?.message || error);
+    if (error instanceof BackendError && error.hint) entry.error += ` ${error.hint}`;
   }
+  saveQueue();
+  renderQueue();
+}
+
+function startPolling() {
+  if (pollTimer) return;
+  pollTimer = setInterval(pollAll, POLL_MS);
+}
+
+async function pollAll() {
+  const active = queue.filter((entry) => entry.id && (entry.state === 'running' || entry.state === 'starting'));
+  if (active.length === 0) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+    return;
+  }
+
+  await Promise.all(
+    active.map(async (entry) => {
+      try {
+        const job = await backend.poll(entry.id);
+        Object.assign(entry, {
+          stage: job.stage,
+          progress: job.progress,
+          speed: job.speed,
+          eta: job.eta,
+          totalBytes: job.totalBytes,
+          client: job.client,
+          attempts: job.attempts,
+          itemsDone: job.itemsDone,
+          itemsTotal: job.itemsTotal,
+          title: job.title || entry.title,
+        });
+        if (job.state === 'done') {
+          entry.state = 'done';
+          entry.filename = job.filename;
+          entry.fileUrl = backend.fileUrl(entry.id);
+          handOver(entry);
+        } else if (job.state === 'error') {
+          entry.state = 'error';
+          entry.error = job.error || 'The download failed.';
+        }
+      } catch (error) {
+        // A 404 means the server swept it; anything else is a real failure.
+        entry.state = /no such download/i.test(String(error?.message)) ? 'expired' : 'error';
+        if (entry.state === 'error') {
+          entry.error = error instanceof BackendError ? error.message : 'Lost contact with the server.';
+        }
+      }
+    }),
+  );
+  saveQueue();
+  renderQueue();
+}
+
+/**
+ * Hand a finished file to the browser.
+ *
+ * A synthetic click on an <a> keeps the page in place: the response carries
+ * Content-Disposition: attachment, so the browser saves rather than navigates.
+ * Inside an iOS home-screen app there is no download manager and the click is
+ * dropped silently — so there, the row's own Save button is the whole story and
+ * nothing is attempted automatically.
+ */
+function handOver(entry) {
+  if (platform.ios && platform.standalone) return;
+
+  const anchor = document.createElement('a');
+  anchor.href = entry.fileUrl;
+  anchor.download = '';
+  anchor.rel = 'noopener';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
+
+/** Re-check stored downloads against the server; the files may still be there. */
+async function restoreQueue() {
+  try {
+    queue = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+  } catch {
+    queue = [];
+  }
+  if (queue.length === 0) return;
+  renderQueue();
+
+  await Promise.all(
+    queue.map(async (entry) => {
+      if (!entry.id) return;
+      try {
+        const job = await backend.poll(entry.id);
+        entry.state = job.state === 'done' ? 'done' : job.state === 'error' ? 'error' : 'running';
+        entry.stage = job.stage;
+        entry.progress = job.progress;
+        entry.filename = job.filename || entry.filename;
+        entry.error = job.error;
+        if (entry.state === 'done') entry.fileUrl = backend.fileUrl(entry.id);
+      } catch {
+        // Swept by the TTL, or a different server is configured now.
+        entry.state = entry.state === 'done' ? 'expired' : entry.state;
+        if (entry.state !== 'expired' && entry.state !== 'error') entry.state = 'expired';
+      }
+    }),
+  );
+  saveQueue();
+  renderQueue();
+  if (queue.some((entry) => entry.state === 'running')) startPolling();
 }
 
 /* ------------------------------------------------------------------ backend */
@@ -386,128 +579,6 @@ async function runProbe(url) {
     // but download fine — so this is a note, not a blocker.
     if (error instanceof BackendError && !error.retryable) showError(error);
   }
-}
-
-/* ----------------------------------------------------------------- download */
-
-async function startDownload() {
-  const url = $('url').value.trim();
-  if (!looksLikeUrl(url)) return;
-
-  renderFeedback('');
-  state = 'working';
-  renderAction();
-
-  try {
-    const started = await backend.start(url, settings.preset, { playlist: wantPlaylist });
-
-    if (started.kind === 'direct') {
-      // Public instances stream the file themselves: hand it to the browser and
-      // let its own download UI take over.
-      finish({
-        url: started.url,
-        title: started.filename || lastProbe?.title || 'download',
-        meta: 'via public instance',
-      });
-      return;
-    }
-
-    activeJob = started.id;
-    pollJob();
-  } catch (error) {
-    state = 'error';
-    renderAction();
-    showError(error);
-  }
-}
-
-async function pollJob() {
-  if (!activeJob) return;
-  try {
-    const job = await backend.poll(activeJob);
-
-    if (job.state === 'done') {
-      const meta = [formatBytes(job.totalBytes), PRESETS.find((p) => p.id === settings.preset)?.label]
-        .filter(Boolean)
-        .join(' · ');
-      finish({
-        url: backend.fileUrl(activeJob),
-        title: job.filename || job.title || lastProbe?.title || 'download',
-        meta: meta || 'done',
-      });
-      activeJob = null;
-      return;
-    }
-
-    if (job.state === 'error') {
-      activeJob = null;
-      state = 'error';
-      renderAction();
-      showError(new BackendError(job.error || 'The download failed.'));
-      return;
-    }
-
-    renderProgress(job);
-    pollTimer = setTimeout(pollJob, POLL_MS);
-  } catch (error) {
-    activeJob = null;
-    state = 'error';
-    renderAction();
-    showError(error);
-  }
-}
-
-/**
- * Hand the finished file to the browser.
- *
- * A synthetic click on an <a> is what keeps the page in place: the response
- * carries `Content-Disposition: attachment`, so the browser saves it instead of
- * navigating. `download` only takes effect same-origin, which is why the header
- * — not this attribute — is what actually does the work.
- */
-function finish(entry) {
-  state = 'done';
-  renderAction();
-
-  recent.unshift(entry);
-  if (recent.length > 8) recent.pop();
-  renderHistory();
-
-  // Inside an iOS home-screen app there is no download manager, and a synthetic
-  // click is silently dropped. The file has to be a link the user taps, opened
-  // out into Safari where saving exists.
-  if (platform.ios && platform.standalone) {
-    renderFeedback(
-      '<div class="notice"><p><strong>Ready.</strong> iOS will not save a file from ' +
-        'inside an installed app, so this opens in Safari — then use the share button ' +
-        'to put it in Files.</p>' +
-        `<a class="save-now" href="${escapeHtml(entry.url)}" target="_blank" rel="noopener">` +
-        'Open and save</a></div>',
-    );
-    return;
-  }
-
-  const anchor = document.createElement('a');
-  anchor.href = entry.url;
-  anchor.download = '';
-  anchor.rel = 'noopener';
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-
-  renderFeedback(
-    '<div class="notice"><p><strong>Saved.</strong> Check your downloads. ' +
-      'If nothing appeared, use the Save button below.</p></div>',
-  );
-}
-
-function cancelDownload() {
-  clearTimeout(pollTimer);
-  if (activeJob) backend.cancel?.(activeJob);
-  activeJob = null;
-  state = 'idle';
-  renderAction();
-  renderFeedback('');
 }
 
 /* ----------------------------------------------------------------- settings */
@@ -676,6 +747,26 @@ function setupInstall() {
   });
 }
 
+/** Languages only matter once subtitles are actually wanted. */
+function syncSubFields() {
+  $('subLangsField').hidden = settings.subs === 'off';
+}
+
+/**
+ * Empty the box and its preview, so the next link can go straight in.
+ * Called the moment a download is accepted, never before.
+ */
+function clearInput() {
+  const input = $('url');
+  input.value = '';
+  lastProbe = null;
+  wantPlaylist = false;
+  probeToken += 1; // abandon any probe still in flight for the old link
+  renderPreview(null);
+  renderFeedback('');
+  renderAction();
+}
+
 /* --------------------------------------------------------------------- boot */
 
 function readSharedUrl() {
@@ -692,7 +783,39 @@ function init() {
   applyBackend();
   renderQualities();
   renderAction();
-  renderHistory();
+  renderQueue();
+
+  restoreQueue();
+
+  $('go').addEventListener('click', () => {
+    const url = $('url').value.trim();
+    if (!looksLikeUrl(url)) return;
+    enqueue(url);
+    clearInput();
+  });
+
+  $('queueClear').addEventListener('click', () => {
+    queue = queue.filter((entry) => entry.state === 'running' || entry.state === 'starting');
+    saveQueue();
+    renderQueue();
+  });
+
+  // Subtitles: remembered like the quality, since it is the same kind of
+  // standing preference rather than a per-download decision.
+  for (const input of document.querySelectorAll('input[name="subs"]')) {
+    input.checked = input.value === settings.subs;
+    input.addEventListener('change', (event) => {
+      settings.subs = event.target.value;
+      saveSettings();
+      syncSubFields();
+    });
+  }
+  $('subLangs').value = settings.subLangs;
+  $('subLangs').addEventListener('input', (event) => {
+    settings.subLangs = event.target.value.trim() || 'en';
+    saveSettings();
+  });
+  syncSubFields();
 
   const urlInput = $('url');
   urlInput.addEventListener('input', () => {
@@ -704,7 +827,8 @@ function init() {
     if (event.key === 'Enter' && looksLikeUrl(urlInput.value)) {
       event.preventDefault();
       urlInput.blur();
-      startDownload();
+      enqueue(urlInput.value.trim());
+      clearInput();
     }
   });
 

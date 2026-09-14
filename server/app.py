@@ -299,6 +299,8 @@ class Job:
     is_playlist: bool = False
     items_done: int = 0
     items_total: int = 0
+    subs: str = "off"
+    sub_langs: str = "en"
 
     @property
     def directory(self) -> Path:
@@ -350,9 +352,14 @@ MEDIA_SUFFIXES = frozenset(
     {".mp4", ".mkv", ".webm", ".mov", ".avi", ".mp3", ".m4a", ".opus", ".flac", ".wav", ".ogg", ".aac"}
 )
 
+# Subtitle files asked for as separate files are part of the download, not
+# leftovers — without this they would be fetched and then quietly discarded.
+SUBTITLE_SUFFIXES = frozenset({".srt", ".vtt", ".ass", ".ssa", ".lrc"})
 
-def media_files(directory: Path) -> list[Path]:
-    return sorted(p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES)
+
+def media_files(directory: Path, include_subtitles: bool = False) -> list[Path]:
+    wanted = MEDIA_SUFFIXES | SUBTITLE_SUFFIXES if include_subtitles else MEDIA_SUFFIXES
+    return sorted(p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in wanted)
 
 
 def _hook(job: Job):
@@ -422,6 +429,21 @@ def build_options(job: Job, client: str | None) -> dict[str, Any]:
         "postprocessor_hooks": [_postprocessor_hook(job)],
         **preset["opts"],
     }
+    # Subtitles are a video concern; an MP3 has nowhere to put them.
+    if job.subs != "off" and preset["kind"] == "video":
+        options["writesubtitles"] = True
+        # Auto-captions are worth asking for: most of YouTube has nothing else,
+        # and a request for human subtitles that finds none silently returns a
+        # file with no subtitles at all.
+        options["writeautomaticsub"] = True
+        options["subtitleslangs"] = [lang.strip() for lang in job.sub_langs.split(",") if lang.strip()]
+        if job.subs == "embed":
+            options.setdefault("postprocessors", [])
+            options["postprocessors"] = [
+                *options["postprocessors"],
+                {"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False},
+            ]
+
     if job.is_playlist:
         options["playlistend"] = PLAYLIST_LIMIT
         # One dead video must not abandon the other forty-nine.
@@ -482,7 +504,7 @@ def run_job(job: Job) -> None:
                 # Trust the directory over yt-dlp's reported path: postprocessors
                 # rename the file (.webm -> .mp3) after the info dict is built, so
                 # the recorded name is routinely the one that no longer exists.
-                files = media_files(job.directory)
+                files = media_files(job.directory, include_subtitles=job.subs == "files")
                 if not files:
                     raise FileNotFoundError("yt-dlp produced no file.")
 
@@ -562,6 +584,8 @@ class JobRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     preset: str = "video_best"
     playlist: bool = False
+    subs: str = "off"  # off | embed | files
+    sub_langs: str = Field(default="en", max_length=200)
 
 
 class ProbeRequest(BaseModel):
@@ -817,7 +841,14 @@ async def create_job(body: JobRequest, authorization: str | None = Header(defaul
         active = sum(1 for job in JOBS.values() if job.state in ("queued", "running"))
         if active >= MAX_CONCURRENT_JOBS * 4:
             raise HTTPException(status_code=429, detail="Too many downloads in flight. Try again shortly.")
-        job = Job(id=uuid.uuid4().hex[:16], url=url, preset=body.preset, is_playlist=body.playlist)
+        job = Job(
+            id=uuid.uuid4().hex[:16],
+            url=url,
+            preset=body.preset,
+            is_playlist=body.playlist,
+            subs=body.subs if body.subs in ("off", "embed", "files") else "off",
+            sub_langs=body.sub_langs.strip() or "en",
+        )
         JOBS[job.id] = job
 
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
