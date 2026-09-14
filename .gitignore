@@ -5,3 +5,4 @@ node_modules/
 .DS_Store
 downloads/
 .pytest_cache/
+web/tests/.e2e/

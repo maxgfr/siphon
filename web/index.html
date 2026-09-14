@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="color-scheme" content="dark light" />
 <title>siphon — download video and audio in your browser</title>
-<meta name="description" content="Paste a link, pick a quality, get the file. A mobile-first web front end for yt-dlp, with no app to install." />
+<meta name="description" content="Paste a link, pick a quality, get the file. A mobile-first downloader that runs in the browser, or drives your own yt-dlp server." />
 <meta name="theme-color" content="#0e1315" media="(prefers-color-scheme: dark)" />
 <meta name="theme-color" content="#f2f5f5" media="(prefers-color-scheme: light)" />
 <!-- The unprefixed name is the standard one; the apple- form is still what
@@ -44,7 +44,7 @@
   </header>
 
   <main>
-    <h1 class="sr-only">Download video and audio with yt-dlp</h1>
+    <h1 class="sr-only">Download video and audio</h1>
 
     <div class="field">
       <label class="sr-only" for="url">Link to download</label>
@@ -73,6 +73,10 @@
         Comma-separated. Auto-generated captions are included, since most videos have nothing else.
       </p>
     </div>
+
+    <p class="playlist-note" id="subsUnsupported" hidden>
+      In-browser downloads have no subtitles yet — that one needs your own server.
+    </p>
 
     <div id="feedback" aria-live="polite"></div>
 
@@ -122,8 +126,8 @@
       </button>
     </div>
     <p class="explain">
-      A web page cannot reach a video host directly — browsers block it, and the stream URLs are
-      signed. Something has to run yt-dlp for you. Pick what.
+      Some hosts let a web page read their files and some do not, and the ones that do not cannot
+      be talked round. Pick what does the fetching.
     </p>
 
     <div class="mode" role="radiogroup" aria-label="Download source">
@@ -133,6 +137,15 @@
           <b>Your own server</b>
           <small>Runs yt-dlp itself. Every site yt-dlp supports, real progress, nothing goes
             through a stranger. Deploy the <code>server/</code> folder from this project.</small>
+        </span>
+      </label>
+      <label>
+        <input type="radio" name="mode" value="browser" id="modeBrowser" />
+        <span>
+          <b>In this browser</b>
+          <small>No server anywhere. Works for direct files and HLS streams whose host allows
+            it — which is most things built to be embedded. YouTube refuses, and needs the
+            relay below.</small>
         </span>
       </label>
       <label>
@@ -189,6 +202,38 @@
         <label class="lbl">On your phone</label>
         <p class="hint" id="phoneHintBody"></p>
       </div>
+    </div>
+
+    <div id="browserFields" hidden>
+      <p class="hint">
+        The extractor runs in this page: it reads the link, picks a quality, downloads the
+        stream and, when a file has to be merged or converted, loads
+        <a href="https://github.com/ffmpegwasm/ffmpeg.wasm" target="_blank" rel="noopener noreferrer">ffmpeg.wasm</a>
+        to do it here. Nothing is uploaded and no link leaves the device.
+      </p>
+      <p class="hint">
+        <strong>What it cannot do is argue with the browser.</strong> A host that sends no
+        cross-origin headers — YouTube above all — is unreadable from a page, and no amount of
+        JavaScript changes that. Those links need either your own server or a relay.
+      </p>
+
+      <label class="lbl" for="relayUrl">Relay <span style="font-weight:400;color:var(--muted)">— only for hosts that refuse</span></label>
+      <input type="url" id="relayUrl" inputmode="url" autocapitalize="off" autocorrect="off"
+             spellcheck="false" placeholder="https://siphon-relay.you.workers.dev" />
+      <p class="hint">
+        A relay adds the missing header and forwards nothing else — no yt-dlp, no ffmpeg, no
+        state, one file. <code>relay/worker.js</code> in this project deploys to a free
+        Cloudflare Worker in about a minute. It is still a server, so it is optional and off
+        until you fill this in; leave it empty and YouTube links simply say why they failed.
+      </p>
+
+      <label class="lbl" for="coreUrl">Converter <span style="font-weight:400;color:var(--muted)">— optional</span></label>
+      <input type="url" id="coreUrl" inputmode="url" autocapitalize="off" autocorrect="off"
+             spellcheck="false" placeholder="ffmpeg-core.js from a CDN" />
+      <p class="hint">
+        Where ffmpeg.wasm is fetched from the first time a download needs converting — about
+        32 MB, cached afterwards. Blank uses jsDelivr; set it to host your own copy.
+      </p>
     </div>
 
     <div id="publicFields" hidden>

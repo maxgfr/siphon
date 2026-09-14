@@ -1,0 +1,10 @@
+{
+  "name": "siphon",
+  "private": true,
+  "type": "module",
+  "description": "Tooling only. The app in web/ has no build step and no dependencies — this exists so the in-browser extractor's pure logic can be tested with node --test.",
+  "scripts": {
+    "test": "node --test \"web/tests/*.test.js\"",
+    "test:e2e": "node web/tests/e2e.mjs"
+  }
+}

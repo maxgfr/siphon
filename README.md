@@ -1,61 +1,98 @@
 # siphon
 
-Paste a link, pick a quality, get the file. A mobile-first web front end for
-[yt-dlp](https://github.com/yt-dlp/yt-dlp), with nothing to install on the phone.
+Paste a link, pick a quality, get the file. A mobile-first downloader with
+nothing to install on the phone — and, for a lot of links, nothing to run
+anywhere at all.
 
 Open it, tap **Paste**, tap **Download**. On Android you can also share a link
 straight from YouTube into it, because it installs as a share target.
 
-## Why there is a server in here
+## Three ways to get the file
 
-A web page cannot download a YouTube video on its own. Two hard walls, not a
-missing feature:
+Settings picks which one does the fetching. They answer the same four questions,
+so the rest of the app is identical whichever you choose.
 
-- **CORS.** Media hosts send no cross-origin headers, so a browser refuses to
-  let a page on your domain read their bytes.
-- **Signed URLs.** Getting a playable stream URL out of YouTube means running
-  its own JavaScript to solve a signature challenge.
+| | what runs it | what it covers | what it costs |
+|---|---|---|---|
+| **In this browser** | the page you are looking at | direct files, HLS, pages that declare their media | nothing |
+| **Your own server** | `server/`, running yt-dlp | everything yt-dlp supports | a container |
+| **A public instance** | someone else's [cobalt](https://github.com/imputnet/cobalt) | whatever they allow | your links, seen by them |
 
-So something has to run yt-dlp. This project is both halves:
+### What the browser can actually do
 
-| | what it is | where it runs |
-|---|---|---|
-| `web/` | the interface | GitHub Pages, or any static host |
-| `server/` | a small API around yt-dlp | a container you run |
+Browser mode is not a wrapper around somebody's API. The extractor runs in the
+page: it reads the link, parses the HLS ladder, picks a rendition for the
+quality you asked for, downloads and decrypts the segments, and when a file has
+to be merged or converted it loads
+[ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm) and does that here too.
+Nothing is uploaded, no link leaves the device, and the finished file never
+existed anywhere else.
 
-The frontend is useless alone and says so on first load. Point it at a server in
-settings, and it works.
+It covers more than it sounds like, because the media a site *wants* other
+people's pages to play is media it has to let a page read:
 
-### "Can't the browser just do it?"
+- a direct `.mp4`, `.webm`, `.m4a`, `.mp3` — the file is the link
+- an `.m3u8` HLS stream, including AES-128 encrypted ones, remuxed to MP4
+- a page whose markup declares its video: `og:video`, `<video src>`,
+  `<source>`, JSON-LD `contentUrl`, or an `.m3u8` sitting in inline JSON
+- MP3 and M4A extraction from any of the above, tagged and with cover art
 
-No, and it is worth knowing why before trying:
+`ffmpeg.wasm` is only fetched when a job actually needs it. A progressive MP4 at
+the quality you asked for is handed over exactly as it arrived, so the common
+case costs no 32 MB download and no conversion pass.
 
-- `*.googlevideo.com` allows CORS only from `youtube.com`, so a page on your own
-  domain cannot read the bytes.
-- Getting the signed stream URL in the first place means running YouTube's own
-  player JavaScript. [YouTube.js](https://github.com/LuanRT/YouTube.js), the
-  reference InnerTube client, states plainly that browser use requires proxying
-  through your own server, and ships a proxy in its browser example.
-- A service worker is a fake server, but it has no extra network privileges: its
-  requests obey the same CORS rules, JavaScript cannot read an opaque
-  (`mode: "no-cors"`) response body, and the spec forbids answering a navigation
-  with one.
-- `ffmpeg.wasm` is real and useful — it merges video and audio in the browser —
-  but only once you already have the bytes.
+### Where it stops, and why that is not fixable
 
-Projects advertising a backend-free YouTube downloader are using someone else's
-server underneath: the well-known ffmpeg.wasm one routes through Piped, and the
-large yt-dlp web UIs (MeTube, siphon-ui) are all self-hosted. The one genuine
-exception is a browser extension, whose host permissions do bypass CORS — but on
-mobile that only exists on Firefox for Android.
+A browser will not let a page read a cross-origin response unless the host says
+it may. That is not a bug to route around, and the usual ideas do not work: a
+service worker has no extra network privileges, JavaScript cannot read an opaque
+`no-cors` body, and `ffmpeg.wasm` only helps once you already have the bytes.
 
-That is why this project offers your own server first and a public instance as a
-fallback: those are the two options that actually exist.
+**YouTube is the host that says no.** Its InnerTube API sends no cross-origin
+headers, and `*.googlevideo.com` allows only `youtube.com`, so the request fails
+before it leaves the browser. Signing the stream URL is the *easy* half — that
+is just JavaScript, and [YouTube.js](https://github.com/LuanRT/YouTube.js) does
+it in the page — but a signed URL you are not allowed to fetch is no use.
+
+So YouTube in browser mode needs one of two things:
+
+- **[A relay](relay/)** — one file, on a free Cloudflare Worker, that adds the
+  missing header and forwards nothing else. No yt-dlp, no ffmpeg, no state, and
+  nothing to maintain when YouTube changes, because the part that changes is
+  running in your browser. It is still a server, so it is optional and empty by
+  default; leave it unset and YouTube links say exactly why they failed.
+- **Your own server**, below, which is the only option with a cookie jar and a
+  proof-of-origin provider — and so the only one that clears a determined bot
+  wall.
+
+Projects advertising a backend-free YouTube downloader are, as far as we can
+tell, all using someone else's server for that last hop. This one is honest
+about which hop that is.
+
+### Browser mode does not do everything
+
+Worth knowing before you switch to it:
+
+- **No subtitles yet.** The app says so rather than handing back a file that
+  quietly has none.
+- **One video at a time.** A playlist is offered whole by the server, because it
+  can build a zip; a tab cannot, so browser mode takes the video you linked.
+- **No cookies.** There is nowhere safe to put them and nothing that would use
+  them.
+- **Sites that build their player in JavaScript** hide the file from a markup
+  scrape. yt-dlp has a hand-written extractor for each of those; this has four
+  general ones.
+- **Big files live in memory during conversion.** Remuxing a two-hour video in
+  wasm on a phone is not a good idea. Finished files go to the origin private
+  file system, not the heap, so a row still survives a reload.
 
 ## The shortest setup: you are the client
 
-You do not have to host anything. Put the interface on GitHub Pages, run yt-dlp
-on the computer you are sitting at, and point one at the other:
+For anything browser mode does not cover — YouTube without a relay, a site that
+hides its player behind JavaScript, subtitles, a whole playlist — you want
+yt-dlp. You still do not have to host it anywhere. Put the interface on GitHub
+Pages, run yt-dlp on the computer you are sitting at, and point one at the
+other:
 
 ```sh
 docker compose up -d                      # yt-dlp, on your machine, port 8000
@@ -321,7 +358,11 @@ fix, and the interface shows the running version next to the wordmark.
 
 ## Configuration
 
-All server-side, all environment variables:
+Browser mode has two settings and both are in the app, because nothing of yours
+is running: the **relay** address, and where **ffmpeg.wasm** is fetched from if
+you would rather not depend on a CDN. Both are optional and both start empty.
+
+The server has the rest. All server-side, all environment variables:
 
 | variable | default | what it does |
 |---|---|---|
@@ -368,13 +409,34 @@ to supply an address you actually trust. Treat this as the fallback, not the pla
 pip install -r server/requirements.txt
 WEB_DIR=web uvicorn server.app:app --reload --port 8000
 
-# tests
+# server tests
 pip install pytest httpx
 pytest server/tests -q
+
+# frontend tests — the extractor's pure logic, no browser needed
+npm test
+
+# browser mode, end to end — builds its own fixtures with ffmpeg, serves the
+# app and the media on two origins, and drives Chromium through the real UI.
+# Needs playwright and ffmpeg; SIPHON_CORE_URL points at a local ffmpeg.wasm.
+npm run test:e2e
 ```
 
-The frontend has no build step — three files, plain ES modules, no framework, no
-bundler. Edit and reload.
+The frontend has no build step and no dependencies: plain ES modules, no
+framework, no bundler. Edit and reload. `package.json` exists only so
+`node --test` can reach the extractor; nothing in `web/` imports from it.
+
+Where it lives:
+
+| file | what it is |
+|---|---|
+| `app.js` | the screen and the queue |
+| `api.js` | picks a backend; the server and cobalt clients |
+| `inbrowser.js` | the browser backend — job table, HLS assembly, decryption |
+| `extract.js` | what a link is, and what to download for a preset |
+| `m3u8.js`, `net.js` | HLS parsing; fetching under CORS, with the relay fallback |
+| `media.js`, `ffmpeg-worker.js` | ffmpeg.wasm, loaded on demand |
+| `store.js` | finished files, in the origin private file system |
 
 ## What was verified
 
@@ -392,6 +454,38 @@ Against yt-dlp 2026.08.19, in a headless Chromium on a Pixel 7 profile:
   40 px tall.
 - A failed link produces a sentence, not a stack trace.
 - The Android share target prefills the link and scrubs it from the address bar.
+
+### Browser mode
+
+41 unit tests cover the parts that are pure: HLS attribute and playlist
+parsing, byte-range continuation, IV derivation, YouTube URL shapes, page
+scraping precedence, and the whole preset → format decision table.
+
+Then `npm run test:e2e`, which drives a real headless Chromium with the app on
+one origin and the media on another, so the CORS path under test is the real
+one. All 21 checks pass:
+
+- A progressive MP4 arrives byte-identical to the source, and the 32 MB
+  converter is never requested — verified on the wire, not assumed.
+- An HLS master is parsed, the right rendition chosen (`Best` → 1280×720;
+  `480p` → 640×360 out of 180/360/720), segments fetched and remuxed into an
+  MP4 that ffmpeg reads back as h264 + aac.
+- An AES-128 encrypted rendition is decrypted in the page with WebCrypto and
+  remuxed the same way.
+- MP3 comes back as real MP3 with no video stream and its title tag set; M4A
+  comes back as AAC in an MP4 container with the video dropped.
+- A plain HTML page's `og:video` is found, fetched, and named after the page,
+  and its `og:image` arrives in the MP3 as an attached cover.
+- A YouTube link with no relay fails with a sentence naming the reason, not a
+  stack trace.
+- A finished row survives a reload with its Save button intact, because the file
+  is in OPFS.
+- No uncaught errors in the page across all of it.
+
+**Not verified here:** the YouTube-through-a-relay path. The environment this
+was built in cannot reach YouTube or a CDN at all, so the InnerTube client, the
+signature solving and the relay were written against the libraries' documented
+behaviour and reviewed, not run. Everything above was run.
 
 ## Licence
 

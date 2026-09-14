@@ -22,6 +22,10 @@ const DEFAULT_SETTINGS = Object.freeze({
   serverKey: '',
   publicUrl: '',
   publicKey: '',
+  // Browser mode: both optional. An empty relay is the honest default — it
+  // means "nothing but this device", and the hosts that need one say so.
+  relayUrl: '',
+  coreUrl: '',
   preset: 'video_best',
   subs: 'off',
   subLangs: 'en',
@@ -463,7 +467,10 @@ function handOver(entry) {
 
   const anchor = document.createElement('a');
   anchor.href = entry.fileUrl;
-  anchor.download = '';
+  // A server response names the file in Content-Disposition, but a blob URL
+  // from browser mode carries no headers at all — without this the file lands
+  // as a UUID with no extension.
+  anchor.download = entry.filename || '';
   anchor.rel = 'noopener';
   document.body.appendChild(anchor);
   anchor.click();
@@ -505,12 +512,19 @@ async function restoreQueue() {
 
 /* ------------------------------------------------------------------ backend */
 
+const PRIVACY_NOTE = {
+  public: 'In public-instance mode, every link you paste is sent to that instance.',
+  server: 'Links go only to the server you configured. Nothing is sent anywhere else.',
+  browser: 'Downloads happen on this device. Links go to the site they point at, and nowhere else.',
+  browserRelay: 'Downloads happen on this device, except for hosts that refuse a web page — those go through your relay.',
+};
+
 function applyBackend() {
   backend = makeBackend(settings);
   $('privacyNote').textContent =
-    settings.mode === 'public'
-      ? 'In public-instance mode, every link you paste is sent to that instance.'
-      : 'Links go only to the server you configured. Nothing is sent anywhere else.';
+    settings.mode === 'browser' && settings.relayUrl
+      ? PRIVACY_NOTE.browserRelay
+      : PRIVACY_NOTE[settings.mode] || PRIVACY_NOTE.server;
 }
 
 async function refreshBackendLabel() {
@@ -518,7 +532,7 @@ async function refreshBackendLabel() {
   label.textContent = 'checking server…';
   try {
     const info = await backend.health();
-    const where = settings.mode === 'public' ? 'public instance' : 'your server';
+    const where = { public: 'public instance', browser: 'no server', server: 'your server' }[settings.mode];
     label.textContent = info.ffmpeg === false ? `${info.label} · no ffmpeg` : `${info.label} · ${where}`;
     if (info.ffmpeg === false) {
       renderFeedback(
@@ -531,7 +545,8 @@ async function refreshBackendLabel() {
     if (settings.mode === 'server' && !settings.serverUrl) {
       renderFeedback(
         '<div class="notice"><p><strong>No server set up yet.</strong> ' +
-          'This page needs something running yt-dlp for it. Open settings to point it at one.</p>' +
+          'Point this at one in settings — or switch to <strong>In this browser</strong>, ' +
+          'which needs nothing at all for direct files and HLS streams.</p>' +
           '<button class="retry" type="button" id="openFromNotice">Open settings</button></div>',
       );
       $('openFromNotice')?.addEventListener('click', openSettings);
@@ -585,23 +600,29 @@ async function runProbe(url) {
 
 function openSettings() {
   $('modeServer').checked = settings.mode === 'server';
+  $('modeBrowser').checked = settings.mode === 'browser';
   $('modePublic').checked = settings.mode === 'public';
   $('serverUrl').value = settings.serverUrl;
   $('serverKey').value = settings.serverKey;
   $('publicUrl').value = settings.publicUrl;
   $('publicKey').value = settings.publicKey;
+  $('relayUrl').value = settings.relayUrl;
+  $('coreUrl').value = settings.coreUrl;
   syncSettingsFields();
   setStatus('', 'Not checked yet');
   $('settings').showModal();
 }
 
 function syncSettingsFields() {
-  const isPublic = $('modePublic').checked;
-  $('serverFields').hidden = isPublic;
-  $('publicFields').hidden = !isPublic;
-  // A public instance has no cookie store of ours to write to.
-  $('cookiesBlock').hidden = isPublic;
+  const mode = draftMode();
+  $('serverFields').hidden = mode !== 'server';
+  $('browserFields').hidden = mode !== 'browser';
+  $('publicFields').hidden = mode !== 'public';
+  // Only our own server has a cookie store to write to.
+  $('cookiesBlock').hidden = mode !== 'server';
 }
+
+const draftMode = () => ($('modeBrowser').checked ? 'browser' : $('modePublic').checked ? 'public' : 'server');
 
 function setStatus(kind, text) {
   $('statusDot').className = `dot${kind ? ` ${kind}` : ''}`;
@@ -611,18 +632,28 @@ function setStatus(kind, text) {
 function draftSettings() {
   return {
     ...settings,
-    mode: $('modePublic').checked ? 'public' : 'server',
+    mode: draftMode(),
     serverUrl: $('serverUrl').value.trim(),
     serverKey: $('serverKey').value.trim(),
     publicUrl: $('publicUrl').value.trim(),
     publicKey: $('publicKey').value.trim(),
+    relayUrl: $('relayUrl').value.trim(),
+    coreUrl: $('coreUrl').value.trim(),
   };
 }
 
 async function testConnection() {
   setStatus('', 'Checking…');
+  const draft = draftSettings();
+  if (draft.mode === 'browser') {
+    // There is nothing to reach, so the useful answer is what this device can
+    // and cannot do rather than a green light that means nothing.
+    setStatus('ok', draft.relayUrl ? 'Ready — relay set, so YouTube can be tried too' : 'Ready — hosts that allow it only, no relay set');
+    showPhoneHint([]);
+    return;
+  }
   try {
-    const info = await makeBackend(draftSettings()).health();
+    const info = await makeBackend(draft).health();
     setStatus('ok', `Reachable — ${info.label}${info.ffmpeg === false ? ', but no ffmpeg' : ''}`);
     showPhoneHint(info.lanUrls || []);
     setCookieState(info.hasCookies === true);
@@ -749,7 +780,11 @@ function setupInstall() {
 
 /** Languages only matter once subtitles are actually wanted. */
 function syncSubFields() {
-  $('subLangsField').hidden = settings.subs === 'off';
+  const wanted = settings.subs !== 'off';
+  $('subLangsField').hidden = !wanted;
+  // Better to say the setting will be ignored than to hand back a file that
+  // quietly has no subtitles in it.
+  $('subsUnsupported').hidden = !(wanted && settings.mode === 'browser');
 }
 
 /**
@@ -849,6 +884,7 @@ function init() {
   $('openSettings').addEventListener('click', openSettings);
   $('closeSettings').addEventListener('click', () => $('settings').close());
   $('modeServer').addEventListener('change', syncSettingsFields);
+  $('modeBrowser').addEventListener('change', syncSettingsFields);
   $('modePublic').addEventListener('change', syncSettingsFields);
   $('useLocalhost').addEventListener('click', () => {
     // 8000 is what docker-compose publishes, so this is the right guess far
@@ -870,6 +906,7 @@ function init() {
     applyBackend();
     $('settings').close();
     renderFeedback('');
+    syncSubFields();
     refreshBackendLabel();
     scheduleProbe();
   });
