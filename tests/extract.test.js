@@ -8,6 +8,7 @@ import {
   isYouTube,
   scrapePage,
   planDownload,
+  pipedFormats,
   safeFilename,
   titleFromUrl,
   extensionOf,
@@ -231,4 +232,71 @@ test('a filename loses the characters a file system will not take', () => {
 test('a title falls back to the last path segment', () => {
   assert.equal(titleFromUrl('https://cdn.example/videos/my_holiday.mp4'), 'my holiday');
   assert.equal(titleFromUrl('https://cdn.example/'), 'cdn.example');
+});
+
+/* --------------------------------------------------------------------- piped */
+
+const PIPED = {
+  title: 'Me at the zoo',
+  uploader: 'jawed',
+  duration: 19,
+  videoStreams: [
+    { url: 'https://p.example/v720', format: 'MPEG_4', quality: '720p', mimeType: 'video/mp4', codec: 'avc1.64001f', videoOnly: true, bitrate: 1500000, contentLength: '3000000', width: 1280, height: 720 },
+    { url: 'https://p.example/v360', format: 'MPEG_4', quality: '360p', mimeType: 'video/mp4', codec: 'avc1.42001e', videoOnly: false, bitrate: 600000, contentLength: '1200000', width: 640, height: 360 },
+    { url: 'https://p.example/webm', format: 'WEBM', quality: '480p', mimeType: 'video/webm', codec: 'vp9', videoOnly: true, bitrate: 800000, contentLength: '1600000', width: 854, height: 480 },
+  ],
+  audioStreams: [
+    { url: 'https://p.example/a128', format: 'M4A', quality: '128 kbps', mimeType: 'audio/mp4', codec: 'mp4a.40.2', bitrate: 128000, contentLength: '300000' },
+    { url: 'https://p.example/opus', format: 'WEBM', quality: '160 kbps', mimeType: 'audio/webm', codec: 'opus', bitrate: 160000, contentLength: '380000' },
+  ],
+};
+
+test('a Piped stream list maps onto the same Format shape InnerTube produces', () => {
+  const formats = pipedFormats(PIPED);
+  assert.equal(formats.length, 5);
+  const v720 = formats.find((f) => f.url.endsWith('v720'));
+  assert.equal(v720.kind, 'video');
+  assert.equal(v720.container, 'mp4');
+  assert.equal(v720.height, 720);
+  assert.equal(v720.filesize, 3000000);
+  assert.equal(v720.codecs, 'avc1.64001f');
+});
+
+test('the planner treats Piped streams by its usual rules: a sharper pair beats a lesser muxed file', () => {
+  // 480p video-only + audio is a whole step above the 360p muxed stream, so
+  // the pair is merged rather than the muxed file handed over.
+  const plan = planDownload({ formats: pipedFormats(PIPED), title: 't', url: 'u' }, 'video_480');
+  assert.equal(plan.op, 'copy');
+  assert.equal(plan.video.url, 'https://p.example/webm');
+  assert.equal(plan.audio.url, 'https://p.example/opus');
+});
+
+test('a muxed Piped stream is handed over raw when nothing sharper fits', () => {
+  const only = { videoStreams: [PIPED.videoStreams[1]], audioStreams: PIPED.audioStreams };
+  const plan = planDownload({ formats: pipedFormats(only), title: 't', url: 'u' }, 'video_480');
+  assert.equal(plan.op, 'raw');
+  assert.equal(plan.video.url, 'https://p.example/v360');
+});
+
+test('audio streams keep container and codec, so an AAC stream that wins is copied, not re-encoded', () => {
+  const [aac] = pipedFormats({ audioStreams: [PIPED.audioStreams[0]] });
+  assert.equal(aac.container, 'm4a');
+  assert.equal(aac.codecs, 'mp4a.40.2');
+  const plan = planDownload({ formats: [aac], title: 't', url: 'u' }, 'audio_m4a');
+  assert.equal(plan.op, 'audio-copy');
+});
+
+test('the best audio is still chosen by bitrate, even when that means re-encoding Opus to AAC', () => {
+  const plan = planDownload({ formats: pipedFormats(PIPED), title: 't', url: 'u' }, 'audio_m4a');
+  assert.equal(plan.audio.url, 'https://p.example/opus');
+  assert.equal(plan.op, 'audio-encode');
+});
+
+test('height falls back to the quality label when the instance omits it', () => {
+  const [only] = pipedFormats({ videoStreams: [{ url: 'https://p.example/x', quality: '1080p', mimeType: 'video/mp4', videoOnly: true }] });
+  assert.equal(only.height, 1080);
+});
+
+test('a stream with no URL is dropped rather than planned', () => {
+  assert.deepEqual(pipedFormats({ videoStreams: [{ quality: '720p' }], audioStreams: [] }), []);
 });

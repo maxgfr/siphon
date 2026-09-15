@@ -25,6 +25,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   // Browser mode: both optional. An empty relay is the honest default — it
   // means "nothing but this device", and the hosts that need one say so.
   relayUrl: '',
+  pipedUrl: '',
   coreUrl: '',
   preset: 'video_best',
   subs: 'off',
@@ -545,14 +546,17 @@ const PRIVACY_NOTE = {
   server: 'Links go only to the server you configured. Nothing is sent anywhere else.',
   browser: 'Downloads happen on this device. Links go to the site they point at, and nowhere else.',
   browserRelay: 'Downloads happen on this device, except for hosts that refuse a web page — those go through your relay.',
+  browserPiped: 'Downloads happen on this device. YouTube links are sent to the Piped instance you configured.',
 };
 
 function applyBackend() {
   backend = makeBackend(settings);
   $('privacyNote').textContent =
-    settings.mode === 'browser' && settings.relayUrl
-      ? PRIVACY_NOTE.browserRelay
-      : PRIVACY_NOTE[settings.mode] || PRIVACY_NOTE.server;
+    settings.mode === 'browser' && settings.pipedUrl
+      ? PRIVACY_NOTE.browserPiped
+      : settings.mode === 'browser' && settings.relayUrl
+        ? PRIVACY_NOTE.browserRelay
+        : PRIVACY_NOTE[settings.mode] || PRIVACY_NOTE.server;
 }
 
 async function refreshBackendLabel() {
@@ -633,6 +637,7 @@ function openSettings() {
   $('publicUrl').value = settings.publicUrl;
   $('publicKey').value = settings.publicKey;
   $('relayUrl').value = settings.relayUrl;
+  $('pipedUrl').value = settings.pipedUrl;
   $('coreUrl').value = settings.coreUrl;
   syncSettingsFields();
   setStatus('', 'Not checked yet');
@@ -665,6 +670,7 @@ function draftSettings() {
     publicUrl: $('publicUrl').value.trim(),
     publicKey: $('publicKey').value.trim(),
     relayUrl: $('relayUrl').value.trim(),
+    pipedUrl: $('pipedUrl').value.trim(),
     coreUrl: $('coreUrl').value.trim(),
   };
 }
@@ -675,7 +681,11 @@ async function testConnection() {
   if (draft.mode === 'browser') {
     // There is nothing to reach, so the useful answer is what this device can
     // and cannot do rather than a green light that means nothing.
-    setStatus('ok', draft.relayUrl ? 'Ready — relay set, so YouTube can be tried too' : 'Ready — hosts that allow it only, no relay set');
+    setStatus('ok', draft.pipedUrl
+      ? 'Ready — a Piped instance is set, so YouTube goes through it'
+      : draft.relayUrl
+        ? 'Ready — relay set, so YouTube can be tried too'
+        : 'Ready — hosts that allow it only, no relay or instance set');
     showPhoneHint([]);
     return;
   }

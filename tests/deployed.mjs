@@ -228,13 +228,17 @@ for (const [mode, api] of [['public', false], ['browser', true], ['server', fals
   await page.check('input[name="mode"][value="browser"]');
   await page.click('#testConnection');
   await page.waitForTimeout(400);
-  check('Test names the missing relay', /no relay set/i.test((await page.textContent('#statusText')) || ''),
+  check('Test names what is missing', /no relay or instance set/i.test((await page.textContent('#statusText')) || ''),
     (await page.textContent('#statusText')) || '');
 
   await page.fill('#relayUrl', 'https://relay.example.workers.dev');
+  await page.fill('#pipedUrl', 'https://pipedapi.example');
   await page.click('#saveSettings');
   await page.waitForTimeout(600);
-  check('the privacy note follows the relay', /relay/i.test((await page.textContent('#privacyNote')) || ''));
+  // Both are set, and the instance is the one that sees YouTube links, so the
+  // privacy line must name it rather than the relay.
+  check('the privacy note names the instance once one is set', /Piped instance/i.test((await page.textContent('#privacyNote')) || ''),
+    (await page.textContent('#privacyNote')) || '');
 
   await page.reload({ waitUntil: 'networkidle' });
   await page.waitForTimeout(1500);
@@ -243,8 +247,10 @@ for (const [mode, api] of [['public', false], ['browser', true], ['server', fals
   const kept = await page.evaluate(() => ({
     mode: document.querySelector('input[name="mode"]:checked')?.value,
     relay: document.getElementById('relayUrl').value,
+    piped: document.getElementById('pipedUrl').value,
   }));
-  check('the mode and relay survive a reload', kept.mode === 'browser' && kept.relay.includes('workers.dev'), JSON.stringify(kept));
+  check('the mode, relay and instance survive a reload',
+    kept.mode === 'browser' && kept.relay.includes('workers.dev') && kept.piped.includes('pipedapi'), JSON.stringify(kept));
 
   // Phone width is what this app is for; the sheet must not scroll sideways.
   const overflow = await page.evaluate(() => {

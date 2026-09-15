@@ -61,20 +61,34 @@ before it leaves the browser. Signing the stream URL is the *easy* half — that
 is just JavaScript, and [YouTube.js](https://github.com/LuanRT/YouTube.js) does
 it in the page — but a signed URL you are not allowed to fetch is no use.
 
-So YouTube in browser mode needs one of two things:
+So YouTube in browser mode needs one of three things, and the first needs
+nothing of yours running at all:
 
-- **[A relay](relay/)** — one file, on a free Cloudflare Worker, that adds the
-  missing header and forwards nothing else. No yt-dlp, no ffmpeg, no state, and
-  nothing to maintain when YouTube changes, because the part that changes is
-  running in your browser. It is still a server, so it is optional and empty by
-  default; leave it unset and YouTube links say exactly why they failed.
+- **A [Piped](https://github.com/TeamPiped/Piped) instance.** Its API answers
+  a web page directly and proxies the media with the headers the browser
+  needs, so the browser mode's own pipeline — the planner, ffmpeg.wasm, the
+  queue — runs on top of it unchanged. Paste an instance's API address under
+  **Settings → In this browser** and YouTube works from a phone with nothing
+  deployed. It is someone else's server: it sees every YouTube link you paste,
+  instances come and go, and YouTube blocks them in waves. There is no default
+  baked in, deliberately, for the same reason there is none for cobalt. When
+  one is set it is tried first and a relay is the fallback.
+- **[A relay](relay/)** — one file that adds the missing header and forwards
+  nothing else. No yt-dlp, no ffmpeg, no state, and nothing to maintain when
+  YouTube changes, because the part that changes is running in your browser.
+  One click puts it on a free Cloudflare Worker; `node relay/serve.mjs` runs
+  the same file on your own machine with no account at all, on your home IP,
+  which YouTube treats far more gently than a datacentre's. It is still a
+  server, so it is optional and empty by default; leave it unset and YouTube
+  links say exactly why they failed.
 - **Your own server**, below, which is the only option with a cookie jar and a
   proof-of-origin provider — and so the only one that clears a determined bot
   wall.
 
 Projects advertising a backend-free YouTube downloader are, as far as we can
 tell, all using someone else's server for that last hop. This one is honest
-about which hop that is.
+about which hop that is — and the Piped option *is* that: the instance is the
+hop, and the app says so in its privacy line.
 
 ### What actually moves the wall — and what does not
 
@@ -485,7 +499,17 @@ npm run test:e2e
 # running, a first visit to a host with no API behind it, and the settings sheet.
 # Needs playwright and openssl.
 npm run test:deployed
+
+# YouTube, for real, through the local relay. Needs a network that reaches
+# youtube.com; runs in CI, where it is informative rather than gating.
+npm run test:youtube
 ```
+
+All of it runs on every pull request. `fast` (the server suite and the unit
+tests) and `browser` (the two Playwright suites) gate the merge. `youtube` does
+not: a runner is a datacentre IP, and whether YouTube answers one on a given
+day is YouTube's decision, not this code's. A red there says *look*, never *do
+not merge* — and it names the client that got through or the exact refusal.
 
 The frontend has no build step and no dependencies: plain ES modules, no
 framework, no bundler. Edit and reload. `package.json` exists only so
