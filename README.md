@@ -12,6 +12,13 @@ straight from YouTube into it, because it installs as a share target.
 Settings picks which one does the fetching. They answer the same four questions,
 so the rest of the app is identical whichever you choose.
 
+On a first visit siphon picks for you, from the one fact that distinguishes the
+two situations: whether the page's own origin answers `/api/health`. The
+container serves both halves, so it does, and that setup keeps working with
+nothing configured. A static host does not, so browser mode is chosen — which
+works on arrival instead of opening on an instruction to go and set something
+up. Once you have chosen a mode yourself, nothing overrides it.
+
 | | what runs it | what it covers | what it costs |
 |---|---|---|---|
 | **In this browser** | the page you are looking at | direct files, HLS, pages that declare their media | nothing |
@@ -454,6 +461,11 @@ npm test
 # app and the media on two origins, and drives Chromium through the real UI.
 # Needs playwright and ffmpeg; SIPHON_CORE_URL points at a local ffmpeg.wasm.
 npm run test:e2e
+
+# the app as deployed — HTTPS, a /siphon/ subpath, the service worker actually
+# running, and a first visit to a host with no API behind it.
+# Needs playwright and openssl.
+npm run test:deployed
 ```
 
 The frontend has no build step and no dependencies: plain ES modules, no
@@ -529,6 +541,25 @@ one. All 21 checks pass:
 - A finished row survives a reload with its Save button intact, because the file
   is in OPFS.
 - No uncaught errors in the page across all of it.
+
+### As deployed
+
+`npm run test:deployed` covers the two things that only happen on a real static
+host, neither of which the suite above touches — it runs over plain HTTP, where
+the service worker never registers, and against a host that answers the API.
+15 checks pass:
+
+- A first visit to a host with no `/api/health` lands in browser mode, with a
+  header that says it is ready rather than a notice telling the visitor to go
+  and configure something.
+- A first visit to a host that *does* answer keeps server mode and names the
+  yt-dlp it found, so the container setup does not regress.
+- A mode the user already chose is never overridden, in any of the three.
+- A deploy landing under a returning visitor: the previous worker and its cache
+  are replaced, the old cache is swept, and the new app renders rather than the
+  cached old one — on that visit and the next.
+- With the network cut, the shell still opens, which is the only reason the
+  worker exists.
 
 **Not verified here:** how YouTube itself answers. The environment this was
 built in cannot reach YouTube or a CDN at all — the egress gateway refuses the

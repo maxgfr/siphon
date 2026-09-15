@@ -6,3 +6,4 @@ node_modules/
 downloads/
 .pytest_cache/
 tests/.e2e/
+tests/.deployed/
