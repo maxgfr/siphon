@@ -268,6 +268,15 @@ The image serves the interface *and* the API from one origin, so there is no
 CORS to configure and no second thing to deploy. It is published for amd64 and
 arm64, so the same command works on an Apple Silicon Mac or a Raspberry Pi.
 
+> **If you forked this, make the package public once.** GHCR publishes a new
+> package as private and the workflow's token cannot change that, so until you
+> go to Packages → siphon → Package settings → Change visibility → Public, the
+> pull fails with `denied` on any machine that is not signed in. It looks like
+> the image was never built. It was.
+
+Nothing is pinned to `latest` if you would rather not be: every push is also
+tagged with its short commit sha, and a `v*` tag publishes under that name.
+
 `docker compose up -d` does the same thing with the settings in
 `docker-compose.yml` — a named volume, a restart policy, and somewhere obvious
 to put `AUTH_TOKEN`. It pulls the same image rather than building one. To build
