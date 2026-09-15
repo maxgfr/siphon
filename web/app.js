@@ -11,7 +11,7 @@
  * primary action pinned within thumb reach, and no interaction that needs a
  * hover or a precise tap.
  */
-import { PRESETS, BackendError, makeBackend, detectEndpoint, privacyNote, describeEndpoint } from './api.js';
+import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, privacyNote, describeEndpoint } from './api.js';
 
 const SETTINGS_KEY = 'siphon:settings';
 const POLL_MS = 700;
@@ -97,6 +97,62 @@ async function pickInitialHelper() {
     return NO_HELPER;
   }
 }
+
+const INSTANCE_OFFERED = 'siphon:instance-offered';
+
+/**
+ * Nothing behind the page, so go and find a public instance.
+ *
+ * Runs after the first screen is already usable, because it talks to
+ * directories and then to several strangers, and none of that should hold up
+ * a paste. When one answers it is applied and *named* — the person has to be
+ * able to see whose server their links are about to reach, and to undo it.
+ *
+ * Once per browser: if the search finds nothing, or the person clears the
+ * address afterwards, it is not tried again behind their back.
+ */
+async function offerPublicInstance() {
+  try {
+    if (localStorage.getItem(INSTANCE_OFFERED) === '1') return;
+  } catch {
+    /* storage off: offering once per session is the harmless side */
+  }
+  const found = await findInstance({ detect: (address) => detectEndpoint(address) }).catch(() => null);
+  try {
+    localStorage.setItem(INSTANCE_OFFERED, '1');
+  } catch { /* nothing to do */ }
+  // A helper the person chose in the meantime wins over anything found here.
+  if (!found || settings.helper.kind !== 'none' || settings.endpoint) return;
+
+  settings = { ...settings, endpoint: found.endpoint, key: '', helper: found.helper };
+  saveSettings();
+  applyBackend();
+  refreshBackendLabel();
+  renderFeedback(
+    '<div class="notice"><p><strong>Using a public instance.</strong> ' +
+      `Nothing of yours is running, so links this device cannot read itself go to ` +
+      `<strong>${escapeHtml(hostOf(found.endpoint))}</strong>, which is someone else's server and sees them. ` +
+      'Change or clear it in settings.</p>' +
+      '<button class="retry" type="button" id="instanceSettings">Settings</button> ' +
+      '<button class="retry" type="button" id="instanceClear">Use this device only</button></div>',
+  );
+  $('instanceSettings')?.addEventListener('click', openSettings);
+  $('instanceClear')?.addEventListener('click', () => {
+    settings = { ...settings, endpoint: '', key: '', helper: NO_HELPER };
+    saveSettings();
+    applyBackend();
+    refreshBackendLabel();
+    renderFeedback('');
+  });
+}
+
+const hostOf = (url) => {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+};
 
 function saveSettings() {
   try {
@@ -906,6 +962,26 @@ function init() {
   $('cookiesFile').addEventListener('change', (event) => uploadCookies(event.target.files?.[0]));
   $('cookiesClear').addEventListener('click', removeCookies);
 
+  $('findInstance').addEventListener('click', async () => {
+    const button = $('findInstance');
+    button.disabled = true;
+    setStatus('', 'Looking for one that answers…');
+    try {
+      const found = await findInstance({ detect: (address) => detectEndpoint(address) });
+      if (!found) {
+        setStatus('bad', 'No public instance answered. They come and go; try again later, or run your own.');
+        return;
+      }
+      $('endpoint').value = found.endpoint;
+      $('endpointKey').value = '';
+      reflectHelper(found.helper);
+    } catch {
+      setStatus('bad', 'Could not reach the instance lists.');
+    } finally {
+      button.disabled = false;
+    }
+  });
+
   $('testConnection').addEventListener('click', testConnection);
   $('saveSettings').addEventListener('click', async () => {
     // Saving is what settles what the address is; an address that cannot be
@@ -955,6 +1031,10 @@ async function boot(firstVisit) {
   }
   await restoreQueue();
   refreshBackendLabel();
+  // Only on a genuine first visit, and never awaited: the screen is already
+  // usable, this talks to other people's servers, and someone who has used the
+  // app before with no helper chose that.
+  if (firstVisit && settings.helper.kind === 'none' && !settings.endpoint) offerPublicInstance();
 }
 
 init();
