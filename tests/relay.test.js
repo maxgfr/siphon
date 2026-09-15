@@ -210,6 +210,9 @@ test('a POST body reaches upstream, which is how InnerTube is called at all', as
       body: JSON.stringify({ videoId: 'dQw4w9WgXcQ' }),
     });
     assert.equal(upstream.calls[0].init.method, 'POST');
+    // Whole, not streamed: a stream goes out chunked with no content-length,
+    // which YouTube's API refuses.
+    assert.ok(upstream.calls[0].init.body instanceof ArrayBuffer, 'body is sent as bytes, not a stream');
     assert.equal(await response.text(), '{"videoId":"dQw4w9WgXcQ"}');
   } finally {
     upstream.restore();

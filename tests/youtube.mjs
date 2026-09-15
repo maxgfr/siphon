@@ -211,6 +211,22 @@ await page.addInitScript(
 // than every megabyte of video — a different cost model entirely. Counting
 // requests on the wire answers that without trusting anything.
 const routes = { direct: 0, relayed: 0 };
+// Every refusal, with its body. "failed with status code 400" names the
+// status and nothing else; the body is where YouTube (or an instance) says
+// why, and that sentence is the whole point of running this job at all.
+page.on('response', async (response) => {
+  if (response.status() < 400) return;
+  const url = response.url();
+  const target = url.startsWith(`http://127.0.0.1:${RELAY_PORT}/?url=`) ? `relay -> ${decodeURIComponent(url.slice(url.indexOf('=') + 1))}` : url;
+  if (target.startsWith(`http://127.0.0.1:${APP_PORT}`)) return; // a missing icon is not news
+  let body = '';
+  try {
+    body = (await response.text()).replace(/\s+/g, ' ').slice(0, 300);
+  } catch {
+    body = '(body unreadable)';
+  }
+  say(`   ${response.status()} ${target.slice(0, 160)}\n        ${body}`);
+});
 page.on('request', (request) => {
   const url = request.url();
   if (/googlevideo\.com/.test(url)) routes.direct += 1;

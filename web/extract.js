@@ -505,11 +505,13 @@ async function extractYouTube(url, context) {
   }
   // An instance needs no relay at all, so it goes first. If it fails and a
   // relay exists, the relay is the second try rather than the error.
+  let pipedFailure = null;
   if (context.piped) {
     try {
       return await extractPiped(id, url, context);
     } catch (error) {
       if (!context.net.hasEscape) throw error;
+      pipedFailure = error;
     }
   }
 
@@ -574,10 +576,12 @@ async function extractYouTube(url, context) {
     };
   }
 
+  // Both routes were tried; naming only the second would hide the first.
+  const instance = pipedFailure ? ` The Piped instance was tried first: ${pipedFailure.message}` : '';
   throw new BackendError('YouTube turned every client away.', {
-    hint: lastReason
+    hint: (lastReason
       ? `Last answer: ${lastReason}. A relay runs on a datacentre IP, which YouTube treats with more suspicion than a home connection — your own server is the cure.`
-      : 'Try your own server, which can carry your cookies.',
+      : 'Try your own server, which can carry your cookies.') + instance,
   });
 }
 

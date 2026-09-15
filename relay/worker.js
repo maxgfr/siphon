@@ -152,17 +152,20 @@ export default {
     headers.set('Origin', 'https://www.youtube.com');
     headers.set('Referer', 'https://www.youtube.com/');
 
+    // The body is read whole rather than streamed. Streamed, it goes out as
+    // transfer-encoding: chunked with no content-length — and that was the
+    // one difference between a browser's own POST and ours when YouTube's
+    // API answered every InnerTube call through the Node relay with a 400.
+    // Nothing is lost: only API calls are POSTed through here, a few
+    // kilobytes each; the media that must not be buffered is always a GET.
+    const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
     let upstream;
     try {
       upstream = await fetch(target.toString(), {
         method: request.method,
         headers,
-        body: request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body,
+        body: hasBody ? await request.arrayBuffer() : undefined,
         redirect: 'follow',
-        // Workers streams a request body without being asked; Node's fetch
-        // refuses to unless told. Harmless there, and it is what lets this
-        // exact file run under `node --test` instead of only in production.
-        duplex: 'half',
       });
     } catch (failure) {
       return deny(`upstream: ${failure?.message || failure}`, request, env, 502);
