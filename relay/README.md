@@ -27,6 +27,12 @@ copy of the server.
 
 ## Deploy
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/maxgfr/siphon/tree/main/relay)
+
+One click, a free Cloudflare account, and a `*.workers.dev` address at the
+end. Set `ALLOWED_ORIGINS` to your frontend's URL in the Worker's settings once
+it exists. Or from a terminal:
+
 ```sh
 cd relay
 npx wrangler deploy
@@ -35,6 +41,23 @@ npx wrangler secret put ALLOWED_ORIGINS     # https://yourname.github.io
 
 Then paste the worker's address into siphon under **Settings → In this browser
 → Relay**.
+
+## Or run it on your own machine, with no account at all
+
+```sh
+node relay/serve.mjs          # http://127.0.0.1:8787
+```
+
+Same file, same allow-lists, same code — bridged to Node's http server instead
+of Cloudflare's. Paste `http://127.0.0.1:8787` into siphon. A page on GitHub
+Pages is allowed to call it, because browsers treat `127.0.0.1` as a secure
+context.
+
+Two things it changes, one each way. It uses **your home IP**, which YouTube
+treats far more gently than a datacentre's — so this clears bot walls the
+Worker cannot. And it only exists while your machine does, so a phone can use
+it only when it can reach that machine. It is also what CI uses to drive a real
+YouTube download.
 
 Free-tier Workers allow 100,000 requests a day, which a personal downloader
 will not come close to: one video is a handful of requests, not one per

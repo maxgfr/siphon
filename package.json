@@ -2,10 +2,15 @@
   "name": "siphon",
   "private": true,
   "type": "module",
-  "description": "Tooling only. The app in web/ has no build step and no dependencies — this exists so the in-browser extractor's pure logic can be tested with node --test. Tests live outside web/ because the Pages workflow publishes that whole directory.",
+  "description": "Tooling only. The app in web/ has no build step and no dependencies — this exists so the tests can run under node --test and Playwright. Tests live outside web/ because the Pages workflow publishes that whole directory.",
   "scripts": {
     "test": "node --test \"tests/*.test.js\"",
     "test:e2e": "node tests/e2e.mjs",
-    "test:deployed": "node tests/deployed.mjs"
+    "test:deployed": "node tests/deployed.mjs",
+    "test:youtube": "node tests/youtube.mjs",
+    "relay": "node relay/serve.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1"
   }
 }

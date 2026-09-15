@@ -63,11 +63,14 @@ it in the page — but a signed URL you are not allowed to fetch is no use.
 
 So YouTube in browser mode needs one of two things:
 
-- **[A relay](relay/)** — one file, on a free Cloudflare Worker, that adds the
-  missing header and forwards nothing else. No yt-dlp, no ffmpeg, no state, and
-  nothing to maintain when YouTube changes, because the part that changes is
-  running in your browser. It is still a server, so it is optional and empty by
-  default; leave it unset and YouTube links say exactly why they failed.
+- **[A relay](relay/)** — one file that adds the missing header and forwards
+  nothing else. No yt-dlp, no ffmpeg, no state, and nothing to maintain when
+  YouTube changes, because the part that changes is running in your browser.
+  One click puts it on a free Cloudflare Worker; `node relay/serve.mjs` runs
+  the same file on your own machine with no account at all, on your home IP,
+  which YouTube treats far more gently than a datacentre's. It is still a
+  server, so it is optional and empty by default; leave it unset and YouTube
+  links say exactly why they failed.
 - **Your own server**, below, which is the only option with a cookie jar and a
   proof-of-origin provider — and so the only one that clears a determined bot
   wall.
@@ -485,7 +488,17 @@ npm run test:e2e
 # running, a first visit to a host with no API behind it, and the settings sheet.
 # Needs playwright and openssl.
 npm run test:deployed
+
+# YouTube, for real, through the local relay. Needs a network that reaches
+# youtube.com; runs in CI, where it is informative rather than gating.
+npm run test:youtube
 ```
+
+All of it runs on every pull request. `fast` (the server suite and the unit
+tests) and `browser` (the two Playwright suites) gate the merge. `youtube` does
+not: a runner is a datacentre IP, and whether YouTube answers one on a given
+day is YouTube's decision, not this code's. A red there says *look*, never *do
+not merge* — and it names the client that got through or the exact refusal.
 
 The frontend has no build step and no dependencies: plain ES modules, no
 framework, no bundler. Edit and reload. `package.json` exists only so

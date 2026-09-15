@@ -1,0 +1,66 @@
+name: CI
+
+# Two defects reached main before this file existed, and both would have been
+# caught in seconds: a requirements.txt pip could not resolve, and a service
+# worker no test had ever run because every test used plain HTTP. Nothing was
+# executing on a pull request. Now something is.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Seconds. Runs on every change, gates every merge.
+  fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Installing from the file, not a hand-picked subset, is the whole point:
+      # the file has to resolve, or the Dockerfile cannot build.
+      - run: pip install -r server/requirements.txt pytest httpx
+      - run: pytest server/tests -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npm test
+
+  # A few minutes. The app in a real browser: downloads, the service worker
+  # over HTTPS, a first visit to a host with no API, the settings sheet.
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+      - run: npm run test:e2e
+      - run: npm run test:deployed
+
+  # Informative, not gating. A runner is a datacentre IP, and whether YouTube
+  # answers one on a given day is YouTube's decision, not this code's — a red
+  # here says "look", never "do not merge". What it must never be is silent:
+  # the log names the client that got through, or the exact refusal.
+  youtube:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+      - run: npm run test:youtube

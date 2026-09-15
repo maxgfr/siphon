@@ -7,3 +7,4 @@ downloads/
 .pytest_cache/
 tests/.e2e/
 tests/.deployed/
+tests/.youtube/
