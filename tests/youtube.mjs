@@ -43,13 +43,51 @@ const RELAY_PORT = 8791;
 rmSync(OUT, { recursive: true, force: true });
 mkdirSync(OUT, { recursive: true });
 
+/**
+ * A hard ceiling on the whole run.
+ *
+ * Every wait below has its own timeout, but a job that is informative rather
+ * than gating must never be able to sit on a runner for hours: the first CI
+ * run of this file did, and nothing it could have reported was worth that.
+ * The per-attempt budget is 60 s probe + 150 s download; three attempts and
+ * setup fit comfortably in twelve minutes, so anything past that is a hang.
+ */
+const DEADLINE_MS = 12 * 60 * 1000;
+setTimeout(() => {
+  say(`\nFAIL watchdog: still running after ${DEADLINE_MS / 60000} minutes — something hung past its own timeout`);
+  process.exit(1);
+}, DEADLINE_MS);
+
 /* ------------------------------------------------------------------ servers */
 
 const relay = spawn(process.execPath, [join(HERE, '..', 'relay', 'serve.mjs')], {
   env: { ...process.env, PORT: String(RELAY_PORT) },
   stdio: ['ignore', 'pipe', 'inherit'],
 });
-for await (const chunk of relay.stdout) if (String(chunk).includes('relay listening')) break;
+
+/**
+ * Wait for the relay to say it is listening — on the accumulated output, not
+ * on each chunk. A pipe hands text over in arbitrary pieces, and the first CI
+ * run of this file most likely died here: the marker straddled two chunks,
+ * no single chunk contained it, and the loop waited for a line that had
+ * already gone by. Ten seconds is generous for a process that prints four
+ * lines on start; past that it did not start, and that is the report.
+ */
+await new Promise((resolve, reject) => {
+  let seen = '';
+  const timer = setTimeout(() => reject(new Error('the relay did not report listening within 10s')), 10_000);
+  relay.stdout.on('data', (chunk) => {
+    seen += String(chunk);
+    if (seen.includes('relay listening')) {
+      clearTimeout(timer);
+      resolve();
+    }
+  });
+  relay.on('exit', (code) => {
+    clearTimeout(timer);
+    reject(new Error(`the relay exited with code ${code} before listening`));
+  });
+});
 
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml', '.png': 'image/png' };
 const app = createServer((request, response) => {
