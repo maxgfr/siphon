@@ -465,9 +465,15 @@ async function loadInnertube() {
  * by the time they reach here — the Headers constructor drops them — which is
  * one of the reasons this path needs a relay at all.
  */
-function innertubeFetch(net) {
+export function innertubeFetch(net) {
   return async (input, init) => {
-    const request = input instanceof Request ? input : new Request(input, init);
+    // The library calls this with a Request *and* an init: the Request is
+    // the bare payload, and the init carries what the library added to it —
+    // the session context in the body, the visitor and client headers. Taking
+    // the Request alone sends a player call with no `context` at all, which
+    // YouTube answers with 400 "Precondition check failed" on every client.
+    // `new Request(input, init)` lets the init win, as the library intends.
+    const request = new Request(input, init);
     const headers = {};
     request.headers.forEach((value, key) => {
       headers[key] = value;

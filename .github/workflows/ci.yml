@@ -71,6 +71,8 @@ jobs:
       # one hand-built call per client, no browser, no relay, no library. A
       # red below is read against this instead of guessed at.
       - run: node tests/innertube-probe.mjs
+        env:
+          SIPHON_PIPED_URL: https://pipedapi.kavin.rocks
       - run: npm run test:youtube
         env:
           SIPHON_PIPED_URL: https://pipedapi.kavin.rocks

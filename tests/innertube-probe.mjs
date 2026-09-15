@@ -98,6 +98,29 @@ say(`\n${usable}/${results.length} hand-built variants got a playable answer`);
  * one draws a 400 and the fetched one does not, the browser's session is
  * the problem, not the relay and not the runner.
  */
+/* The Piped instance CI hands the browser test, asked directly from Node. */
+const PIPED = (process.env.SIPHON_PIPED_URL || '').replace(/\/+$/, '');
+if (PIPED) {
+  say(`\npiped instance ${PIPED}, straight from this machine\n`);
+  try {
+    const response = await fetch(`${PIPED}/streams/${VIDEO}`, { signal: AbortSignal.timeout(20_000), headers: { Accept: 'application/json' } });
+    const text = await response.text();
+    let summary = text.replace(/\s+/g, ' ').slice(0, 140);
+    try {
+      const json = JSON.parse(text);
+      if (json.error) summary = `error: ${String(json.error).slice(0, 120)}`;
+      else summary = `title=${JSON.stringify(json.title || '')} video streams=${json.videoStreams?.length || 0} audio streams=${json.audioStreams?.length || 0}`;
+    } catch {
+      /* not json — the raw start of the body says enough */
+    }
+    say(`/streams                           HTTP ${response.status}  cors=${response.headers.get('access-control-allow-origin') || 'none'}  ${summary}`);
+  } catch (error) {
+    say(`/streams                           ERROR ${String(error?.message || error).slice(0, 140)}`);
+  }
+} else {
+  say('\npiped instance: not set (SIPHON_PIPED_URL), skipped');
+}
+
 say('\nyoutubei.js from Node, same version the page loads\n');
 const { Innertube } = await import('youtubei.js');
 const CLIENT_LADDER = [undefined, 'TV_EMBEDDED', 'IOS', 'ANDROID_VR', 'MWEB'];
