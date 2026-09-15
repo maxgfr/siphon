@@ -268,11 +268,11 @@ The image serves the interface *and* the API from one origin, so there is no
 CORS to configure and no second thing to deploy. It is published for amd64 and
 arm64, so the same command works on an Apple Silicon Mac or a Raspberry Pi.
 
-> **If you forked this, make the package public once.** GHCR publishes a new
-> package as private and the workflow's token cannot change that, so until you
-> go to Packages → siphon → Package settings → Change visibility → Public, the
-> pull fails with `denied` on any machine that is not signed in. It looks like
-> the image was never built. It was.
+The package takes this repository's visibility, so nothing has to be unlocked
+for the command above to work. **On a private fork it will be private too**,
+and making it pullable is Packages → siphon → Package settings → Change
+visibility → Public — a personal token is needed for that, so the workflow
+cannot do it for you.
 
 Nothing is pinned to `latest` if you would rather not be: every push is also
 tagged with its short commit sha, and a `v*` tag publishes under that name.

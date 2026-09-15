@@ -37,18 +37,15 @@ jobs:
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
-      # ONE-TIME MANUAL STEP, after the first successful run:
-      # the repo's Packages -> siphon -> Package settings -> Change visibility
-      # -> Public.
+      # GITHUB_TOKEN is enough for the repository's own package: no secret to
+      # set up, which is the point of using GHCR rather than Docker Hub.
       #
-      # GHCR makes a new package private, and GITHUB_TOKEN cannot change that —
-      # flipping visibility needs a personal token, so it is not something this
-      # workflow can do for itself. Until it is done, `docker pull` from a
-      # machine that is not signed in fails with "denied", which looks like the
-      # image was never published.
-      #
-      # GITHUB_TOKEN is otherwise enough for the repository's own package: no
-      # secret to set up, which is the point of using GHCR rather than Docker Hub.
+      # The package inherits this repository's visibility, so on a public repo
+      # it is publicly pullable as soon as it is pushed — verified by fetching
+      # the manifest with an anonymous ghcr.io token. On a private fork it will
+      # be private too, and making it public is Packages -> siphon -> Package
+      # settings -> Change visibility, which needs a personal token and so is
+      # not something this workflow can do for itself.
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
