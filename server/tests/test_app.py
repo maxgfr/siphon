@@ -601,6 +601,25 @@ class TestResolvedFormat:
         assert hls["protocol"] == "hls"
         assert dash is None
 
+    def test_unknown_codecs_are_not_absent_codecs(self) -> None:
+        """
+        yt-dlp writes "none" for a track that is definitely absent and leaves
+        the field unset when it does not know. A direct .mp4 comes back with
+        both unset, and reading that as "no codecs" dropped every plain link —
+        which then failed with a paragraph about YouTube cookies.
+        """
+        direct = server_app.resolved_format({
+            "format_id": "mp4", "url": "https://cdn.example/clip.mp4", "protocol": "http", "ext": "mp4",
+        })
+        assert direct is not None
+        assert direct["kind"] == "muxed"
+        assert direct["label"] == "source"
+
+    def test_a_thumbnail_with_both_codecs_absent_is_still_dropped(self) -> None:
+        assert server_app.resolved_format({
+            "format_id": "thumb", "url": "u", "ext": "jpg", "vcodec": "none", "acodec": "none",
+        }) is None
+
     @pytest.mark.parametrize(
         "fmt",
         [
@@ -692,6 +711,8 @@ class TestResolveAndTunnel:
         assert kept_headers == {"User-Agent": "yt-dlp-ua", "Referer": "https://site.example/"}
 
     def test_resolve_walks_the_client_ladder_on_a_bot_wall(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A YouTube link: the ladder is YouTube's, and a bot wall is the one
+        # answer worth trying another of its clients for.
         calls = {"n": 0}
 
         def extract_info(self: _FakeYdl, _url: str, download: bool = True) -> dict:
@@ -701,7 +722,7 @@ class TestResolveAndTunnel:
             return dict(_FakeYdl.info)
 
         monkeypatch.setattr(_FakeYdl, "extract_info", extract_info)
-        response = client.post("/api/resolve", json={"url": "https://site.example/watch?v=abc"})
+        response = client.post("/api/resolve", json={"url": "https://www.youtube.com/watch?v=abc"})
         assert response.status_code == 200
         assert response.json()["extractor"] == "Site (server, tv)"
         assert calls["n"] == 2
@@ -766,3 +787,141 @@ class TestResolveAndTunnel:
 def test_health_lists_capabilities(client: TestClient) -> None:
     body = client.get("/api/health").json()
     assert body["capabilities"] == ["jobs", "resolve", "tunnel"]
+
+
+# ------------------------------------------------- the ladder is YouTube's
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://www.youtube.com/watch?v=abc", True),
+        ("https://youtu.be/abc", True),
+        ("https://music.youtube.com/watch?v=abc", True),
+        ("https://m.youtube.com/watch?v=abc", True),
+        ("https://youtube-nocookie.com/embed/abc", True),
+        # The suffix trick that a plain "endswith" would wave through.
+        ("https://youtube.com.evil.example/watch?v=abc", False),
+        ("https://vimeo.com/123", False),
+        ("https://cdn.example/clip.mp4", False),
+        ("not a url at all", False),
+    ],
+)
+def test_youtube_is_recognised_by_host_not_by_substring(url: str, expected: bool) -> None:
+    assert server_app.is_youtube(url) is expected
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["Sign in to confirm you're not a bot", "requested format is not available"],
+)
+def test_the_bot_wall_advice_is_only_given_for_youtube(message: str) -> None:
+    """
+    Several bot-wall markers are things yt-dlp says about any site. Telling
+    someone to upload YouTube cookies because an MP4 link broke is worse than
+    saying nothing.
+    """
+    youtube = server_app.humanize_error(Exception(message), "https://www.youtube.com/watch?v=abc")
+    other = server_app.humanize_error(Exception(message), "https://cdn.example/clip.mp4")
+    assert "cookies" in youtube.lower()
+    assert "cookies" not in other.lower()
+    assert message.split(" ")[0].lower() in other.lower() or other
+
+
+def test_a_non_youtube_resolve_does_not_walk_the_client_ladder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Three extra attempts with YouTube player clients help no other site."""
+    _public_dns(monkeypatch)
+    calls: list[dict] = []
+
+    class _Counting(_FakeYdl):
+        def extract_info(self, _url: str, download: bool = True) -> dict:
+            calls.append(dict(_FakeYdl.seen_options[-1]))
+            raise server_app.yt_dlp.utils.DownloadError("Sign in to confirm you're not a bot")
+
+    monkeypatch.setattr(server_app.yt_dlp, "YoutubeDL", _Counting)
+    _FakeYdl.seen_options = []
+    with pytest.raises(Exception):
+        server_app.resolve_url("https://vimeo.com/123")
+    assert len(calls) == 1
+
+    _FakeYdl.seen_options = []
+    calls.clear()
+    with pytest.raises(Exception):
+        server_app.resolve_url("https://www.youtube.com/watch?v=abc")
+    assert len(calls) == len(server_app.player_client_chain(False))
+
+
+# ------------------------------------------------ real yt-dlp, real socket
+
+
+class TestAgainstRealYtDlp:
+    """
+    One test that does not stub yt-dlp.
+
+    Everything above describes what this server does with a *canned* info
+    dict, which is exactly how a real defect got through: yt-dlp answers a
+    plain media link with the codec fields unset, meaning "unknown", and
+    reading that as "no codecs" dropped the only format there was. The link
+    then failed — with a paragraph about YouTube cookies, for a link that was
+    never YouTube's.
+
+    So this one serves a file over a real socket and lets the real extractor
+    look at it. No network beyond loopback, and nothing but the standard
+    library to serve it.
+    """
+
+    @pytest.fixture()
+    def media(self, monkeypatch: pytest.MonkeyPatch):
+        import http.server
+        import threading
+
+        body = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 512
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 — the stdlib's spelling
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_HEAD = do_GET
+
+            def log_message(self, *_args: object) -> None:
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        # The guard exists to stop this service being pointed at a private
+        # network; the flag that lifts it is exactly what a LAN source needs,
+        # and what this test is.
+        monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", True)
+        monkeypatch.setattr(server_app, "TUNNEL_HOSTS", {})
+        try:
+            yield f"http://127.0.0.1:{server.server_address[1]}/clip.mp4", body
+        finally:
+            server.shutdown()
+
+    def test_a_plain_media_link_resolves_to_something_downloadable(self, media) -> None:
+        url, body = media
+        info = server_app.resolve_url(url)
+
+        assert info["formats"], "a direct link must produce a format, not an empty list"
+        fmt = info["formats"][0]
+        # Unknown codecs are not absent codecs: this is the whole file.
+        assert fmt["kind"] == "muxed"
+        assert fmt["protocol"] == "progressive"
+        assert fmt["url"] == url
+        assert fmt["label"] != "audio", "a video file must not be labelled audio"
+        # And the host it named is now the one the tunnel will carry.
+        assert "127.0.0.1" in server_app.TUNNEL_HOSTS
+
+    def test_and_the_tunnel_then_carries_it_byte_for_byte(self, media, monkeypatch: pytest.MonkeyPatch) -> None:
+        url, body = media
+        server_app.resolve_url(url)
+        client = TestClient(server_app.app)
+        response = client.get("/api/tunnel", params={"url": url})
+        assert response.status_code == 200
+        assert response.content == body
+        assert response.headers["content-type"] == "video/mp4"

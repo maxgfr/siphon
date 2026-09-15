@@ -183,6 +183,22 @@ BOT_WALL_MARKERS = (
 )
 
 
+# The ladder and the bot-wall advice are about one site. Everywhere else they
+# are noise at best: three pointless retries and, at the end, a paragraph about
+# YouTube cookies for a link that was never YouTube's.
+YOUTUBE_HOSTS = frozenset({
+    "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
+    "youtu.be", "www.youtu.be", "youtube-nocookie.com", "www.youtube-nocookie.com",
+})
+
+
+def is_youtube(url: str) -> bool:
+    try:
+        return (urlparse(url).hostname or "").lower().lstrip(".") in YOUTUBE_HOSTS
+    except ValueError:
+        return False
+
+
 def is_bot_wall(message: str) -> bool:
     lowered = message.lower()
     return any(marker in lowered for marker in BOT_WALL_MARKERS)
@@ -470,7 +486,7 @@ def run_job(job: Job) -> None:
     """
     with RUNNING:
         job.state = "running"
-        attempts = player_client_chain(have_cookies())
+        attempts = player_client_chain(have_cookies()) if is_youtube(job.url) else [None]
         last_error: Exception | None = None
 
         for index, client in enumerate(attempts):
@@ -541,18 +557,24 @@ def run_job(job: Job) -> None:
 
         job.state = "error"
         job.stage = "failed"
-        job.error = humanize_error(last_error or Exception("The download failed."))
+        job.error = humanize_error(last_error or Exception("The download failed."), job.url)
 
 
-def humanize_error(exc: Exception) -> str:
-    """Turn yt-dlp's stderr-shaped messages into something worth showing a user."""
+def humanize_error(exc: Exception, url: str = "") -> str:
+    """
+    Turn yt-dlp's stderr-shaped messages into something worth showing a user.
+
+    `url` decides whether the bot-wall advice applies: several of the markers
+    are things yt-dlp says about any site, and telling someone to upload
+    YouTube cookies for a broken MP4 link is worse than saying nothing.
+    """
     text = str(exc)
     text = re.sub(r"\x1b\[[0-9;]*m", "", text)
     text = re.sub(r"^ERROR:\s*", "", text).strip()
     text = re.sub(r";\s*please report this issue.*$", "", text, flags=re.S).strip()
 
     lowered = text.lower()
-    if is_bot_wall(text):
+    if is_bot_wall(text) and (not url or is_youtube(url)):
         if have_cookies():
             return (
                 "YouTube asked for a login on every client, even with your cookies. They have "
@@ -745,7 +767,7 @@ async def probe(body: ProbeRequest, authorization: str | None = Header(default=N
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="The site took too long to answer.")
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=humanize_error(exc))
+        raise HTTPException(status_code=400, detail=humanize_error(exc, url))
 
     if info.get("_type") == "playlist":
         entries = [e for e in info.get("entries", []) if e]
@@ -961,9 +983,26 @@ def _granted(host: str) -> dict[str, str] | None:
 
 
 def format_kind(fmt: dict[str, Any]) -> str:
-    video = (fmt.get("vcodec") or "none") != "none"
-    audio = (fmt.get("acodec") or "none") != "none"
+    """
+    Whether a format carries video, audio or both.
+
+    yt-dlp writes the string "none" when a track is definitely absent and
+    leaves the field unset when it does not know — a direct .mp4 comes back
+    with both unset. Reading unset as absent made every such file look like a
+    codec-less nothing, which is how a plain link ended up being dropped and
+    then explained with a paragraph about YouTube cookies.
+    """
+    video = fmt.get("vcodec") != "none"
+    audio = fmt.get("acodec") != "none"
     return "muxed" if video and audio else "video" if video else "audio"
+
+
+def format_label(fmt: dict[str, Any]) -> str:
+    """What to call a format when the site gave it no name of its own."""
+    if fmt.get("height"):
+        return f"{fmt['height']}p"
+    kind = format_kind(fmt)
+    return "audio" if kind == "audio" else "source"
 
 
 def resolved_format(fmt: dict[str, Any]) -> dict[str, Any] | None:
@@ -984,7 +1023,9 @@ def resolved_format(fmt: dict[str, Any]) -> dict[str, Any] | None:
         shape = "progressive"
     else:
         return None
-    if (fmt.get("vcodec") or "none") == "none" and (fmt.get("acodec") or "none") == "none":
+    # Both explicitly absent is a thumbnail or a storyboard, not media. Both
+    # merely unknown is a direct file, which is the commonest link there is.
+    if fmt.get("vcodec") == "none" and fmt.get("acodec") == "none":
         return None
     codecs = ",".join(c for c in (fmt.get("vcodec"), fmt.get("acodec")) if c and c != "none")
     tbr = fmt.get("tbr")
@@ -999,7 +1040,7 @@ def resolved_format(fmt: dict[str, Any]) -> dict[str, Any] | None:
         "bitrate": int(tbr * 1000) if tbr else None,
         "filesize": fmt.get("filesize") or fmt.get("filesize_approx"),
         "codecs": codecs,
-        "label": fmt.get("format_note") or (f"{fmt.get('height')}p" if fmt.get("height") else "audio"),
+        "label": fmt.get("format_note") or format_label(fmt),
     }
 
 
@@ -1008,7 +1049,7 @@ def resolve_url(url: str) -> dict[str, Any]:
     Metadata and formats, no download, walking the client ladder on a bot
     wall exactly as a job would. Runs in a thread; yt-dlp is synchronous.
     """
-    attempts = player_client_chain(have_cookies())
+    attempts = player_client_chain(have_cookies()) if is_youtube(url) else [None]
     last_error: Exception | None = None
     for index, client in enumerate(attempts):
         options: dict[str, Any] = {
@@ -1038,7 +1079,7 @@ def resolve_url(url: str) -> dict[str, Any]:
                 if single:
                     pairs = [(single, info)]
             if not pairs:
-                raise yt_dlp.utils.DownloadError("requested format is not available")
+                raise yt_dlp.utils.DownloadError("nothing downloadable was offered for that link")
             for fmt, raw in pairs:
                 _grant_host(fmt["url"], raw.get("http_headers"))
             formats = [fmt for fmt, _ in pairs]
@@ -1073,7 +1114,7 @@ async def resolve(body: ProbeRequest, authorization: str | None = Header(default
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="The site took too long to answer.")
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=humanize_error(exc))
+        raise HTTPException(status_code=400, detail=humanize_error(exc, url))
 
 
 def _iter_upstream(response: Any) -> Iterator[bytes]:

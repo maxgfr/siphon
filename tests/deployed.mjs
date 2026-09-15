@@ -142,11 +142,23 @@ const browser = await chromium.launch({
   args: ['--ignore-certificate-errors'],
 });
 
-async function fresh() {
+async function fresh({ offerInstance = false } = {}) {
   const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 412, height: 915 } });
   const page = await context.newPage();
   page.on('pageerror', (error) => context.__errors.push(error.message));
   context.__errors = [];
+  // A first visit with nothing behind the page goes looking for a public
+  // instance, which means contacting real directories and real strangers. No
+  // test may do that, so the "already offered" flag is set unless a case is
+  // specifically about the search.
+  if (!offerInstance) {
+    await page.addInitScript(() => localStorage.setItem('siphon:instance-offered', '1'));
+  }
+  context.__offsite = [];
+  page.on('request', (request) => {
+    const host = new URL(request.url()).host;
+    if (!host.startsWith('127.0.0.1')) context.__offsite.push(host);
+  });
   return { context, page };
 }
 
@@ -167,6 +179,10 @@ async function fresh() {
   check('no dead end telling them to go and set something up', !/open settings/i.test(notice),
     notice.replace(/\s+/g, ' ').trim().slice(0, 60) || '(empty)');
   check('no uncaught errors on a first visit', context.__errors.length === 0, context.__errors.join(' ; '));
+  // The search for a public instance is the one thing here that would reach
+  // off this machine. Having been offered once, it must stay quiet.
+  check('and nothing is contacted off this machine once the offer is spent',
+    context.__offsite.length === 0, context.__offsite.slice(0, 3).join(', '));
   await context.close();
 }
 

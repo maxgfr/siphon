@@ -36,6 +36,27 @@ origin. The container serves both halves, so it answers and everything works
 with no configuration; a static host does not, so the device does it. Either
 way the first screen works rather than opening on an instruction.
 
+### Finding a public instance
+
+When nothing is behind the page, a YouTube link would fail on arrival —
+correctly, but nobody pastes a link in order to read about CORS. So on that
+first visit, *after* the screen is usable, siphon asks the cobalt and Piped
+projects for their own published instance lists, probes what comes back, and
+fills in the first address that actually answers. **Find a public instance** in
+settings does the same on demand.
+
+The directory is a hint; the probe is the truth. A list can be stale, a host
+can be down, an instance can be blocked by YouTube this week, and none of that
+is visible in a JSON file — so nothing is used until it has answered for
+itself, through the same detection a typed-in address goes through. cobalt is
+preferred over Piped, because it reaches more than one site.
+
+Two rules make this safe to do automatically, and they hold everywhere:
+whichever instance is chosen is **named on screen** the moment it is, and
+clearing it is one tap. It is someone else's server and it sees the links it is
+asked about. The search runs once per browser, never behind your back
+afterwards: if you clear the address, it stays cleared.
+
 ### The split: the server says where, the device fetches
 
 This is the shape [cobalt](https://github.com/imputnet/cobalt) found, and it is
@@ -561,12 +582,18 @@ used to smuggle arbitrary yt-dlp options.
 
 ## The public-instance fallback
 
-Point the address at a [cobalt](https://github.com/imputnet/cobalt) instance and
-it is used for whatever this device could not read by itself. No server to
-deploy, but shared instances rate-limit, require captchas or API keys, and come
-and go — and every link that reaches one is seen by whoever runs it. There is no
-default instance baked in, deliberately: you have to supply an address you
-actually trust. Treat this as the fallback, not the plan.
+Point the address at a [cobalt](https://github.com/imputnet/cobalt) or
+[Piped](https://github.com/TeamPiped/Piped) instance and it is used for whatever
+this device could not read by itself — and with nothing saved, siphon will go
+and find one, as above.
+
+It is worth being plain about what that means. Shared instances rate-limit,
+require captchas or API keys, and come and go, and **every link that reaches one
+is seen by whoever runs it**. No instance is hard-coded as a default: the seed
+list in `web/instances.js` is a fallback for when the projects' own directories
+cannot be reached, every address is probed before use, and the one in use is
+named on the main screen. Treat this as the fallback, not the plan — your own
+server is the plan.
 
 ## Development
 
@@ -648,15 +675,22 @@ still unproven.
 
 | suite | what it is | result |
 |---|---|---|
-| `pytest server/tests` | the server, without a network | 94 pass |
-| `npm test` | the extractor, the relay and endpoint detection, as pure logic | 80 pass |
+| `pytest server/tests` | the server, including two against real yt-dlp | 110 pass |
+| `npm test` | the extractor, the relay, endpoint detection, instance finding | 90 pass |
 | `npm run test:e2e` | the device alone, real Chromium, two origins | 21 pass |
-| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker | 35 pass |
+| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker | 36 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
 | `npm run test:split` | a server that only resolves, a device that downloads | 17 pass |
 | `npm run test:youtube` | YouTube, for real, in CI | informative — see below |
 
 ### The device alone
+
+Finding a public instance is covered with both the directories and the probe
+stubbed: that a listed address is only used once it has answered for itself,
+that an instance listed as offline is never even contacted, that a directory
+which changed shape is ignored rather than thrown on, that a siphon server or a
+relay appearing in such a list is not mistaken for an instance, and that the
+number of strangers contacted on a first visit is capped.
 
 The unit tests cover what needs no network: HLS attribute and playlist parsing,
 byte-range continuation, IV derivation, YouTube URL shapes, page-scraping
@@ -705,7 +739,30 @@ with an access key on both. It proves the client half of the arrangement:
 The server half — the shape `/api/resolve` returns, which formats are dropped,
 the client ladder on a bot wall, the headers the tunnel carries and the ones it
 strips, range requests, and the access key on both — is covered by the Python
-tests.
+tests. Two of those do not stub yt-dlp at all: they serve a file over a
+loopback socket and let the real extractor look at it, which is the only way
+the defect below would have been caught.
+
+### What running the real server found
+
+Every test above described the server with a *canned* yt-dlp answer, and that
+is exactly how three defects got through. Starting the real service and asking
+it to resolve a plain `.mp4` produced, of all things, a paragraph about YouTube
+cookies:
+
+- **Unknown codecs were read as absent codecs.** yt-dlp writes `"none"` when a
+  track is definitely not there and leaves the field unset when it does not
+  know. A direct file comes back with both unset, so the only format there was
+  got dropped as codec-less.
+- **The empty result then raised a message that was itself a bot-wall marker**,
+  which sent the resolve round YouTube's client ladder.
+- **The ladder, and the cookie advice at the end of it, applied to every site.**
+  Three pointless retries for a link that was never YouTube's, and then advice
+  that could not possibly help.
+
+All three are fixed, the codec rule is now a tri-state, the ladder and the
+advice are scoped to YouTube hosts by hostname (so `youtube.com.evil.example`
+does not qualify), and the loopback tests fail if any of it comes back.
 
 ### As deployed
 

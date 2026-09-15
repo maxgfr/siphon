@@ -19,6 +19,7 @@ import { BrowserBackend } from './inbrowser.js';
 import { pipedResolver } from './extract.js';
 import { relayEscape } from './net.js';
 export { detectEndpoint, privacyNote, describeEndpoint } from './endpoint.js';
+export { findInstance } from './instances.js';
 
 /** The qualities the UI offers. The server validates against its own copy. */
 export const PRESETS = Object.freeze([
