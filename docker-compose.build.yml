@@ -1,0 +1,12 @@
+# Build the image from this checkout instead of pulling the published one.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# For working on the server. Everyone else should let docker-compose.yml pull,
+# which is faster and needs no toolchain.
+services:
+  siphon:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    pull_policy: build

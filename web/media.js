@@ -123,6 +123,9 @@ const metadataArgs = (tags = {}) =>
 /**
  * Put a video track and an audio track into one playable file.
  *
+ * One track is the same job: a pile of HLS segments handed in as `video` comes
+ * out as a container a player will open, which is all remuxing a stream is.
+ *
  * `-c copy` throughout: nothing is re-encoded, so this is bounded by how fast
  * wasm can shuffle bytes rather than by how fast it can compress them.
  * `+faststart` moves the index to the front, which is what lets a phone's
@@ -184,16 +187,6 @@ export async function toAudio({ source, ext = 'mp3', copy = false, tags = {}, co
     args.push('-vn', '-map', '0:a:0');
   }
 
-  const output = `out.${ext}`;
-  args.push(...metadataArgs(tags), '-y', output);
-  return transform({ inputs, args, output, onProgress });
-}
-
-/** Turn a pile of HLS segments into a file a player will open. */
-export async function remuxStream({ data, sourceExt = 'ts', ext = 'mp4', tags = {}, onProgress }) {
-  const inputs = [{ name: `stream.${sourceExt}`, data }];
-  const args = ['-i', `stream.${sourceExt}`, '-c', 'copy'];
-  if (ext === 'mp4') args.push('-movflags', '+faststart');
   const output = `out.${ext}`;
   args.push(...metadataArgs(tags), '-y', output);
   return transform({ inputs, args, output, onProgress });

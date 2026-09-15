@@ -1,8 +1,17 @@
+# Everything in one container: the API and the interface, on one origin, so
+# there is no CORS to configure and no second thing to deploy.
+#
+#   docker compose up -d        then open http://localhost:8000
+#
+# This pulls a prebuilt image rather than building one, so there is nothing to
+# compile and nothing to wait for. To build from source instead — which is what
+# you want when you are changing the server — add the build overlay:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 services:
   siphon:
-    build:
-      context: .
-      dockerfile: server/Dockerfile
+    image: ghcr.io/maxgfr/siphon:latest
+    pull_policy: always
     ports:
       - "8000:8000"
     environment:
