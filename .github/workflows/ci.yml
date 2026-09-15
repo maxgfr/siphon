@@ -67,6 +67,10 @@ jobs:
       # A public instance for the Piped path. Instances come and go and YouTube
       # blocks them in waves; a failure here is information about that
       # instance today, which is exactly what this job is for.
+      # First, what YouTube's API says to a bare request from this runner:
+      # one hand-built call per client, no browser, no relay, no library. A
+      # red below is read against this instead of guessed at.
+      - run: node tests/innertube-probe.mjs
       - run: npm run test:youtube
         env:
           SIPHON_PIPED_URL: https://pipedapi.kavin.rocks

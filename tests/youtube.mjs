@@ -39,6 +39,7 @@ const FFMPEG = process.env.FFMPEG || 'ffmpeg';
 const VIDEO = process.env.SIPHON_YT_URL || 'https://www.youtube.com/watch?v=jNQXAC9IVRw';
 const APP_PORT = 8790;
 const RELAY_PORT = 8791;
+const PIPED = (process.env.SIPHON_PIPED_URL || '').replace(/\/+$/, '');
 
 rmSync(OUT, { recursive: true, force: true });
 mkdirSync(OUT, { recursive: true });
@@ -215,8 +216,11 @@ const routes = { direct: 0, relayed: 0 };
 // status and nothing else; the body is where YouTube (or an instance) says
 // why, and that sentence is the whole point of running this job at all.
 page.on('response', async (response) => {
-  if (response.status() < 400) return;
   const url = response.url();
+  // An instance's every answer is worth a line, not only its refusals: the
+  // question "was it even asked?" has to be answerable from the log.
+  const instance = PIPED && url.startsWith(PIPED);
+  if (response.status() < 400 && !instance) return;
   const target = url.startsWith(`http://127.0.0.1:${RELAY_PORT}/?url=`) ? `relay -> ${decodeURIComponent(url.slice(url.indexOf('=') + 1))}` : url;
   if (target.startsWith(`http://127.0.0.1:${APP_PORT}`)) return; // a missing icon is not news
   let body = '';
@@ -315,7 +319,6 @@ if (routes.direct > 0 && routes.relayed === 0) {
 }
 
 /* Piped: the same video with nothing of ours in front of it at all. */
-const PIPED = process.env.SIPHON_PIPED_URL || '';
 if (PIPED) {
   say(`\npiped instance: ${PIPED}`);
   const r = await attempt('video_480', { piped: PIPED });

@@ -8,6 +8,7 @@
     "test:e2e": "node tests/e2e.mjs",
     "test:deployed": "node tests/deployed.mjs",
     "test:youtube": "node tests/youtube.mjs",
+    "test:innertube": "node tests/innertube-probe.mjs",
     "relay": "node relay/serve.mjs",
     "test:bridge": "node tests/bridge.mjs"
   },
