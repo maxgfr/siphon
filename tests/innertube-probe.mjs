@@ -88,4 +88,36 @@ results.push(await probe('WEB, no Origin/Referer', CLIENTS.WEB, { drop: ['Origin
 results.push(await probe('WEB, no X-Youtube-Client-*', CLIENTS.WEB, { drop: ['X-Youtube-Client-Name', 'X-Youtube-Client-Version'] }));
 
 const usable = results.filter((line) => /playability=OK/.test(line)).length;
-say(`\n${usable}/${results.length} variants got a playable answer`);
+say(`\n${usable}/${results.length} hand-built variants got a playable answer`);
+
+/*
+ * Now the library the browser mode uses, driven from Node with no relay and
+ * no browser in between — the same pinned version, its own requests. Two
+ * sessions: one built locally (what the browser does, since it cannot fetch
+ * YouTube's pages to get a real one), one fetched from YouTube. If the local
+ * one draws a 400 and the fetched one does not, the browser's session is
+ * the problem, not the relay and not the runner.
+ */
+say('\nyoutubei.js from Node, same version the page loads\n');
+const { Innertube } = await import('youtubei.js');
+const CLIENT_LADDER = [undefined, 'TV_EMBEDDED', 'IOS', 'ANDROID_VR', 'MWEB'];
+for (const local of [true, false]) {
+  let youtube;
+  try {
+    youtube = await Innertube.create({ generate_session_locally: local, retrieve_player: true });
+  } catch (error) {
+    say(`session (local=${local})                ERROR creating: ${String(error?.message || error).slice(0, 140)}`);
+    continue;
+  }
+  for (const client of CLIENT_LADDER) {
+    const label = `${client || 'default'} (session ${local ? 'local' : 'fetched'})`;
+    try {
+      const info = await youtube.getBasicInfo(VIDEO, client ? { client } : undefined);
+      const status = info?.playability_status || {};
+      const formats = (info?.streaming_data?.formats?.length || 0) + (info?.streaming_data?.adaptive_formats?.length || 0);
+      say(`${label.padEnd(34)} playability=${status.status || '?'}${status.reason ? ` (${String(status.reason).slice(0, 80)})` : ''}  formats=${formats}`);
+    } catch (error) {
+      say(`${label.padEnd(34)} ERROR ${String(error?.message || error).slice(0, 160)}`);
+    }
+  }
+}

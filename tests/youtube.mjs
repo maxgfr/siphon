@@ -199,13 +199,36 @@ page.on('pageerror', (error) => pageErrors.push(error.message));
 
 await page.addInitScript(
   ([relayUrl, coreUrl]) => {
+    // This runs on every navigation, the reload inside attempt() included, so
+    // the one setting attempt() writes between navigations must survive it.
+    // Until it did, the instance was wiped on reload and the Piped path had
+    // never actually been exercised by any run of this file.
+    let pipedUrl = '';
+    try {
+      pipedUrl = JSON.parse(localStorage.getItem('siphon:settings') || '{}').pipedUrl || '';
+    } catch {
+      /* first load */
+    }
     localStorage.setItem('siphon:settings', JSON.stringify({
-      mode: 'browser', preset: 'video_480', subs: 'off', relayUrl, coreUrl: coreUrl || '',
+      mode: 'browser', preset: 'video_480', subs: 'off', relayUrl, coreUrl: coreUrl || '', pipedUrl,
     }));
     localStorage.setItem('siphon:install-dismissed', '1');
   },
   [`http://127.0.0.1:${RELAY_PORT}`, process.env.SIPHON_CORE_URL || ''],
 );
+
+// The first InnerTube call, exactly as the page sends it. A hand-built
+// request from the same runner gets a 200 where this gets a 400, so the
+// difference is in here somewhere — and it can only be found by looking.
+let dumped = false;
+page.on('request', (request) => {
+  if (dumped || request.method() !== 'POST') return;
+  const url = request.url();
+  if (!url.startsWith(`http://127.0.0.1:${RELAY_PORT}/?url=`) || !/youtubei\/v1\/player/.test(decodeURIComponent(url))) return;
+  dumped = true;
+  const headers = Object.entries(request.headers()).map(([k, v]) => `${k}: ${v.slice(0, 200)}`).join('\n        ');
+  say(`   first InnerTube request, as the page sends it:\n        ${headers}\n        body: ${(request.postData() || '').slice(0, 1500)}`);
+});
 
 // Where the media bytes actually travelled. If googlevideo ever answers the
 // page directly, the relay only has to carry InnerTube's few kilobytes rather
