@@ -47,6 +47,7 @@ jobs:
       - run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
       - run: npm run test:e2e
       - run: npm run test:deployed
+      - run: npm run test:bridge
 
   # Informative, not gating. A runner is a datacentre IP, and whether YouTube
   # answers one on a given day is YouTube's decision, not this code's — a red
@@ -66,6 +67,12 @@ jobs:
       # A public instance for the Piped path. Instances come and go and YouTube
       # blocks them in waves; a failure here is information about that
       # instance today, which is exactly what this job is for.
+      # First, what YouTube's API says to a bare request from this runner:
+      # one hand-built call per client, no browser, no relay, no library. A
+      # red below is read against this instead of guessed at.
+      - run: node tests/innertube-probe.mjs
+        env:
+          SIPHON_PIPED_URL: https://pipedapi.kavin.rocks
       - run: npm run test:youtube
         env:
           SIPHON_PIPED_URL: https://pipedapi.kavin.rocks

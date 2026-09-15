@@ -12,6 +12,7 @@ import {
   safeFilename,
   titleFromUrl,
   extensionOf,
+  innertubeFetch,
 } from '../web/extract.js';
 
 /* ------------------------------------------------------------------ sniffing */
@@ -299,4 +300,43 @@ test('height falls back to the quality label when the instance omits it', () => 
 
 test('a stream with no URL is dropped rather than planned', () => {
   assert.deepEqual(pipedFormats({ videoStreams: [{ quality: '720p' }], audioStreams: [] }), []);
+});
+
+/* ------------------------------------------------------------ youtubei.js */
+
+test('the InnerTube fetch wrapper sends what the library added, not the bare payload', async () => {
+  // youtubei.js calls fetch(Request, init): the Request holds the bare
+  // payload, the init holds the finished body (with the session context)
+  // and the visitor/client headers. Forwarding the Request alone sent a
+  // player call with no context, which YouTube refuses outright.
+  const seen = [];
+  const net = {
+    request: async (url, options) => {
+      seen.push({ url, ...options, body: new TextDecoder().decode(options.body) });
+      return new Response('{}');
+    },
+  };
+  const url = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false';
+  const bare = new Request(url, { method: 'POST', body: '{"videoId":"x"}', headers: { 'Content-Type': 'application/json' } });
+  await innertubeFetch(net)(bare, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Goog-Visitor-Id': 'visitor', 'X-Youtube-Client-Name': '1' },
+    body: '{"videoId":"x","context":{"client":{"clientName":"WEB"}}}',
+  });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].url, url);
+  assert.equal(seen[0].method, 'POST');
+  assert.equal(seen[0].prefer, 'relay');
+  assert.deepEqual(JSON.parse(seen[0].body), { videoId: 'x', context: { client: { clientName: 'WEB' } } });
+  assert.equal(seen[0].headers['x-goog-visitor-id'], 'visitor');
+  assert.equal(seen[0].headers['x-youtube-client-name'], '1');
+});
+
+test('the InnerTube fetch wrapper still works when the library passes a plain URL', async () => {
+  const seen = [];
+  const net = { request: async (url, options) => (seen.push({ url, ...options }), new Response('ok')) };
+  await innertubeFetch(net)('https://www.youtube.com/sw.js_data', { method: 'GET' });
+  assert.equal(seen[0].url, 'https://www.youtube.com/sw.js_data');
+  assert.equal(seen[0].method, 'GET');
+  assert.equal(seen[0].body, undefined);
 });

@@ -39,9 +39,44 @@ const FFMPEG = process.env.FFMPEG || 'ffmpeg';
 const VIDEO = process.env.SIPHON_YT_URL || 'https://www.youtube.com/watch?v=jNQXAC9IVRw';
 const APP_PORT = 8790;
 const RELAY_PORT = 8791;
+const PIPED = (process.env.SIPHON_PIPED_URL || '').replace(/\/+$/, '');
 
 rmSync(OUT, { recursive: true, force: true });
 mkdirSync(OUT, { recursive: true });
+
+/**
+ * A hard ceiling on the whole run.
+ *
+ * Every wait below has its own timeout, but a job that is informative rather
+ * than gating must never be able to sit on a runner for hours: the first CI
+ * run of this file did, and nothing it could have reported was worth that.
+ * The per-attempt budget is 60 s probe + 150 s download; three attempts and
+ * setup fit comfortably in twelve minutes, so anything past that is a hang.
+ */
+const DEADLINE_MS = 12 * 60 * 1000;
+setTimeout(() => {
+  say(`\nFAIL watchdog: still running after ${DEADLINE_MS / 60000} minutes — hung while ${stage}`);
+  process.exit(1);
+}, DEADLINE_MS);
+
+/**
+ * What the run is doing right now, so a watchdog kill names the step. The
+ * second CI run of this file exited by watchdog having printed nothing at
+ * all, which pinned the hang to "somewhere before the preflight" and no
+ * closer; a run that cannot say where it is stuck is not informative.
+ */
+let stage = 'starting';
+const now = (what) => {
+  stage = what;
+  say(`.. ${what}`);
+};
+
+/** A promise that gives up: `AbortSignal.timeout` covers a fetch, this covers everything else. */
+const within = (ms, what, promise) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${what} did not finish within ${ms / 1000}s`)), ms).unref()),
+  ]);
 
 /* ------------------------------------------------------------------ servers */
 
@@ -49,7 +84,31 @@ const relay = spawn(process.execPath, [join(HERE, '..', 'relay', 'serve.mjs')], 
   env: { ...process.env, PORT: String(RELAY_PORT) },
   stdio: ['ignore', 'pipe', 'inherit'],
 });
-for await (const chunk of relay.stdout) if (String(chunk).includes('relay listening')) break;
+
+/**
+ * Wait for the relay to say it is listening — on the accumulated output, not
+ * on each chunk. A pipe hands text over in arbitrary pieces, and the first CI
+ * run of this file most likely died here: the marker straddled two chunks,
+ * no single chunk contained it, and the loop waited for a line that had
+ * already gone by. Ten seconds is generous for a process that prints four
+ * lines on start; past that it did not start, and that is the report.
+ */
+now('waiting for the relay to listen');
+await new Promise((resolve, reject) => {
+  let seen = '';
+  const timer = setTimeout(() => reject(new Error('the relay did not report listening within 10s')), 10_000);
+  relay.stdout.on('data', (chunk) => {
+    seen += String(chunk);
+    if (seen.includes('relay listening')) {
+      clearTimeout(timer);
+      resolve();
+    }
+  });
+  relay.on('exit', (code) => {
+    clearTimeout(timer);
+    reject(new Error(`the relay exited with code ${code} before listening`));
+  });
+});
 
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml', '.png': 'image/png' };
 const app = createServer((request, response) => {
@@ -64,7 +123,13 @@ const app = createServer((request, response) => {
     response.writeHead(404).end();
   }
 });
-await new Promise((resolve) => app.listen(APP_PORT, '127.0.0.1', resolve));
+now('starting the app server');
+await within(10_000, 'app.listen', new Promise((resolve, reject) => {
+  // A port already in use raises 'error' and never calls back — with the
+  // relay's pipe keeping the loop alive, that is a silent hang. Not any more.
+  app.once('error', reject);
+  app.listen(APP_PORT, '127.0.0.1', resolve);
+}));
 
 /* ---------------------------------------------------------------- preflight */
 
@@ -81,25 +146,37 @@ await new Promise((resolve) => app.listen(APP_PORT, '127.0.0.1', resolve));
   // robots.txt is public, tiny, and unmistakable: a 200 whose body names a
   // User-agent came from YouTube. Any other status — a gateway's 403, a
   // relay's 502 — did not, whatever it says.
-  const target = `http://127.0.0.1:${RELAY_PORT}/?url=${encodeURIComponent('https://www.youtube.com/robots.txt')}`;
-  let reason = '';
-  try {
-    const response = await fetch(target, { signal: AbortSignal.timeout(15_000) });
-    const body = await response.text();
-    if (response.status !== 200 || !/user-agent/i.test(body)) {
-      reason = `HTTP ${response.status}: ${body.replace(/\s+/g, ' ').slice(0, 160)}`;
+  const ROBOTS = 'https://www.youtube.com/robots.txt';
+  const probe = async (url) => {
+    try {
+      const response = await within(20_000, 'the fetch', fetch(url, { signal: AbortSignal.timeout(15_000) }));
+      const body = await within(20_000, 'reading the body', response.text());
+      if (response.status !== 200 || !/user-agent/i.test(body)) {
+        return `HTTP ${response.status}: ${body.replace(/\s+/g, ' ').slice(0, 160)}`;
+      }
+      return '';
+    } catch (error) {
+      return error?.name === 'TimeoutError' ? 'timed out after 15s' : String(error?.message || error);
     }
-  } catch (error) {
-    reason = error?.name === 'TimeoutError' ? 'timed out after 15s' : String(error?.message || error);
-  }
-  if (reason) {
-    say(`\nFAIL youtube.com is not reachable through the relay — ${reason}`);
+  };
+  const bail = (line) => {
+    say(`\nFAIL ${line}`);
     say('     Nothing below could succeed, so nothing below was attempted.');
     relay.kill();
     app.close();
     process.exit(1);
-  }
-  say('\nyoutube.com reachable through the relay');
+  };
+
+  // Two questions, asked separately, because they have different answers:
+  // can this machine reach YouTube at all, and does the relay pass it on.
+  now('preflight: youtube.com from this machine');
+  const direct = await probe(ROBOTS);
+  if (direct) bail(`youtube.com is not reachable from this machine — ${direct}`);
+
+  now('preflight: youtube.com through the relay');
+  const relayed = await probe(`http://127.0.0.1:${RELAY_PORT}/?url=${encodeURIComponent(ROBOTS)}`);
+  if (relayed) bail(`youtube.com is reachable, but not through the relay — ${relayed}`);
+  say('\nyoutube.com reachable, directly and through the relay');
 }
 
 /* ------------------------------------------------------------------- driver */
@@ -113,6 +190,7 @@ function inspect(file) {
   }
 }
 
+now('launching chromium');
 const browser = await chromium.launch({ executablePath: process.env.CHROMIUM || undefined });
 const context = await browser.newContext({ acceptDownloads: true, viewport: { width: 412, height: 915 } });
 const page = await context.newPage();
@@ -121,19 +199,61 @@ page.on('pageerror', (error) => pageErrors.push(error.message));
 
 await page.addInitScript(
   ([relayUrl, coreUrl]) => {
+    // This runs on every navigation, the reload inside attempt() included, so
+    // the one setting attempt() writes between navigations must survive it.
+    // Until it did, the instance was wiped on reload and the Piped path had
+    // never actually been exercised by any run of this file.
+    let pipedUrl = '';
+    try {
+      pipedUrl = JSON.parse(localStorage.getItem('siphon:settings') || '{}').pipedUrl || '';
+    } catch {
+      /* first load */
+    }
     localStorage.setItem('siphon:settings', JSON.stringify({
-      mode: 'browser', preset: 'video_480', subs: 'off', relayUrl, coreUrl: coreUrl || '',
+      mode: 'browser', preset: 'video_480', subs: 'off', relayUrl, coreUrl: coreUrl || '', pipedUrl,
     }));
     localStorage.setItem('siphon:install-dismissed', '1');
   },
   [`http://127.0.0.1:${RELAY_PORT}`, process.env.SIPHON_CORE_URL || ''],
 );
 
+// The first InnerTube call, exactly as the page sends it. A hand-built
+// request from the same runner gets a 200 where this gets a 400, so the
+// difference is in here somewhere — and it can only be found by looking.
+let dumped = false;
+page.on('request', (request) => {
+  if (dumped || request.method() !== 'POST') return;
+  const url = request.url();
+  if (!url.startsWith(`http://127.0.0.1:${RELAY_PORT}/?url=`) || !/youtubei\/v1\/player/.test(decodeURIComponent(url))) return;
+  dumped = true;
+  const headers = Object.entries(request.headers()).map(([k, v]) => `${k}: ${v.slice(0, 200)}`).join('\n        ');
+  say(`   first InnerTube request, as the page sends it:\n        ${headers}\n        body: ${(request.postData() || '').slice(0, 1500)}`);
+});
+
 // Where the media bytes actually travelled. If googlevideo ever answers the
 // page directly, the relay only has to carry InnerTube's few kilobytes rather
 // than every megabyte of video — a different cost model entirely. Counting
 // requests on the wire answers that without trusting anything.
 const routes = { direct: 0, relayed: 0 };
+// Every refusal, with its body. "failed with status code 400" names the
+// status and nothing else; the body is where YouTube (or an instance) says
+// why, and that sentence is the whole point of running this job at all.
+page.on('response', async (response) => {
+  const url = response.url();
+  // An instance's every answer is worth a line, not only its refusals: the
+  // question "was it even asked?" has to be answerable from the log.
+  const instance = PIPED && url.startsWith(PIPED);
+  if (response.status() < 400 && !instance) return;
+  const target = url.startsWith(`http://127.0.0.1:${RELAY_PORT}/?url=`) ? `relay -> ${decodeURIComponent(url.slice(url.indexOf('=') + 1))}` : url;
+  if (target.startsWith(`http://127.0.0.1:${APP_PORT}`)) return; // a missing icon is not news
+  let body = '';
+  try {
+    body = (await response.text()).replace(/\s+/g, ' ').slice(0, 300);
+  } catch {
+    body = '(body unreadable)';
+  }
+  say(`   ${response.status()} ${target.slice(0, 160)}\n        ${body}`);
+});
 page.on('request', (request) => {
   const url = request.url();
   if (/googlevideo\.com/.test(url)) routes.direct += 1;
@@ -147,6 +267,8 @@ const verdict = (ok, label, detail = '') => {
 };
 
 async function attempt(preset, { piped = '' } = {}) {
+  const label = piped ? `${preset} via piped` : preset;
+  now(`${label}: loading the app`);
   await page.goto(`http://127.0.0.1:${APP_PORT}/`, { waitUntil: 'networkidle' });
   await page.evaluate(
     (instance) => {
@@ -164,6 +286,7 @@ async function attempt(preset, { piped = '' } = {}) {
   // The probe runs first and names the client that got through; that is the
   // single most useful fact this test can report.
   let client = '(no preview)';
+  now(`${label}: probing the video`);
   try {
     await page.waitForSelector('.preview-meta:not(.skeleton)', { timeout: 60_000 });
     client = ((await page.textContent('.preview-meta')) || '').split('·').pop().trim();
@@ -174,6 +297,7 @@ async function attempt(preset, { piped = '' } = {}) {
     if (note) client = `(probe failed: ${note.slice(0, 140)})`;
   }
 
+  now(`${label}: downloading`);
   const waiting = page.waitForEvent('download', { timeout: 150_000 });
   await page.click('#go');
 
@@ -218,7 +342,6 @@ if (routes.direct > 0 && routes.relayed === 0) {
 }
 
 /* Piped: the same video with nothing of ours in front of it at all. */
-const PIPED = process.env.SIPHON_PIPED_URL || '';
 if (PIPED) {
   say(`\npiped instance: ${PIPED}`);
   const r = await attempt('video_480', { piped: PIPED });
@@ -234,6 +357,7 @@ if (PIPED) {
 
 verdict(pageErrors.length === 0, 'no uncaught errors in the page', pageErrors.slice(0, 2).join(' ; '));
 
+now('closing');
 await browser.close();
 app.close();
 relay.kill();

@@ -21,10 +21,25 @@ test.before(async () => {
     env: { ...process.env, PORT: String(PORT), ALLOWED_ORIGINS: 'https://maxgfr.github.io' },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
-  // It announces itself once it is listening; that line is the ready signal.
-  for await (const chunk of relay.stdout) {
-    if (String(chunk).includes('relay listening')) break;
-  }
+  // It announces itself once it is listening. Match on the accumulated
+  // output: a pipe delivers text in arbitrary pieces, and a marker that
+  // straddles two chunks is never seen by a per-chunk check — which is a
+  // hang, not a failure, and the worse of the two.
+  await new Promise((resolve, reject) => {
+    let seen = '';
+    const timer = setTimeout(() => reject(new Error('relay did not report listening within 10s')), 10_000);
+    relay.stdout.on('data', (chunk) => {
+      seen += String(chunk);
+      if (seen.includes('relay listening')) {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    relay.on('exit', (code) => {
+      clearTimeout(timer);
+      reject(new Error(`relay exited with ${code} before listening`));
+    });
+  });
 });
 
 test.after(() => {

@@ -152,26 +152,38 @@ export default {
     headers.set('Origin', 'https://www.youtube.com');
     headers.set('Referer', 'https://www.youtube.com/');
 
+    // The body is read whole rather than streamed. Streamed, it goes out as
+    // transfer-encoding: chunked with no content-length — and that was the
+    // one difference between a browser's own POST and ours when YouTube's
+    // API answered every InnerTube call through the Node relay with a 400.
+    // Nothing is lost: only API calls are POSTed through here, a few
+    // kilobytes each; the media that must not be buffered is always a GET.
+    const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
     let upstream;
     try {
       upstream = await fetch(target.toString(), {
         method: request.method,
         headers,
-        body: request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body,
+        body: hasBody ? await request.arrayBuffer() : undefined,
         redirect: 'follow',
-        // Workers streams a request body without being asked; Node's fetch
-        // refuses to unless told. Harmless there, and it is what lets this
-        // exact file run under `node --test` instead of only in production.
-        duplex: 'half',
       });
     } catch (failure) {
       return deny(`upstream: ${failure?.message || failure}`, request, env, 502);
     }
 
+    // The runtime's fetch has already decoded the body, so the upstream's
+    // content-encoding describes bytes that are no longer there. Workers
+    // would quietly re-encode to match; Node forwards the header over
+    // plaintext, and a client told "gzip" then waits for a gzip header that
+    // never comes — which is how the first real YouTube run hung on the very
+    // first request. content-length is the truth only when nothing was
+    // encoded, and then it is worth keeping: it is what a progress bar needs.
+    const encoded = upstream.headers.has('content-encoding');
     const out = new Headers();
     for (const [key, value] of upstream.headers) {
       const name = key.toLowerCase();
-      if (HOP_BY_HOP.has(name) || name === 'set-cookie') continue;
+      if (name === 'content-encoding' || name === 'set-cookie') continue;
+      if (name === 'content-length' ? encoded : HOP_BY_HOP.has(name)) continue;
       if (name.startsWith('access-control-')) continue; // ours are the ones that count
       out.set(key, value);
     }

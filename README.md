@@ -104,10 +104,65 @@ browser tab making the request:
 
 | route | lifts CORS | what it costs |
 |---|---|---|
+| **[the bridge](bridge/)** — a userscript on siphon's page | yes — the userscript manager lends its host permissions | installing one script in Tampermonkey or Violentmonkey |
 | [Termux](https://termux.dev) on Android | n/a — real yt-dlp, on the phone | a terminal app, and a build or two |
 | a WebView shell (Capacitor, Cordova) | yes — the native layer fetches | an APK to install and keep signed |
 | a browser extension | yes — host permissions bypass it | desktop, or Firefox for Android only |
 | a relay | no — it satisfies CORS rather than skipping it | one free Worker |
+
+### What the open-source projects actually do
+
+It is worth checking, because "runs in the browser" is claimed far more often
+than it is true. Read from their source rather than their READMEs:
+
+| project | how it really gets the video |
+|---|---|
+| [Piped](https://github.com/TeamPiped/Piped), [Invidious](https://github.com/iv-org/invidious) | a backend in Java / Crystal; the SPA is a client of it |
+| [cobalt](https://github.com/imputnet/cobalt) | an `api/` server it describes as "a fancy proxy" — though it now runs ffmpeg **in the browser** (`web/src/lib/task-manager/runners/ffmpeg.ts`), the same choice made here |
+| [FreeTube](https://github.com/FreeTubeApp/FreeTube) | Electron: the shell fetches, not a web page |
+| [YouTube.js](https://github.com/LuanRT/YouTube.js) | a library; its own browser example ships a service worker *and* a Cloudflare Worker, i.e. a relay |
+| [cat-catch](https://github.com/xifangczy/cat-catch) | an extension with `webRequest` and `<all_urls>`, whose page script proxies `MediaSource.prototype.addSourceBuffer` to capture what *any* site's player is playing |
+| [Local YouTube Downloader](https://greasyfork.org/en/scripts/484735-local-youtube-downloader) | a userscript that runs **on youtube.com's own origin**, so InnerTube and googlevideo are same-origin |
+
+So no full-frontend YouTube client works from a foreign origin. The ones that
+work have a server, a native shell, or run *on the site*. The transferable idea
+is the last one, and its general form is not "run on youtube.com" but **run
+with a userscript manager's privileges**: a script granted `GM_xmlhttpRequest`
+with `@connect *` fetches any URL with no cross-origin rule at all, because the
+manager is itself an extension.
+
+### The bridge
+
+That is what [`bridge/siphon-bridge.user.js`](bridge/) is. It runs only on
+siphon's own page, and does one thing: when the page asks for a URL, it
+fetches it with the manager's privileges and hands the bytes back. siphon's
+`net.js` treats it as a route between *direct* and *relay* — tried before the
+relay, because it is on this device and involves no server of anyone's.
+
+Nothing else changes. Every extractor already here — direct files, HLS, pages,
+YouTube through youtubei.js — works on hosts that refuse the page, because the
+thing that refused them is gone. **No relay, no instance, no server.** Install
+one script, and YouTube downloads in browser mode on desktop Chrome or Firefox
+(Tampermonkey, Violentmonkey) and on Firefox for Android (Violentmonkey).
+
+The page never trusts the bridge with a decision: it hands over a URL and gets
+bytes, and messages are matched on `event.source === window`, so another frame
+cannot inject a response. The script sends requests `anonymous`, so a site's
+cookies never ride along with a fetch the page asked for.
+
+`npm run test:bridge` proves it against a media host that sends **no** CORS
+headers: without the bridge the page is refused, exactly as by YouTube; with
+the shipped userscript injected and `GM_xmlhttpRequest` played by a Node fetch
+— which has no same-origin policy, like the real thing — a direct file arrives
+byte-identical, an HLS ladder is fetched and remuxed, and a page is scraped
+and converted to MP3.
+
+Sources for the project survey:
+[Piped instances in 2026](https://sumguy.com/invidious-piped-redlib-nitter-2026/),
+[Piped vs Invidious](https://dev.to/selfhostingsh/invidious-vs-piped-4ijn),
+[Local YouTube Downloader on Greasy Fork](https://greasyfork.org/en/scripts/484735-local-youtube-downloader),
+[Universal Video Sniffer](https://greasyfork.org/en/scripts/557721-universal-video-sniffer),
+[sniff-hls](https://github.com/nuoyax/sniff-hls).
 
 **Termux is the best of these on Android** and needs nothing from this project
 that is not already here: install Python, ffmpeg and yt-dlp, run `server/` on
@@ -500,20 +555,35 @@ npm run test:e2e
 # Needs playwright and openssl.
 npm run test:deployed
 
+# the bridge, against a media host that sends no CORS headers at all.
+# Needs playwright and ffmpeg.
+npm run test:bridge
+
+# what YouTube's API says to a bare request from this machine — one hand-built
+# call per client, then the same through youtubei.js, no browser, no relay.
+# The baseline a red below is read against.
+npm run test:innertube
+
 # YouTube, for real, through the local relay. Needs a network that reaches
 # youtube.com; runs in CI, where it is informative rather than gating.
 npm run test:youtube
 ```
 
 All of it runs on every pull request. `fast` (the server suite and the unit
-tests) and `browser` (the two Playwright suites) gate the merge. `youtube` does
-not: a runner is a datacentre IP, and whether YouTube answers one on a given
-day is YouTube's decision, not this code's. A red there says *look*, never *do
-not merge* — and it names the client that got through or the exact refusal.
+tests) and `browser` (the three Playwright suites) gate the merge. `youtube`
+does not: a runner is a datacentre IP, and whether YouTube answers one on a
+given day is YouTube's decision, not this code's. A red there says *look*,
+never *do not merge* — and the log says exactly why: every step announces
+itself, every refusal is printed with its body, and the probe that runs first
+shows what YouTube says to that machine with nothing of ours in between. As of
+this writing that answer, on a GitHub runner, is "Sign in to confirm you're
+not a bot" for every client — the wall the relay section above describes,
+seen from inside it.
 
 The frontend has no build step and no dependencies: plain ES modules, no
-framework, no bundler. Edit and reload. `package.json` exists only so
-`node --test` can reach the extractor; nothing in `web/` imports from it.
+framework, no bundler. Edit and reload. `package.json` carries only the test
+tooling — Playwright for the browser suites, youtubei.js for the probe —
+and nothing in `web/` imports from it.
 
 Tests live in `tests/`, not under `web/`, because the Pages workflow publishes
 that whole directory — anything left in it is served to the public site.
