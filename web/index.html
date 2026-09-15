@@ -227,6 +227,18 @@
         until you fill this in; leave it empty and YouTube links simply say why they failed.
       </p>
 
+      <label class="lbl" for="pipedUrl">Piped instance <span style="font-weight:400;color:var(--muted)">— YouTube with nothing to deploy</span></label>
+      <input type="url" id="pipedUrl" inputmode="url" autocapitalize="off" autocorrect="off"
+             spellcheck="false" placeholder="https://pipedapi.example" />
+      <p class="hint">
+        A <a href="https://github.com/TeamPiped/Piped" target="_blank" rel="noopener noreferrer">Piped</a>
+        instance's API answers a web page directly and proxies the media with the headers the
+        browser needs — so YouTube works here with no relay and nothing of yours running. It is
+        someone else's server: it sees every YouTube link you paste, instances come and go, and
+        YouTube blocks them in waves. There is no default; bring an address you trust. When one
+        is set it is tried first, and a relay is the fallback.
+      </p>
+
       <label class="lbl" for="coreUrl">Converter <span style="font-weight:400;color:var(--muted)">— optional</span></label>
       <input type="url" id="coreUrl" inputmode="url" autocapitalize="off" autocorrect="off"
              spellcheck="false" placeholder="ffmpeg-core.js from a CDN" />

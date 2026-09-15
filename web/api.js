@@ -255,6 +255,6 @@ export { BrowserBackend };
 /** Build whichever backend the saved settings describe. */
 export function makeBackend(settings) {
   if (settings.mode === 'public') return new PublicBackend({ base: settings.publicUrl, key: settings.publicKey });
-  if (settings.mode === 'browser') return new BrowserBackend({ relay: settings.relayUrl, coreUrl: settings.coreUrl });
+  if (settings.mode === 'browser') return new BrowserBackend({ relay: settings.relayUrl, coreUrl: settings.coreUrl, piped: settings.pipedUrl });
   return new ServerBackend({ base: settings.serverUrl, key: settings.serverKey });
 }

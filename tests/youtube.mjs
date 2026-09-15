@@ -129,15 +129,34 @@ await page.addInitScript(
   [`http://127.0.0.1:${RELAY_PORT}`, process.env.SIPHON_CORE_URL || ''],
 );
 
+// Where the media bytes actually travelled. If googlevideo ever answers the
+// page directly, the relay only has to carry InnerTube's few kilobytes rather
+// than every megabyte of video — a different cost model entirely. Counting
+// requests on the wire answers that without trusting anything.
+const routes = { direct: 0, relayed: 0 };
+page.on('request', (request) => {
+  const url = request.url();
+  if (/googlevideo\.com/.test(url)) routes.direct += 1;
+  else if (url.startsWith(`http://127.0.0.1:${RELAY_PORT}/?url=`) && /googlevideo/.test(decodeURIComponent(url))) routes.relayed += 1;
+});
+
 const verdicts = [];
 const verdict = (ok, label, detail = '') => {
   verdicts.push(ok);
   say(`${ok ? 'ok  ' : 'FAIL'} ${label}${detail ? ` — ${detail}` : ''}`);
 };
 
-async function attempt(preset) {
+async function attempt(preset, { piped = '' } = {}) {
   await page.goto(`http://127.0.0.1:${APP_PORT}/`, { waitUntil: 'networkidle' });
-  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.evaluate(
+    (instance) => {
+      localStorage.removeItem('siphon:queue');
+      const settings = JSON.parse(localStorage.getItem('siphon:settings') || '{}');
+      settings.pipedUrl = instance;
+      localStorage.setItem('siphon:settings', JSON.stringify(settings));
+    },
+    piped,
+  );
   await page.reload({ waitUntil: 'networkidle' });
   await page.check(`input[name="quality"][value="${preset}"]`);
   await page.fill('#url', VIDEO);
@@ -191,6 +210,26 @@ say(`\nvideo: ${VIDEO}`);
   } else {
     verdict(false, `audio_m4a did not produce a file (probe client: ${r.client})`, r.error);
   }
+}
+
+say(`\nmedia bytes: ${routes.direct} request(s) straight to googlevideo, ${routes.relayed} through the relay`);
+if (routes.direct > 0 && routes.relayed === 0) {
+  say('     -> googlevideo answered the page directly; the relay carried only the API call');
+}
+
+/* Piped: the same video with nothing of ours in front of it at all. */
+const PIPED = process.env.SIPHON_PIPED_URL || '';
+if (PIPED) {
+  say(`\npiped instance: ${PIPED}`);
+  const r = await attempt('video_480', { piped: PIPED });
+  if (r.saved) {
+    const report = inspect(r.saved);
+    verdict(/Video: (h264|vp9|av1)/.test(report), `piped: video_480 produced real video via ${r.client}`, (/\d{3,4}x\d{3,4}/.exec(report) || [])[0] || r.saved);
+  } else {
+    verdict(false, `piped: no file (probe client: ${r.client})`, r.error);
+  }
+} else {
+  say('\npiped instance: not set (SIPHON_PIPED_URL), skipped');
 }
 
 verdict(pageErrors.length === 0, 'no uncaught errors in the page', pageErrors.slice(0, 2).join(' ; '));

@@ -29,8 +29,9 @@ const PROBE_TTL_MS = 120_000;
 const nowSeconds = () => Date.now() / 1000;
 
 export class BrowserBackend {
-  constructor({ relay = '', coreUrl = '' } = {}) {
+  constructor({ relay = '', coreUrl = '', piped = '' } = {}) {
     this.net = new Fetcher({ relay });
+    this.piped = String(piped || '').trim();
     this.mode = 'browser';
     this.supportsProgress = true;
     this.supportsProbe = true;
@@ -56,6 +57,7 @@ export class BrowserBackend {
       ffmpeg: true, // fetched on demand; absence is a download failure, not a missing dependency
       presets: null,
       relay: this.net.hasRelay,
+      piped: Boolean(this.piped),
       converterLoaded: isLoaded(),
     };
   }
@@ -70,7 +72,7 @@ export class BrowserBackend {
   async identify(url, signal) {
     const cached = this.cache.get(url);
     if (cached && Date.now() - cached.at < PROBE_TTL_MS) return cached.value;
-    const value = await extract(url, { net: this.net, signal });
+    const value = await extract(url, { net: this.net, signal, piped: this.piped });
     this.cache.set(url, { at: Date.now(), value });
     return value;
   }

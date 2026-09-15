@@ -61,8 +61,18 @@ before it leaves the browser. Signing the stream URL is the *easy* half — that
 is just JavaScript, and [YouTube.js](https://github.com/LuanRT/YouTube.js) does
 it in the page — but a signed URL you are not allowed to fetch is no use.
 
-So YouTube in browser mode needs one of two things:
+So YouTube in browser mode needs one of three things, and the first needs
+nothing of yours running at all:
 
+- **A [Piped](https://github.com/TeamPiped/Piped) instance.** Its API answers
+  a web page directly and proxies the media with the headers the browser
+  needs, so the browser mode's own pipeline — the planner, ffmpeg.wasm, the
+  queue — runs on top of it unchanged. Paste an instance's API address under
+  **Settings → In this browser** and YouTube works from a phone with nothing
+  deployed. It is someone else's server: it sees every YouTube link you paste,
+  instances come and go, and YouTube blocks them in waves. There is no default
+  baked in, deliberately, for the same reason there is none for cobalt. When
+  one is set it is tried first and a relay is the fallback.
 - **[A relay](relay/)** — one file that adds the missing header and forwards
   nothing else. No yt-dlp, no ffmpeg, no state, and nothing to maintain when
   YouTube changes, because the part that changes is running in your browser.
@@ -77,7 +87,8 @@ So YouTube in browser mode needs one of two things:
 
 Projects advertising a backend-free YouTube downloader are, as far as we can
 tell, all using someone else's server for that last hop. This one is honest
-about which hop that is.
+about which hop that is — and the Piped option *is* that: the instance is the
+hop, and the app says so in its privacy line.
 
 ### What actually moves the wall — and what does not
 

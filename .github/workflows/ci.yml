@@ -63,4 +63,9 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+      # A public instance for the Piped path. Instances come and go and YouTube
+      # blocks them in waves; a failure here is information about that
+      # instance today, which is exactly what this job is for.
       - run: npm run test:youtube
+        env:
+          SIPHON_PIPED_URL: https://pipedapi.kavin.rocks
