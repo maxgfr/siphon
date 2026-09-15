@@ -8,3 +8,4 @@ downloads/
 tests/.e2e/
 tests/.deployed/
 tests/.youtube/
+tests/.bridge/

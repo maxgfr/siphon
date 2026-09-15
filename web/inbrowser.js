@@ -57,6 +57,7 @@ export class BrowserBackend {
       ffmpeg: true, // fetched on demand; absence is a download failure, not a missing dependency
       presets: null,
       relay: this.net.hasRelay,
+      bridge: this.net.hasBridge,
       piped: Boolean(this.piped),
       converterLoaded: isLoaded(),
     };

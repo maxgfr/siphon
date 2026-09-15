@@ -25,12 +25,23 @@ const isBlocked = (error) => error instanceof TypeError;
 export class Fetcher {
   constructor({ relay = '' } = {}) {
     this.relay = String(relay || '').trim().replace(/\/+$/, '');
-    /** @type {Map<string, 'direct'|'relay'>} */
+    /** @type {Map<string, 'direct'|'bridge'|'relay'>} */
     this.verdicts = new Map();
+    this.bridge = installBridge();
   }
 
   get hasRelay() {
     return Boolean(this.relay);
+  }
+
+  /** A userscript on this page that fetches with the manager's privileges — no server anywhere. */
+  get hasBridge() {
+    return this.bridge.ready;
+  }
+
+  /** Whether a host that refuses the page can still be reached somehow. */
+  get hasEscape() {
+    return this.hasBridge || this.hasRelay;
   }
 
   /** What the relay's URL looks like for a given target. */
@@ -55,8 +66,13 @@ export class Fetcher {
   async request(url, { prefer = 'direct', signal, ...init } = {}) {
     const origin = this.#origin(url);
     const known = this.verdicts.get(origin);
-    const route = known || (prefer === 'relay' && this.hasRelay ? 'relay' : 'direct');
+    // A host known to refuse the page goes straight to whatever gets past it.
+    // The bridge is preferred over the relay: it is on this device and involves
+    // no server of anyone's.
+    const escape = this.hasBridge ? 'bridge' : this.hasRelay ? 'relay' : null;
+    const route = known || (prefer === 'relay' && escape ? escape : 'direct');
 
+    if (route === 'bridge') return this.bridge.request(url, { signal, ...init });
     if (route === 'relay') return this.#relayRequest(url, { signal, ...init });
 
     try {
@@ -66,9 +82,11 @@ export class Fetcher {
     } catch (error) {
       if (signal?.aborted) throw error;
       if (!isBlocked(error)) throw error;
-      if (!this.hasRelay) throw corsWall(origin);
-      const response = await this.#relayRequest(url, { signal, ...init });
-      this.verdicts.set(origin, 'relay');
+      if (!escape) throw corsWall(origin);
+      const response = escape === 'bridge'
+        ? await this.bridge.request(url, { signal, ...init })
+        : await this.#relayRequest(url, { signal, ...init });
+      this.verdicts.set(origin, escape);
       return response;
     }
   }
@@ -159,6 +177,76 @@ export class Fetcher {
     }
     return out;
   }
+}
+
+/* ------------------------------------------------------------------- bridge */
+
+/**
+ * The bridge: a userscript on this page that fetches on the page's behalf.
+ *
+ * A userscript manager (Tampermonkey, Violentmonkey, …) is itself a browser
+ * extension with host permissions, and it lends them to scripts through
+ * GM_xmlhttpRequest. A script matched to this page can therefore fetch any
+ * URL with no cross-origin restriction at all — which is the one thing the
+ * page cannot do, and the whole reason the relay exists. With the bridge
+ * installed there is no server anywhere: not ours, not a Worker, not an
+ * instance. bridge/siphon-bridge.user.js is the other half of this protocol.
+ *
+ * Nothing here trusts the bridge with anything: it is handed a URL and
+ * returns bytes, and the page still decides what to fetch. Messages are
+ * matched on `event.source === window` and a tag, so another frame cannot
+ * inject responses.
+ */
+function installBridge() {
+  const pending = new Map();
+  let nextId = 1;
+  const state = { ready: false, version: null, request: null };
+
+  if (typeof window === 'undefined') return state;
+
+  window.addEventListener('message', (event) => {
+    if (event.source !== window || !event.data || event.data.siphon === undefined) return;
+    const message = event.data;
+    if (message.siphon === 'ready') {
+      state.ready = true;
+      state.version = message.version || null;
+      return;
+    }
+    const waiting = pending.get(message.id);
+    if (!waiting) return;
+    if (message.siphon === 'response') {
+      pending.delete(message.id);
+      waiting.resolve(
+        new Response(message.body, {
+          status: message.status,
+          statusText: message.statusText || '',
+          headers: message.headers || {},
+        }),
+      );
+    } else if (message.siphon === 'error') {
+      pending.delete(message.id);
+      waiting.reject(new BackendError(`The bridge could not fetch that: ${message.message || 'unknown error'}`));
+    }
+  });
+
+  state.request = async (url, { signal, method = 'GET', headers = {}, body } = {}) => {
+    const id = nextId++;
+    const payload = body instanceof ArrayBuffer ? body : body ? await new Response(body).arrayBuffer() : null;
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      signal?.addEventListener('abort', () => {
+        pending.delete(id);
+        reject(new DOMException('Aborted', 'AbortError'));
+      });
+      const plainHeaders = headers instanceof Headers ? Object.fromEntries(headers) : { ...headers };
+      window.postMessage({ siphon: 'fetch', id, url, method, headers: plainHeaders, body: payload }, '*', payload ? [payload] : []);
+    });
+  };
+
+  // Ask whether a bridge is listening. A script installed after this page
+  // loaded announces itself unprompted, so a late install is picked up too.
+  window.postMessage({ siphon: 'hello' }, '*');
+  return state;
 }
 
 function headersOf(response) {
