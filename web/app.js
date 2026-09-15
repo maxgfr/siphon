@@ -11,7 +11,7 @@
  * primary action pinned within thumb reach, and no interaction that needs a
  * hover or a precise tap.
  */
-import { PRESETS, BackendError, makeBackend } from './api.js';
+import { PRESETS, BackendError, makeBackend, ServerBackend } from './api.js';
 
 const SETTINGS_KEY = 'siphon:settings';
 const POLL_MS = 700;
@@ -42,12 +42,40 @@ const recent = [];
 
 /* ---------------------------------------------------------------- settings */
 
+/**
+ * Read the saved settings, and say whether there were any.
+ *
+ * "First visit" is the thing the caller actually needs to know: it is the one
+ * moment where choosing a mode on the user's behalf is helpful rather than
+ * presumptuous, because there is nothing of theirs to override.
+ */
 function loadSettings() {
   try {
-    const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
-    return { ...DEFAULT_SETTINGS, ...saved };
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    return { settings: { ...DEFAULT_SETTINGS, ...JSON.parse(raw || '{}') }, firstVisit: !raw };
   } catch {
-    return { ...DEFAULT_SETTINGS };
+    return { settings: { ...DEFAULT_SETTINGS }, firstVisit: true };
+  }
+}
+
+/**
+ * Which mode a brand-new visitor should land in.
+ *
+ * `server` is only the right default when a server is actually there, which is
+ * the case that matters: the container serves this page and the API from one
+ * origin, and that setup must keep working with nothing configured. Anywhere
+ * else — GitHub Pages, any static host — there is no server behind the page,
+ * and defaulting to one means the first thing a visitor sees is a dead end
+ * telling them to go and set something up. Browser mode works on arrival.
+ *
+ * The probe is one request, on the first visit only; the answer is saved.
+ */
+async function pickInitialMode() {
+  try {
+    await new ServerBackend({ base: '' }).health();
+    return 'server';
+  } catch {
+    return 'browser';
   }
 }
 
@@ -814,13 +842,12 @@ function readSharedUrl() {
 }
 
 function init() {
-  settings = loadSettings();
+  const loaded = loadSettings();
+  settings = loaded.settings;
   applyBackend();
   renderQualities();
   renderAction();
   renderQueue();
-
-  restoreQueue();
 
   $('go').addEventListener('click', () => {
     const url = $('url').value.trim();
@@ -921,11 +948,29 @@ function init() {
   }
 
   setupInstall();
-  refreshBackendLabel();
+  boot(loaded.firstVisit);
 
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
+}
+
+/**
+ * Settle on a backend, then bring the queue back against it.
+ *
+ * Restoring after the mode is known matters: a restored row is re-checked
+ * against whichever backend is current, and doing that against a provisional
+ * one would mark live downloads as gone.
+ */
+async function boot(firstVisit) {
+  if (firstVisit) {
+    settings.mode = await pickInitialMode();
+    saveSettings();
+    applyBackend();
+    syncSubFields();
+  }
+  await restoreQueue();
+  refreshBackendLabel();
 }
 
 init();
