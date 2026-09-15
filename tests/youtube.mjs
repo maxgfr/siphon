@@ -200,18 +200,14 @@ page.on('pageerror', (error) => pageErrors.push(error.message));
 await page.addInitScript(
   ([relayUrl, coreUrl]) => {
     // This runs on every navigation, the reload inside attempt() included, so
-    // the one setting attempt() writes between navigations must survive it.
-    // Until it did, the instance was wiped on reload and the Piped path had
-    // never actually been exercised by any run of this file.
-    let pipedUrl = '';
-    try {
-      pipedUrl = JSON.parse(localStorage.getItem('siphon:settings') || '{}').pipedUrl || '';
-    } catch {
-      /* first load */
+    // it only seeds the very first load; what attempt() writes between
+    // navigations must survive the reload that follows it.
+    if (!localStorage.getItem('siphon:settings')) {
+      localStorage.setItem('siphon:settings', JSON.stringify({
+        endpoint: relayUrl, key: '', helper: { kind: 'relay', label: 'relay' },
+        coreUrl: coreUrl || '', preset: 'video_480', subs: 'off',
+      }));
     }
-    localStorage.setItem('siphon:settings', JSON.stringify({
-      mode: 'browser', preset: 'video_480', subs: 'off', relayUrl, coreUrl: coreUrl || '', pipedUrl,
-    }));
     localStorage.setItem('siphon:install-dismissed', '1');
   },
   [`http://127.0.0.1:${RELAY_PORT}`, process.env.SIPHON_CORE_URL || ''],
@@ -270,14 +266,17 @@ async function attempt(preset, { piped = '' } = {}) {
   const label = piped ? `${preset} via piped` : preset;
   now(`${label}: loading the app`);
   await page.goto(`http://127.0.0.1:${APP_PORT}/`, { waitUntil: 'networkidle' });
+  // One helper at a time, which is the app's model: the relay for the relay
+  // attempts, the instance for the Piped one.
   await page.evaluate(
-    (instance) => {
+    ([instance, relayUrl]) => {
       localStorage.removeItem('siphon:queue');
       const settings = JSON.parse(localStorage.getItem('siphon:settings') || '{}');
-      settings.pipedUrl = instance;
+      settings.endpoint = instance || relayUrl;
+      settings.helper = instance ? { kind: 'piped', label: 'Piped instance' } : { kind: 'relay', label: 'relay' };
       localStorage.setItem('siphon:settings', JSON.stringify(settings));
     },
-    piped,
+    [piped, `http://127.0.0.1:${RELAY_PORT}`],
   );
   await page.reload({ waitUntil: 'networkidle' });
   await page.check(`input[name="quality"][value="${preset}"]`);

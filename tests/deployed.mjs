@@ -98,7 +98,10 @@ const server = createServer(
     if (path === '/api/health') {
       if (!hasApi) return response.writeHead(404, { 'Content-Type': 'text/plain' }).end('not found');
       return response.writeHead(200, { 'Content-Type': 'application/json' })
-        .end(JSON.stringify({ ytDlpVersion: '2026.08.19', ffmpeg: true, presets: [] }));
+        .end(JSON.stringify({
+          service: 'siphon', ytDlpVersion: '2026.08.19', ffmpeg: true,
+          capabilities: ['jobs', 'resolve', 'tunnel'], presets: [], hasCookies: false, lanUrls: [],
+        }));
     }
 
     if (!path.startsWith('/siphon/')) return response.writeHead(404).end('not found');
@@ -159,9 +162,10 @@ async function fresh() {
   const label = (await page.textContent('#backendLabel')) || '';
   const notice = (await page.textContent('#feedback')) || '';
 
-  check('a static host puts a new visitor in browser mode', saved.mode === 'browser', saved.mode);
+  check('a static host leaves a new visitor with no helper', saved.helper?.kind === 'none', JSON.stringify(saved.helper));
   check('the header says it is ready, not broken', /in this browser/i.test(label), label);
-  check('no "no server set up yet" dead end', !/no server set up/i.test(notice), notice.replace(/\s+/g, ' ').trim().slice(0, 60) || '(empty)');
+  check('no dead end telling them to go and set something up', !/open settings/i.test(notice),
+    notice.replace(/\s+/g, ' ').trim().slice(0, 60) || '(empty)');
   check('no uncaught errors on a first visit', context.__errors.length === 0, context.__errors.join(' ; '));
   await context.close();
 }
@@ -174,70 +178,106 @@ async function fresh() {
   await page.waitForTimeout(2500);
   const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:settings') || '{}'));
   const label = (await page.textContent('#backendLabel')) || '';
-  check('a host that answers /api/health keeps server mode', saved.mode === 'server', saved.mode);
+  check('a host that answers /api/health is recognised as your own server', saved.helper?.kind === 'siphon',
+    JSON.stringify(saved.helper));
   check('and reports the server it found', /yt-dlp/i.test(label), label);
   await context.close();
 }
 
 /* 3. A choice already made is never overridden. */
-for (const [mode, api] of [['public', false], ['browser', true], ['server', false]]) {
+for (const [label, helper, api] of [
+  ['none', { kind: 'none', label: 'this device only' }, true],
+  ['relay', { kind: 'relay', label: 'relay' }, false],
+  ['siphon', { kind: 'siphon', label: 'yt-dlp 1', ffmpeg: true }, false],
+]) {
   const { context, page } = await fresh();
   await setApi(api);
   await page.addInitScript(
     (value) => localStorage.setItem('siphon:settings', value),
-    JSON.stringify({ mode, preset: 'video_best', subs: 'off' }),
+    JSON.stringify({ endpoint: helper.kind === 'none' ? '' : 'https://helper.example', key: '', helper, preset: 'video_best', subs: 'off' }),
   );
   await page.goto(APP, { waitUntil: 'networkidle' });
   await page.waitForTimeout(2000);
   const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:settings') || '{}'));
-  check(`a saved "${mode}" choice is left alone`, saved.mode === mode, saved.mode);
+  check(`a saved "${label}" helper is left alone`, saved.helper?.kind === helper.kind, JSON.stringify(saved.helper));
+  await context.close();
+}
+
+/* 3b. Settings written by the version with three modes still work. */
+for (const [old, expected] of [
+  [{ mode: 'server', serverUrl: 'https://mine.example', serverKey: 'k' }, { kind: 'siphon', endpoint: 'https://mine.example', key: 'k' }],
+  [{ mode: 'public', publicUrl: 'https://cobalt.example' }, { kind: 'cobalt', endpoint: 'https://cobalt.example' }],
+  [{ mode: 'browser', pipedUrl: 'https://pipedapi.example', relayUrl: 'https://relay.example' }, { kind: 'piped', endpoint: 'https://pipedapi.example' }],
+  [{ mode: 'browser', relayUrl: 'https://relay.example' }, { kind: 'relay', endpoint: 'https://relay.example' }],
+  [{ mode: 'browser' }, { kind: 'none', endpoint: '' }],
+]) {
+  const { context, page } = await fresh();
+  await setApi(false);
+  await page.addInitScript(
+    (value) => localStorage.setItem('siphon:settings', value),
+    JSON.stringify({ ...old, preset: 'audio_mp3', subs: 'off' }),
+  );
+  await page.goto(APP, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(1500);
+  const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:settings') || '{}'));
+  check(`an old "${old.mode}" setup becomes a ${expected.kind} helper`,
+    saved.helper?.kind === expected.kind && saved.endpoint === expected.endpoint && (expected.key ? saved.key === expected.key : true),
+    JSON.stringify({ helper: saved.helper?.kind, endpoint: saved.endpoint, key: saved.key }));
+  check('and the unrelated preferences survive the move', saved.preset === 'audio_mp3', saved.preset);
   await context.close();
 }
 
 /* 4. The settings sheet, driven the way a person drives it. */
 {
   const { context, page } = await fresh();
-  await setApi(false);
+  await setApi(true);
   await page.goto(APP, { waitUntil: 'networkidle' });
   await page.waitForTimeout(2000);
+  // Start from nothing, whatever the first-visit probe found.
+  await page.evaluate(() => localStorage.setItem('siphon:settings', JSON.stringify({ endpoint: '', key: '', helper: { kind: 'none', label: 'this device only' }, preset: 'video_best', subs: 'off' })));
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForTimeout(1200);
   await page.click('#openSettings');
   await page.waitForTimeout(300);
 
-  const modes = await page.locator('.mode input[name="mode"]').count();
-  check('settings offers every mode', modes === 3, String(modes));
+  const fields = await page.evaluate(() => ({
+    address: Boolean(document.getElementById('endpoint')),
+    modes: document.querySelectorAll('input[name="mode"]').length,
+    cookies: document.getElementById('cookiesBlock').hidden,
+  }));
+  check('the sheet asks for one address, not a mode', fields.address && fields.modes === 0, JSON.stringify(fields));
+  check('the cookie jar is hidden until the address proves to be a server', fields.cookies === true);
 
-  // Each mode shows its own fields and nothing else — the cookie jar in
-  // particular belongs only to the server we run ourselves.
-  for (const [mode, visible] of [['browser', 'browserFields'], ['public', 'publicFields'], ['server', 'serverFields']]) {
-    await page.check(`input[name="mode"][value="${mode}"]`);
-    const state = await page.evaluate(
-      (shown) => ({
-        shown: document.getElementById(shown).hidden,
-        others: ['serverFields', 'browserFields', 'publicFields']
-          .filter((id) => id !== shown)
-          .every((id) => document.getElementById(id).hidden),
-        cookies: document.getElementById('cookiesBlock').hidden,
-      }),
-      visible,
-    );
-    check(`"${mode}" shows its own fields and no others`, state.shown === false && state.others, JSON.stringify(state));
-    check(`"${mode}" handles the cookie jar correctly`, state.cookies === (mode !== 'server'));
-  }
-
-  // Test has nothing to reach in browser mode, so it must say something true.
-  await page.check('input[name="mode"][value="browser"]');
+  // Nothing filled in, and nothing behind the page: the status line must
+  // describe the device honestly rather than show a green light for nobody.
+  await setApi(false);
   await page.click('#testConnection');
-  await page.waitForTimeout(400);
-  check('Test names what is missing', /no relay or instance set/i.test((await page.textContent('#statusText')) || ''),
+  await page.waitForTimeout(800);
+  check('with no address and nothing behind the page, it says this device only',
+    /this device only|nothing set/i.test((await page.textContent('#statusText')) || ''),
+    (await page.textContent('#statusText')) || '');
+  await setApi(true);
+
+  // An address that answers nothing must say so rather than be saved.
+  await page.fill('#endpoint', 'https://127.0.0.1:9/nothing');
+  await page.click('#saveSettings');
+  await page.waitForTimeout(1500);
+  check('an unreachable address is refused, and the sheet stays open',
+    await page.evaluate(() => document.getElementById('settings').open));
+  check('and the reason is on screen', /could not reach|not a siphon/i.test((await page.textContent('#statusText')) || ''),
     (await page.textContent('#statusText')) || '');
 
-  await page.fill('#relayUrl', 'https://relay.example.workers.dev');
-  await page.fill('#pipedUrl', 'https://pipedapi.example');
+  // The real one: this very host answers /api/health, so it is a siphon server.
+  await page.fill('#endpoint', BASE);
+  await page.click('#testConnection');
+  await page.waitForTimeout(1200);
+  check('a siphon server is recognised from its address alone',
+    /your server/i.test((await page.textContent('#statusText')) || ''), (await page.textContent('#statusText')) || '');
+  check('and the cookie jar appears with it', (await page.evaluate(() => document.getElementById('cookiesBlock').hidden)) === false);
+
   await page.click('#saveSettings');
-  await page.waitForTimeout(600);
-  // Both are set, and the instance is the one that sees YouTube links, so the
-  // privacy line must name it rather than the relay.
-  check('the privacy note names the instance once one is set', /Piped instance/i.test((await page.textContent('#privacyNote')) || ''),
+  await page.waitForTimeout(1200);
+  check('the privacy note names where links go', /your server/i.test((await page.textContent('#privacyNote')) || ''),
     (await page.textContent('#privacyNote')) || '');
 
   await page.reload({ waitUntil: 'networkidle' });
@@ -245,12 +285,10 @@ for (const [mode, api] of [['public', false], ['browser', true], ['server', fals
   await page.click('#openSettings');
   await page.waitForTimeout(300);
   const kept = await page.evaluate(() => ({
-    mode: document.querySelector('input[name="mode"]:checked')?.value,
-    relay: document.getElementById('relayUrl').value,
-    piped: document.getElementById('pipedUrl').value,
+    endpoint: document.getElementById('endpoint').value,
+    helper: JSON.parse(localStorage.getItem('siphon:settings') || '{}').helper?.kind,
   }));
-  check('the mode, relay and instance survive a reload',
-    kept.mode === 'browser' && kept.relay.includes('workers.dev') && kept.piped.includes('pipedapi'), JSON.stringify(kept));
+  check('the address and what it is survive a reload', kept.endpoint === BASE && kept.helper === 'siphon', JSON.stringify(kept));
 
   // Phone width is what this app is for; the sheet must not scroll sideways.
   const overflow = await page.evaluate(() => {
@@ -286,11 +324,11 @@ for (const [mode, api] of [['public', false], ['browser', true], ['server', fals
   check('the new worker takes over', after.caches.includes('siphon-v2'), after.caches.join(','));
   check('the previous cache is swept, not left to rot', !after.caches.includes('siphon-v1'), after.caches.join(','));
   check('the new app is rendered, not the cached old one',
-    (await page.locator('#modeBrowser').count()) === 1 && (await page.locator('#old-build').count()) === 0);
+    (await page.locator('#endpoint').count()) === 1 && (await page.locator('#old-build').count()) === 0);
 
   await page.reload({ waitUntil: 'networkidle' });
   await page.waitForTimeout(2000);
-  check('and still on the visit after that', (await page.locator('#modeBrowser').count()) === 1);
+  check('and still on the visit after that', (await page.locator('#endpoint').count()) === 1);
 
   /* 6. Offline, which is the only reason the worker exists at all. */
   await context.setOffline(true);

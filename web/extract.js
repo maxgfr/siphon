@@ -244,14 +244,50 @@ export function isYouTube(url) {
 /* --------------------------------------------------------------- the entry */
 
 /**
+ * @typedef {object} Resolver
+ * Something that can turn a link into formats when this page cannot: a siphon
+ * server running yt-dlp, a Piped instance. Tried in order.
+ * @property {string} name
+ * @property {boolean} generic  true if it knows every site, not just YouTube
+ * @property {(url: string, context: object) => Promise<object>} resolve
+ */
+
+/**
  * Identify a link.
  *
+ * The device goes first for everything it can read itself: direct files, HLS,
+ * pages with a video in them. YouTube is the exception — it checks who is
+ * asking, and a page is the wrong answer — so there the resolvers go first,
+ * and InnerTube from this page is the last resort. Any other link the device
+ * cannot make sense of is offered to a generic resolver, which is how the
+ * thousand sites yt-dlp knows become reachable from a page that knows four.
+ *
  * @param {string} url
- * @param {{ net: import('./net.js').Fetcher, signal?: AbortSignal }} context
+ * @param {{ net: import('./net.js').Fetcher, signal?: AbortSignal, resolvers?: Resolver[] }} context
  */
 export async function extract(url, context) {
-  if (isYouTube(url)) return extractYouTube(url, context);
+  const resolvers = context.resolvers || [];
+  if (isYouTube(url)) return extractYouTube(url, { ...context, resolvers });
 
+  try {
+    return await extractNative(url, context);
+  } catch (error) {
+    const generic = resolvers.filter((resolver) => resolver.generic);
+    if (generic.length === 0) throw error;
+    let last = error;
+    for (const resolver of generic) {
+      try {
+        return await resolver.resolve(url, context);
+      } catch (failure) {
+        last = failure;
+      }
+    }
+    throw last;
+  }
+}
+
+/** What this page can read on its own. */
+async function extractNative(url, context) {
   const hint = sniffUrl(url);
   if (hint?.protocol === 'hls') return extractHls(url, context, {});
   if (hint) return extractDirect(url, context, hint);
@@ -509,24 +545,27 @@ async function extractYouTube(url, context) {
       retryable: false,
     });
   }
-  // An instance needs no relay at all, so it goes first. If it fails and a
-  // relay exists, the relay is the second try rather than the error.
+  // Whatever can answer for YouTube without this page pretending to be a
+  // browser on youtube.com goes first: a server with yt-dlp and cookies, an
+  // instance. InnerTube from here, through an escape, is the last resort —
+  // it works from a home connection and is bot-walled from a datacentre.
   let pipedFailure = null;
-  if (context.piped) {
+  for (const resolver of context.resolvers || []) {
     try {
-      return await extractPiped(id, url, context);
+      return await resolver.resolve(url, context);
     } catch (error) {
-      if (!context.net.hasEscape) throw error;
+      if (error instanceof BackendError && error.retryable === false && !context.net.hasEscape) throw error;
       pipedFailure = error;
     }
   }
 
   if (!context.net.hasEscape) {
+    if (pipedFailure) throw pipedFailure;
     throw new BackendError('YouTube will not talk to a web page directly.', {
       hint:
         'Its API sends no cross-origin headers, so the browser refuses before the request leaves. ' +
-        'Add a Piped instance or a relay in settings — neither needs anything of yours running — ' +
-        'or use your own server.',
+        'Give this app a helper in settings — your own server, a cobalt or Piped instance, or a relay — ' +
+        'or install the bridge.',
       retryable: false,
     });
   }
@@ -583,7 +622,7 @@ async function extractYouTube(url, context) {
   }
 
   // Both routes were tried; naming only the second would hide the first.
-  const instance = pipedFailure ? ` The Piped instance was tried first: ${pipedFailure.message}` : '';
+  const instance = pipedFailure ? ` Tried first: ${pipedFailure.message}` : '';
   throw new BackendError('YouTube turned every client away.', {
     hint: (lastReason
       ? `Last answer: ${lastReason}. A relay runs on a datacentre IP, which YouTube treats with more suspicion than a home connection — your own server is the cure.`
@@ -666,6 +705,21 @@ export function pipedFormats(body) {
  * already exists: nothing is contacted unless the user pasted an address,
  * and the privacy line on the main screen says the instance sees the link.
  */
+/** A Piped instance as a resolver: YouTube only, nothing of ours in front. */
+export function pipedResolver(base) {
+  const root = String(base || '').trim().replace(/\/+$/, '');
+  if (!root) return null;
+  return {
+    name: 'piped',
+    generic: false,
+    resolve: (url, context) => {
+      const id = youtubeId(url);
+      if (!id) throw new BackendError('That YouTube link has no video in it.', { retryable: false });
+      return extractPiped(id, url, { ...context, piped: root });
+    },
+  };
+}
+
 async function extractPiped(id, url, context) {
   const base = String(context.piped || '').replace(/\/+$/, '');
   let body;

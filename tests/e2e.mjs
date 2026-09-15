@@ -183,7 +183,7 @@ await page.addInitScript(
   (coreUrl) => {
     localStorage.setItem(
       'siphon:settings',
-      JSON.stringify({ mode: 'browser', preset: 'video_best', subs: 'off', relayUrl: '', coreUrl }),
+      JSON.stringify({ endpoint: '', key: '', helper: { kind: 'none', label: 'this device only' }, preset: 'video_best', subs: 'off', coreUrl }),
     );
     localStorage.setItem('siphon:install-dismissed', '1');
   },

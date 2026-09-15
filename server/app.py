@@ -30,13 +30,15 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator, Iterator, Literal
+from urllib.error import HTTPError
 from urllib.parse import urlparse
+from urllib.request import Request as UrlRequest, urlopen
 
 import yt_dlp
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -625,6 +627,10 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    # The tunnel's Content-Length and Content-Range are what a progress bar and
+    # a ranged download read; without this the browser is handed the bytes and
+    # told nothing about them.
+    expose_headers=["*"],
     # What makes "UI on GitHub Pages, yt-dlp on your own machine" work. Browsers
     # allow an HTTPS page to call http://localhost — localhost counts as a
     # secure context — but Chrome additionally guards public-to-private requests
@@ -700,6 +706,10 @@ async def health(request: Request) -> dict[str, Any]:
         "service": "siphon",
         "ytDlpVersion": yt_dlp.version.__version__,
         "ffmpeg": shutil.which("ffmpeg") is not None,
+        # What this server can do for a page. `jobs` needs ffmpeg to be worth
+        # much; `resolve` and `tunnel` need only yt-dlp, and let the page do
+        # the downloading and converting itself.
+        "capabilities": ["jobs", "resolve", "tunnel"],
         "requiresKey": bool(AUTH_TOKEN),
         "hasCookies": have_cookies(),
         "potProvider": bool(POT_PROVIDER_URL),
@@ -900,6 +910,229 @@ async def delete_job(job_id: str, authorization: str | None = Header(default=Non
     if job:
         shutil.rmtree(job.directory, ignore_errors=True)
     return {"deleted": bool(job)}
+
+
+# ------------------------------------------------------- resolve + tunnel
+
+# The light half of this server: no ffmpeg, no disk, no job. `resolve` runs
+# yt-dlp's extractor and hands the page the formats with their URLs — the one
+# thing a page cannot do for the sites that check who is asking. `tunnel` then
+# carries the bytes for the hosts that refuse a browser, and nothing else: it
+# only ever fetches hosts that a resolve just named, with the headers that
+# resolve said they need. The page downloads, merges and converts on its own.
+#
+# This is the split cobalt made, and it is the right one: the server holds the
+# identity, the device does the work.
+
+# hostname -> (headers to send, expiry). Filled by resolve, read by tunnel. A
+# host stays fetchable for as long as a download could plausibly take, then
+# drops out; this is what keeps the tunnel from being an open proxy.
+TUNNEL_HOSTS: dict[str, tuple[dict[str, str], float]] = {}
+TUNNEL_HOSTS_LOCK = threading.Lock()
+TUNNEL_HOST_TTL = float(os.environ.get("TUNNEL_HOST_TTL", str(2 * 60 * 60)))
+TUNNEL_CHUNK = 256 * 1024
+
+# Request headers worth carrying to a media host, and no others: the ones a
+# CDN checks. Everything else in yt-dlp's http_headers is noise for a GET of
+# bytes.
+TUNNEL_HEADER_NAMES = ("user-agent", "referer", "origin", "accept-language", "cookie", "authorization")
+
+
+def _grant_host(url: str, headers: dict[str, Any] | None) -> None:
+    host = (urlparse(url).hostname or "").lower()
+    if not host:
+        return
+    kept = {k: str(v) for k, v in (headers or {}).items() if k.lower() in TUNNEL_HEADER_NAMES}
+    with TUNNEL_HOSTS_LOCK:
+        # Several formats share a host; one of them naming headers is enough,
+        # and one of them naming none must not forget them.
+        previous = TUNNEL_HOSTS.get(host, ({}, 0.0))[0]
+        TUNNEL_HOSTS[host] = ({**previous, **kept}, time.time() + TUNNEL_HOST_TTL)
+
+
+def _granted(host: str) -> dict[str, str] | None:
+    now = time.time()
+    with TUNNEL_HOSTS_LOCK:
+        stale = [name for name, (_, expires) in TUNNEL_HOSTS.items() if expires < now]
+        for name in stale:
+            TUNNEL_HOSTS.pop(name, None)
+        entry = TUNNEL_HOSTS.get(host.lower())
+    return entry[0] if entry else None
+
+
+def format_kind(fmt: dict[str, Any]) -> str:
+    video = (fmt.get("vcodec") or "none") != "none"
+    audio = (fmt.get("acodec") or "none") != "none"
+    return "muxed" if video and audio else "video" if video else "audio"
+
+
+def resolved_format(fmt: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    One yt-dlp format in the shape the page's planner reads.
+
+    Skipped: storyboards, DRM, anything without a URL, and every protocol the
+    page cannot fetch itself (DASH manifests, RTMP). HLS is kept because the
+    page has its own HLS downloader; a progressive URL is the common case.
+    """
+    url = fmt.get("url")
+    protocol = str(fmt.get("protocol") or "https")
+    if not url or fmt.get("has_drm") or fmt.get("ext") in ("mhtml", "storyboard"):
+        return None
+    if protocol.startswith("m3u8"):
+        shape = "hls"
+    elif protocol in ("http", "https"):
+        shape = "progressive"
+    else:
+        return None
+    if (fmt.get("vcodec") or "none") == "none" and (fmt.get("acodec") or "none") == "none":
+        return None
+    codecs = ",".join(c for c in (fmt.get("vcodec"), fmt.get("acodec")) if c and c != "none")
+    tbr = fmt.get("tbr")
+    return {
+        "id": str(fmt.get("format_id") or ""),
+        "url": url,
+        "protocol": shape,
+        "kind": format_kind(fmt),
+        "container": str(fmt.get("ext") or ("mp4" if shape == "progressive" else "ts")),
+        "height": fmt.get("height"),
+        "width": fmt.get("width"),
+        "bitrate": int(tbr * 1000) if tbr else None,
+        "filesize": fmt.get("filesize") or fmt.get("filesize_approx"),
+        "codecs": codecs,
+        "label": fmt.get("format_note") or (f"{fmt.get('height')}p" if fmt.get("height") else "audio"),
+    }
+
+
+def resolve_url(url: str) -> dict[str, Any]:
+    """
+    Metadata and formats, no download, walking the client ladder on a bot
+    wall exactly as a job would. Runs in a thread; yt-dlp is synchronous.
+    """
+    attempts = player_client_chain(have_cookies())
+    last_error: Exception | None = None
+    for index, client in enumerate(attempts):
+        options: dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+        }
+        if have_cookies():
+            options["cookiefile"] = str(COOKIES_PATH)
+        args = extractor_args(client)
+        if args:
+            options["extractor_args"] = args
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info.get("_type") == "playlist":
+                entries = [e for e in info.get("entries", []) if e]
+                if not entries:
+                    raise yt_dlp.utils.DownloadError("That playlist is empty.")
+                info = entries[0]
+            pairs = [(resolved_format(raw), raw) for raw in info.get("formats") or []]
+            pairs = [(fmt, raw) for fmt, raw in pairs if fmt]
+            if not pairs and info.get("url"):
+                # Single-format extractors put the URL on the info itself.
+                single = resolved_format({**info, "format_id": info.get("format_id") or "source"})
+                if single:
+                    pairs = [(single, info)]
+            if not pairs:
+                raise yt_dlp.utils.DownloadError("requested format is not available")
+            for fmt, raw in pairs:
+                _grant_host(fmt["url"], raw.get("http_headers"))
+            formats = [fmt for fmt, _ in pairs]
+            if info.get("thumbnail"):
+                _grant_host(info["thumbnail"], None)
+            return {
+                "id": str(info.get("id") or url),
+                "url": info.get("webpage_url") or url,
+                "title": info.get("title"),
+                "uploader": info.get("uploader") or info.get("channel"),
+                "duration": info.get("duration"),
+                "thumbnail": info.get("thumbnail"),
+                "extractor": f"{info.get('extractor_key') or 'yt-dlp'} (server, {client or 'default'})",
+                "isLive": bool(info.get("is_live")),
+                "formats": formats,
+            }
+        except Exception as exc:  # noqa: BLE001 — surfaced to the user, humanized
+            last_error = exc
+            if index + 1 < len(attempts) and is_bot_wall(str(exc)):
+                continue
+            break
+    raise last_error or RuntimeError("Nothing to resolve.")
+
+
+@app.post("/api/resolve")
+async def resolve(body: ProbeRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """The formats behind a link, for a page that will do its own downloading."""
+    check_auth(authorization)
+    url = assert_fetchable(body.url)
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(resolve_url, url), timeout=90)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="The site took too long to answer.")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=humanize_error(exc))
+
+
+def _iter_upstream(response: Any) -> Iterator[bytes]:
+    try:
+        while True:
+            chunk = response.read(TUNNEL_CHUNK)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        response.close()
+
+
+@app.get("/api/tunnel")
+async def tunnel(url: str, request: Request, key: str | None = None, authorization: str | None = Header(default=None)):
+    """
+    Carry the bytes of a URL a resolve just named, for a page the host refuses.
+
+    Same key as everything else; same public-address guard; and one rule on top
+    that neither has — the host must have come out of a recent resolve. That is
+    what makes this a tunnel rather than a proxy.
+    """
+    if AUTH_TOKEN and not authorization:
+        authorization = f"Bearer {key}" if key else None
+    check_auth(authorization)
+    target = assert_fetchable(url)
+    host = urlparse(target).hostname or ""
+    extra = _granted(host)
+    if extra is None:
+        raise HTTPException(status_code=403, detail="Not a host this server resolved. Resolve the link first.")
+
+    headers = {
+        # A browser's, unless the resolve said which one the host expects.
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        **extra,
+    }
+    range_header = request.headers.get("range")
+    if range_header:
+        headers["Range"] = range_header
+
+    def open_upstream() -> Any:
+        try:
+            return urlopen(UrlRequest(target, headers=headers), timeout=30)
+        except HTTPError as exc:
+            return exc  # an HTTPError is a response too; pass its status through
+
+    upstream = await asyncio.to_thread(open_upstream)
+    status = getattr(upstream, "status", None) or getattr(upstream, "code", 502)
+    passed = {}
+    for name in ("content-type", "content-length", "content-range", "accept-ranges", "last-modified", "etag"):
+        value = upstream.headers.get(name) if hasattr(upstream, "headers") else None
+        if value:
+            passed[name] = value
+    if status >= 400:
+        detail = f"{host} answered {status}."
+        upstream.close()
+        raise HTTPException(status_code=status if status in (403, 404, 410, 416, 429) else 502, detail=detail)
+    return StreamingResponse(_iter_upstream(upstream), status_code=status, headers=passed)
 
 
 # Mounted last so /api/* always wins over a same-named static file.

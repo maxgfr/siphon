@@ -563,3 +563,206 @@ class TestSubtitles:
         # rather than being accepted as a mode.
         assert response.status_code == 400
         assert server_app.Job(id="x", url="u", preset="video_720", subs="off").subs == "off"
+
+
+# --------------------------------------------------------- resolve + tunnel
+
+
+def _public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        server_app.socket, "getaddrinfo", lambda *_a, **_k: [(None, None, None, None, ("93.184.216.34", 0))]
+    )
+
+
+class TestResolvedFormat:
+    """One yt-dlp format, in the shape the page's planner reads."""
+
+    def test_a_muxed_progressive_format(self) -> None:
+        out = server_app.resolved_format({
+            "format_id": "18", "url": "https://cdn.example/v.mp4", "protocol": "https", "ext": "mp4",
+            "vcodec": "avc1.42001E", "acodec": "mp4a.40.2", "height": 360, "width": 640, "tbr": 500.5,
+            "filesize": 1234, "format_note": "360p",
+        })
+        assert out == {
+            "id": "18", "url": "https://cdn.example/v.mp4", "protocol": "progressive", "kind": "muxed",
+            "container": "mp4", "height": 360, "width": 640, "bitrate": 500500, "filesize": 1234,
+            "codecs": "avc1.42001E,mp4a.40.2", "label": "360p",
+        }
+
+    def test_video_only_and_audio_only_are_told_apart(self) -> None:
+        video = server_app.resolved_format({"format_id": "v", "url": "u", "ext": "webm", "vcodec": "vp9", "acodec": "none", "height": 1080})
+        audio = server_app.resolved_format({"format_id": "a", "url": "u", "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "tbr": 128})
+        assert video["kind"] == "video" and video["label"] == "1080p"
+        assert audio["kind"] == "audio" and audio["label"] == "audio" and audio["bitrate"] == 128000
+
+    def test_hls_is_kept_and_dash_is_not(self) -> None:
+        hls = server_app.resolved_format({"format_id": "h", "url": "u.m3u8", "protocol": "m3u8_native", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"})
+        dash = server_app.resolved_format({"format_id": "d", "url": "u.mpd", "protocol": "http_dash_segments", "ext": "mp4", "vcodec": "avc1", "acodec": "none"})
+        assert hls["protocol"] == "hls"
+        assert dash is None
+
+    @pytest.mark.parametrize(
+        "fmt",
+        [
+            {"format_id": "sb", "url": "u", "ext": "mhtml", "vcodec": "none", "acodec": "none"},
+            {"format_id": "drm", "url": "u", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a", "has_drm": True},
+            {"format_id": "nourl", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"},
+            {"format_id": "empty", "url": "u", "ext": "mp4", "vcodec": "none", "acodec": "none"},
+        ],
+    )
+    def test_the_unusable_are_dropped(self, fmt: dict) -> None:
+        assert server_app.resolved_format(fmt) is None
+
+
+class _FakeYdl:
+    """Stands in for yt_dlp.YoutubeDL: returns a canned info dict."""
+
+    info: dict = {}
+    seen_options: list[dict] = []
+
+    def __init__(self, options: dict) -> None:
+        _FakeYdl.seen_options.append(options)
+
+    def __enter__(self) -> "_FakeYdl":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def extract_info(self, _url: str, download: bool = True) -> dict:
+        assert download is False
+        return dict(_FakeYdl.info)
+
+
+class _FakeUpstream:
+    def __init__(self, status: int, headers: dict[str, str], chunks: list[bytes]) -> None:
+        self.status = status
+        self._headers = {k.lower(): v for k, v in headers.items()}
+        self.headers = self
+        self._chunks = list(chunks)
+        self.closed = False
+
+    def get(self, name: str, default: str | None = None) -> str | None:  # email.message.Message-like
+        return self._headers.get(name.lower(), default)
+
+    def read(self, _size: int) -> bytes:
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestResolveAndTunnel:
+    @pytest.fixture(autouse=True)
+    def _isolate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _public_dns(monkeypatch)
+        monkeypatch.setattr(server_app.yt_dlp, "YoutubeDL", _FakeYdl)
+        monkeypatch.setattr(server_app, "TUNNEL_HOSTS", {})
+        _FakeYdl.seen_options = []
+        _FakeYdl.info = {
+            "id": "abc",
+            "title": "A video",
+            "uploader": "Someone",
+            "duration": 19,
+            "thumbnail": "https://img.example/t.jpg",
+            "webpage_url": "https://site.example/watch?v=abc",
+            "extractor_key": "Site",
+            "formats": [
+                {"format_id": "v", "url": "https://cdn.example/v.webm", "ext": "webm", "vcodec": "vp9", "acodec": "none", "height": 720,
+                 "http_headers": {"User-Agent": "yt-dlp-ua", "Referer": "https://site.example/", "X-Internal": "no"}},
+                {"format_id": "a", "url": "https://cdn.example/a.m4a", "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "tbr": 128},
+                {"format_id": "sb", "url": "https://cdn.example/sb", "ext": "mhtml", "vcodec": "none", "acodec": "none"},
+            ],
+        }
+
+    def test_resolve_returns_the_page_shape_and_grants_the_hosts(self, client: TestClient) -> None:
+        response = client.post("/api/resolve", json={"url": "https://site.example/watch?v=abc"})
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["title"] == "A video"
+        assert body["extractor"] == "Site (server, default)"
+        assert [f["id"] for f in body["formats"]] == ["v", "a"]
+        assert body["formats"][0]["kind"] == "video" and body["formats"][1]["kind"] == "audio"
+        # No download was asked for, and the playlist guard is on.
+        assert _FakeYdl.seen_options[0]["skip_download"] is True
+        assert _FakeYdl.seen_options[0]["noplaylist"] is True
+        # The CDN and the thumbnail host are now tunnelable; nothing else is.
+        assert set(server_app.TUNNEL_HOSTS) == {"cdn.example", "img.example"}
+        kept_headers = server_app.TUNNEL_HOSTS["cdn.example"][0]
+        assert kept_headers == {"User-Agent": "yt-dlp-ua", "Referer": "https://site.example/"}
+
+    def test_resolve_walks_the_client_ladder_on_a_bot_wall(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = {"n": 0}
+
+        def extract_info(self: _FakeYdl, _url: str, download: bool = True) -> dict:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise server_app.yt_dlp.utils.DownloadError("Sign in to confirm you're not a bot")
+            return dict(_FakeYdl.info)
+
+        monkeypatch.setattr(_FakeYdl, "extract_info", extract_info)
+        response = client.post("/api/resolve", json={"url": "https://site.example/watch?v=abc"})
+        assert response.status_code == 200
+        assert response.json()["extractor"] == "Site (server, tv)"
+        assert calls["n"] == 2
+
+    def test_resolve_refuses_private_addresses(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The fixture's DNS makes every name public; put the real answer back
+        # for the one address whose whole point is being private.
+        monkeypatch.setattr(
+            server_app.socket, "getaddrinfo", lambda *_a, **_k: [(None, None, None, None, ("169.254.169.254", 0))]
+        )
+        response = client.post("/api/resolve", json={"url": "http://169.254.169.254/latest/meta-data/"})
+        assert response.status_code == 400
+        assert _FakeYdl.seen_options == []
+
+    def test_tunnel_refuses_a_host_nobody_resolved(self, client: TestClient) -> None:
+        response = client.get("/api/tunnel", params={"url": "https://cdn.example/v.webm"})
+        assert response.status_code == 403
+        assert "resolve" in response.json()["detail"].lower()
+
+    def test_tunnel_carries_bytes_headers_and_ranges(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        client.post("/api/resolve", json={"url": "https://site.example/watch?v=abc"})
+        opened: list = []
+
+        def fake_urlopen(request, timeout=0):  # noqa: ANN001
+            opened.append(request)
+            return _FakeUpstream(206, {"Content-Type": "video/webm", "Content-Length": "6", "Content-Range": "bytes 0-5/100", "Accept-Ranges": "bytes"}, [b"abc", b"def"])
+
+        monkeypatch.setattr(server_app, "urlopen", fake_urlopen)
+        response = client.get("/api/tunnel", params={"url": "https://cdn.example/v.webm"}, headers={"Range": "bytes=0-5"})
+        assert response.status_code == 206
+        assert response.content == b"abcdef"
+        assert response.headers["content-type"] == "video/webm"
+        assert response.headers["content-range"] == "bytes 0-5/100"
+        assert response.headers["content-length"] == "6"
+        # Upstream saw the range, the resolve's own headers, and never our internal one.
+        sent = opened[0]
+        assert sent.full_url == "https://cdn.example/v.webm"
+        assert sent.get_header("Range") == "bytes=0-5"
+        assert sent.get_header("Referer") == "https://site.example/"
+        assert sent.get_header("User-agent") == "yt-dlp-ua"
+        assert sent.get_header("X-internal") is None
+
+    def test_tunnel_passes_an_upstream_refusal_through(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        client.post("/api/resolve", json={"url": "https://site.example/watch?v=abc"})
+        monkeypatch.setattr(server_app, "urlopen", lambda *_a, **_k: _FakeUpstream(403, {}, []))
+        response = client.get("/api/tunnel", params={"url": "https://cdn.example/v.webm"})
+        assert response.status_code == 403
+        assert "cdn.example answered 403" in response.json()["detail"]
+
+    def test_both_are_gated_by_the_access_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server_app, "AUTH_TOKEN", "s3cret")
+        client = TestClient(server_app.app)
+        assert client.post("/api/resolve", json={"url": "https://site.example/x"}).status_code == 401
+        assert client.get("/api/tunnel", params={"url": "https://cdn.example/v.webm"}).status_code == 401
+        # The tunnel is fetched by the page's own fetch, which can carry the key
+        # in the query as the file endpoint does.
+        client.post("/api/resolve", json={"url": "https://site.example/x"}, headers={"Authorization": "Bearer s3cret"})
+        monkeypatch.setattr(server_app, "urlopen", lambda *_a, **_k: _FakeUpstream(200, {"Content-Type": "video/webm"}, [b"x"]))
+        assert client.get("/api/tunnel", params={"url": "https://cdn.example/v.webm", "key": "s3cret"}).status_code == 200
+
+
+def test_health_lists_capabilities(client: TestClient) -> None:
+    body = client.get("/api/health").json()
+    assert body["capabilities"] == ["jobs", "resolve", "tunnel"]

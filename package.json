@@ -2,7 +2,7 @@
   "name": "siphon",
   "private": true,
   "type": "module",
-  "description": "Tooling only. The app in web/ has no build step and no dependencies — this exists so the tests can run under node --test and Playwright. Tests live outside web/ because the Pages workflow publishes that whole directory.",
+  "description": "Tooling only. The app in web/ has no build step and no dependencies \u2014 this exists so the tests can run under node --test and Playwright. Tests live outside web/ because the Pages workflow publishes that whole directory.",
   "scripts": {
     "test": "node --test \"tests/*.test.js\"",
     "test:e2e": "node tests/e2e.mjs",
@@ -10,7 +10,8 @@
     "test:youtube": "node tests/youtube.mjs",
     "test:innertube": "node tests/innertube-probe.mjs",
     "relay": "node relay/serve.mjs",
-    "test:bridge": "node tests/bridge.mjs"
+    "test:bridge": "node tests/bridge.mjs",
+    "test:split": "node tests/split.mjs"
   },
   "devDependencies": {
     "playwright": "1.56.1",

@@ -29,9 +29,15 @@ const PROBE_TTL_MS = 120_000;
 const nowSeconds = () => Date.now() / 1000;
 
 export class BrowserBackend {
-  constructor({ relay = '', coreUrl = '', piped = '' } = {}) {
-    this.net = new Fetcher({ relay });
-    this.piped = String(piped || '').trim();
+  /**
+   * @param {object} options
+   * @param {string} [options.coreUrl]  where ffmpeg.wasm is fetched from
+   * @param {import('./net.js').Escape|null} [options.escape]  a relay or a server tunnel, for hosts that refuse the page
+   * @param {import('./extract.js').Resolver[]} [options.resolvers]  who to ask when this page cannot read a link
+   */
+  constructor({ coreUrl = '', escape = null, resolvers = [] } = {}) {
+    this.net = new Fetcher({ escape });
+    this.resolvers = resolvers.filter(Boolean);
     this.mode = 'browser';
     this.supportsProgress = true;
     this.supportsProbe = true;
@@ -56,9 +62,9 @@ export class BrowserBackend {
       label: 'in this browser',
       ffmpeg: true, // fetched on demand; absence is a download failure, not a missing dependency
       presets: null,
-      relay: this.net.hasRelay,
+      escape: this.net.escape?.name || null,
       bridge: this.net.hasBridge,
-      piped: Boolean(this.piped),
+      resolvers: this.resolvers.map((resolver) => resolver.name),
       converterLoaded: isLoaded(),
     };
   }
@@ -73,7 +79,7 @@ export class BrowserBackend {
   async identify(url, signal) {
     const cached = this.cache.get(url);
     if (cached && Date.now() - cached.at < PROBE_TTL_MS) return cached.value;
-    const value = await extract(url, { net: this.net, signal, piped: this.piped });
+    const value = await extract(url, { net: this.net, signal, resolvers: this.resolvers });
     this.cache.set(url, { at: Date.now(), value });
     return value;
   }

@@ -7,12 +7,13 @@
  * `Access-Control-Allow-Origin`, or it would not work at all — and for those
  * this module is a thin wrapper over `fetch` and nothing leaves the browser.
  *
- * For the hosts that do not (YouTube being the one everybody wants), the user
- * can point siphon at a relay: a stateless header-adder they deploy once, with
- * no yt-dlp, no ffmpeg and no state. It is still a server, and this module is
- * careful about the distinction — the relay is never assumed, never contacted
- * unless the direct attempt actually failed, and when it is unset the failure
- * says so in a sentence.
+ * For the hosts that do not (YouTube being the one everybody wants), there is
+ * an escape: something that fetches on the page's behalf. A relay adds the
+ * missing header and forwards nothing else; a siphon server's tunnel carries
+ * the bytes of hosts it just resolved; a userscript bridge does it on this very
+ * device. This module is careful about the distinction — an escape is never
+ * assumed, never contacted unless the direct attempt actually failed, and when
+ * there is none the failure says so in a sentence.
  *
  * The verdict per origin is remembered for the session: a 400-segment HLS
  * download should discover the CORS answer once, not eight hundred times.
@@ -22,16 +23,30 @@ import { BackendError } from './errors.js';
 /** Whether a fetch rejection was the browser refusing, rather than the network. */
 const isBlocked = (error) => error instanceof TypeError;
 
+/**
+ * @typedef {object} Escape
+ * @property {'relay'|'tunnel'} name  what it is, for error messages
+ * @property {(url: string) => string} via  the URL that fetches `url` on our behalf
+ * @property {Record<string,string>} [headers]  sent along with it (an access key)
+ */
+
+/** A relay as an escape: `${base}/?url=…`, the shape relay/worker.js answers. */
+export const relayEscape = (base) => {
+  const root = String(base || '').trim().replace(/\/+$/, '');
+  return root ? { name: 'relay', via: (url) => `${root}/?url=${encodeURIComponent(url)}` } : null;
+};
+
 export class Fetcher {
-  constructor({ relay = '' } = {}) {
-    this.relay = String(relay || '').trim().replace(/\/+$/, '');
+  constructor({ escape = null } = {}) {
+    /** @type {Escape|null} */
+    this.escape = escape;
     /** @type {Map<string, 'direct'|'bridge'|'relay'>} */
     this.verdicts = new Map();
     this.bridge = installBridge();
   }
 
   get hasRelay() {
-    return Boolean(this.relay);
+    return Boolean(this.escape);
   }
 
   /** A userscript on this page that fetches with the manager's privileges — no server anywhere. */
@@ -44,9 +59,9 @@ export class Fetcher {
     return this.hasBridge || this.hasRelay;
   }
 
-  /** What the relay's URL looks like for a given target. */
+  /** What the escape's URL looks like for a given target. */
   via(url) {
-    return `${this.relay}/?url=${encodeURIComponent(url)}`;
+    return this.escape ? this.escape.via(url) : url;
   }
 
   #origin(url) {
@@ -92,18 +107,23 @@ export class Fetcher {
   }
 
   async #relayRequest(url, init) {
-    if (!this.hasRelay) throw corsWall(this.#origin(url));
+    if (!this.escape) throw corsWall(this.#origin(url));
+    const what = this.escape.name === 'tunnel' ? 'the server' : 'the relay';
     let response;
     try {
-      response = await fetch(this.via(url), { ...init, credentials: 'omit' });
+      const headers = { ...(init.headers instanceof Headers ? Object.fromEntries(init.headers) : init.headers || {}), ...(this.escape.headers || {}) };
+      response = await fetch(this.escape.via(url), { ...init, headers, credentials: 'omit' });
     } catch {
-      throw new BackendError('Could not reach the relay.', {
-        hint: 'Check the address in settings, and that the worker is deployed.',
+      throw new BackendError(`Could not reach ${what}.`, {
+        hint: 'Check the address in settings, and that it is running.',
       });
     }
     if (response.status === 403) {
-      throw new BackendError('The relay refused that address.', {
-        hint: 'Relays carry an allow-list of hosts. Add this one to ALLOWED_HOSTS, or use your own server.',
+      throw new BackendError(`${what[0].toUpperCase()}${what.slice(1)} refused to fetch that address.`, {
+        hint:
+          this.escape.name === 'tunnel'
+            ? 'The server only carries hosts it resolved itself.'
+            : 'Relays carry an allow-list of hosts. Add this one to ALLOWED_HOSTS, or use your own server.',
         retryable: false,
       });
     }
@@ -288,7 +308,7 @@ function corsWall(origin) {
   return new BackendError(`${hostOf(origin)} does not let a web page read its files.`, {
     hint:
       'That host sends no cross-origin headers, so the browser refuses on its own. ' +
-      'Add a relay in settings, or switch to your own server.',
+      'Give it a helper in settings — a server or a relay — or install the bridge.',
     retryable: false,
   });
 }
