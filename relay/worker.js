@@ -168,10 +168,19 @@ export default {
       return deny(`upstream: ${failure?.message || failure}`, request, env, 502);
     }
 
+    // The runtime's fetch has already decoded the body, so the upstream's
+    // content-encoding describes bytes that are no longer there. Workers
+    // would quietly re-encode to match; Node forwards the header over
+    // plaintext, and a client told "gzip" then waits for a gzip header that
+    // never comes — which is how the first real YouTube run hung on the very
+    // first request. content-length is the truth only when nothing was
+    // encoded, and then it is worth keeping: it is what a progress bar needs.
+    const encoded = upstream.headers.has('content-encoding');
     const out = new Headers();
     for (const [key, value] of upstream.headers) {
       const name = key.toLowerCase();
-      if (HOP_BY_HOP.has(name) || name === 'set-cookie') continue;
+      if (name === 'content-encoding' || name === 'set-cookie') continue;
+      if (name === 'content-length' ? encoded : HOP_BY_HOP.has(name)) continue;
       if (name.startsWith('access-control-')) continue; // ours are the ones that count
       out.set(key, value);
     }

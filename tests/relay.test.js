@@ -227,6 +227,34 @@ test('the upstream status and body are passed through unchanged', async () => {
   }
 });
 
+test('an upstream encoding is not forwarded, because the body arrives decoded', async () => {
+  // fetch hands the worker plaintext; the header would describe bytes that
+  // are gone, and a client that believes it waits forever for a gzip stream.
+  const upstream = stubUpstream(() =>
+    new Response('plain text', { headers: { 'Content-Encoding': 'gzip', 'Content-Length': '20', 'Content-Type': 'text/plain' } }),
+  );
+  try {
+    const response = await call(relayUrl(YT));
+    assert.equal(response.headers.get('content-encoding'), null);
+    assert.equal(response.headers.get('content-length'), null);
+    assert.equal(response.headers.get('content-type'), 'text/plain');
+    assert.equal(await response.text(), 'plain text');
+  } finally {
+    upstream.restore();
+  }
+});
+
+test('content-length survives when nothing was encoded, since a progress bar needs it', async () => {
+  const upstream = stubUpstream(() => new Response('12345', { headers: { 'Content-Length': '5' } }));
+  try {
+    const response = await call(relayUrl('https://rr1.googlevideo.com/videoplayback'));
+    assert.equal(response.headers.get('content-length'), '5');
+    assert.equal(await response.text(), '12345');
+  } finally {
+    upstream.restore();
+  }
+});
+
 test('an upstream that will not answer becomes a 502, not a crash', async () => {
   const upstream = stubUpstream(() => {
     throw new Error('connection reset');
