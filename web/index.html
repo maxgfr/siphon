@@ -126,141 +126,73 @@
       </button>
     </div>
     <p class="explain">
-      Some hosts let a web page read their files and some do not, and the ones that do not cannot
-      be talked round. Pick what does the fetching.
+      Paste a link and it downloads on this device. Some sites — YouTube above all — refuse a
+      web page, and for those this app needs a helper. Give it one address; it works out what
+      that address is.
     </p>
 
-    <div class="mode" role="radiogroup" aria-label="Download source">
-      <label>
-        <input type="radio" name="mode" value="server" id="modeServer" />
-        <span>
-          <b>Your own server</b>
-          <small>Runs yt-dlp itself. Every site yt-dlp supports, real progress, nothing goes
-            through a stranger. Deploy the <code>server/</code> folder from this project.</small>
-        </span>
-      </label>
-      <label>
-        <input type="radio" name="mode" value="browser" id="modeBrowser" />
-        <span>
-          <b>In this browser</b>
-          <small>No server anywhere. Works for direct files and HLS streams whose host allows
-            it — which is most things built to be embedded. YouTube refuses, and needs the
-            relay below.</small>
-        </span>
-      </label>
-      <label>
-        <input type="radio" name="mode" value="public" id="modePublic" />
-        <span>
-          <b>A public instance</b>
-          <small>No server to run. Instances are shared, so they rate-limit, ask for a captcha,
-            or disappear — treat this as the fallback, not the plan.</small>
-        </span>
-      </label>
+    <label class="lbl" for="endpoint">Helper <span style="font-weight:400;color:var(--muted)">— optional</span></label>
+    <input type="url" id="endpoint" inputmode="url" autocapitalize="off" autocorrect="off"
+           spellcheck="false" placeholder="https://…" />
+    <button type="button" class="chip-btn" id="useLocalhost" style="margin-top:8px">
+      Use this computer
+    </button>
+    <p class="hint">
+      Any of these, and it is recognised on its own:
+      <strong>your own siphon server</strong> — the <code>server/</code> folder, one <code>docker run</code>.
+      With ffmpeg it does everything: every site yt-dlp knows, playlists, subtitles, your YouTube
+      cookies. Without ffmpeg it only resolves links and this device downloads and converts.
+      <strong>A cobalt instance</strong>, for what this device cannot read.
+      <strong>A Piped instance</strong>, for YouTube. <strong>A relay</strong> — <code>relay/</code>,
+      a free Cloudflare Worker — which adds the missing header and nothing else.
+      Leave it empty and this device still handles direct files, HLS and pages that allow it.
+    </p>
+
+    <label class="lbl" for="endpointKey">Access key <span style="font-weight:400;color:var(--muted)">— if the helper asks for one</span></label>
+    <input type="password" id="endpointKey" autocomplete="off" placeholder="Optional" />
+
+    <div id="cookiesBlock" hidden>
+      <label class="lbl">YouTube sign-in <span id="cookiesState" style="font-weight:400;color:var(--muted)"></span></label>
+      <p class="hint">
+        YouTube turns anonymous downloads away with <em>"Sign in to confirm you're not a bot"</em>.
+        Your server already retries with several of YouTube's own clients, and that clears most of it.
+        When it does not, your own session does — export <code>cookies.txt</code> with a
+        Netscape-format cookie extension and upload it here.
+      </p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+        <label class="chip-btn" for="cookiesFile" style="display:grid;place-items:center">
+          Upload cookies.txt
+          <input type="file" id="cookiesFile" accept=".txt,text/plain" hidden />
+        </label>
+        <button type="button" class="chip-btn" id="cookiesClear" hidden>Remove</button>
+      </div>
+      <p class="hint" id="cookiesResult" style="margin-top:8px"></p>
+      <p class="hint">
+        <strong>This is a logged-in session.</strong> Only upload it to a server you control, and
+        use a throwaway account if you would rather not hand over your main one.
+      </p>
     </div>
 
-    <div id="serverFields">
-      <label class="lbl" for="serverUrl">Server address</label>
-      <input type="url" id="serverUrl" inputmode="url" autocapitalize="off" autocorrect="off"
-             spellcheck="false" placeholder="https://ytdl.example.com" />
-      <button type="button" class="chip-btn" id="useLocalhost" style="margin-top:8px">
-        Use this computer
-      </button>
-      <p class="hint">
-        Running yt-dlp on the machine you are sitting at is the shortest path: the video goes
-        from the site straight to your disk, and nothing but this page comes from the internet.
-        Browsers permit it because <code>localhost</code> counts as secure.
-        <strong>On a phone this will not work</strong> — nothing is running on the phone. Use a
-        deployed server there, or open your computer's own address in the phone's browser.
-      </p>
-
-      <label class="lbl" for="serverKey">Access key <span style="font-weight:400;color:var(--muted)">— if the server asks for one</span></label>
-      <input type="password" id="serverKey" autocomplete="off" placeholder="Optional" />
-
-      <div id="cookiesBlock">
-        <label class="lbl">YouTube sign-in <span id="cookiesState" style="font-weight:400;color:var(--muted)"></span></label>
-        <p class="hint">
-          YouTube turns anonymous downloads away with <em>"Sign in to confirm you're not a bot"</em>.
-          siphon already retries with several of YouTube's own clients, and that clears most of it.
-          When it does not, your own session does — export <code>cookies.txt</code> with a
-          Netscape-format cookie extension and upload it here.
-        </p>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
-          <label class="chip-btn" for="cookiesFile" style="display:grid;place-items:center">
-            Upload cookies.txt
-            <input type="file" id="cookiesFile" accept=".txt,text/plain" hidden />
-          </label>
-          <button type="button" class="chip-btn" id="cookiesClear" hidden>Remove</button>
-        </div>
-        <p class="hint" id="cookiesResult" style="margin-top:8px"></p>
-        <p class="hint">
-          <strong>This is a logged-in session.</strong> Only upload it to a server you control, and
-          use a throwaway account if you would rather not hand over your main one.
-        </p>
-      </div>
-
-      <div id="phoneHint" hidden>
-        <label class="lbl">On your phone</label>
-        <p class="hint" id="phoneHintBody"></p>
-      </div>
+    <div id="phoneHint" hidden>
+      <label class="lbl">On your phone</label>
+      <p class="hint" id="phoneHintBody"></p>
     </div>
 
-    <div id="browserFields" hidden>
-      <p class="hint">
-        The extractor runs in this page: it reads the link, picks a quality, downloads the
-        stream and, when a file has to be merged or converted, loads
-        <a href="https://github.com/ffmpegwasm/ffmpeg.wasm" target="_blank" rel="noopener noreferrer">ffmpeg.wasm</a>
-        to do it here. Nothing is uploaded and no link leaves the device.
-      </p>
-      <p class="hint">
-        <strong>What it cannot do is argue with the browser.</strong> A host that sends no
-        cross-origin headers — YouTube above all — is unreadable from a page, and no amount of
-        JavaScript changes that. Those links need either your own server or a relay.
-      </p>
-
-      <label class="lbl" for="relayUrl">Relay <span style="font-weight:400;color:var(--muted)">— only for hosts that refuse</span></label>
-      <input type="url" id="relayUrl" inputmode="url" autocapitalize="off" autocorrect="off"
-             spellcheck="false" placeholder="https://siphon-relay.you.workers.dev" />
-      <p class="hint">
-        A relay adds the missing header and forwards nothing else — no yt-dlp, no ffmpeg, no
-        state, one file. <code>relay/worker.js</code> in this project deploys to a free
-        Cloudflare Worker in about a minute. It is still a server, so it is optional and off
-        until you fill this in; leave it empty and YouTube links simply say why they failed.
-      </p>
-
-      <label class="lbl" for="pipedUrl">Piped instance <span style="font-weight:400;color:var(--muted)">— YouTube with nothing to deploy</span></label>
-      <input type="url" id="pipedUrl" inputmode="url" autocapitalize="off" autocorrect="off"
-             spellcheck="false" placeholder="https://pipedapi.example" />
-      <p class="hint">
-        A <a href="https://github.com/TeamPiped/Piped" target="_blank" rel="noopener noreferrer">Piped</a>
-        instance's API answers a web page directly and proxies the media with the headers the
-        browser needs — so YouTube works here with no relay and nothing of yours running. It is
-        someone else's server: it sees every YouTube link you paste, instances come and go, and
-        YouTube blocks them in waves. There is no default; bring an address you trust. When one
-        is set it is tried first, and a relay is the fallback.
-      </p>
-
+    <details style="margin-top:14px">
+      <summary class="lbl" style="cursor:pointer">Advanced</summary>
       <label class="lbl" for="coreUrl">Converter <span style="font-weight:400;color:var(--muted)">— optional</span></label>
       <input type="url" id="coreUrl" inputmode="url" autocapitalize="off" autocorrect="off"
              spellcheck="false" placeholder="ffmpeg-core.js from a CDN" />
       <p class="hint">
-        Where ffmpeg.wasm is fetched from the first time a download needs converting — about
-        32 MB, cached afterwards. Blank uses jsDelivr; set it to host your own copy.
+        Where ffmpeg.wasm is fetched from the first time a download needs converting on this
+        device — about 32 MB, cached afterwards. Blank uses jsDelivr; set it to host your own copy.
       </p>
-    </div>
-
-    <div id="publicFields" hidden>
-      <label class="lbl" for="publicUrl">Instance API</label>
-      <input type="url" id="publicUrl" inputmode="url" autocapitalize="off" autocorrect="off"
-             spellcheck="false" placeholder="https://your-cobalt-instance.example" />
       <p class="hint">
-        Any <a href="https://github.com/imputnet/cobalt" target="_blank" rel="noopener noreferrer">cobalt</a>
-        instance. There is no official public one, so bring an address you trust — it will see
-        every link you paste.
+        <strong>The bridge.</strong> A userscript that lets this page fetch anything, with no
+        server anywhere — see <code>bridge/</code> in the project. Once installed it is used
+        automatically, ahead of any helper.
       </p>
-
-      <label class="lbl" for="publicKey">API key <span style="font-weight:400;color:var(--muted)">— if the instance asks for one</span></label>
-      <input type="password" id="publicKey" autocomplete="off" placeholder="Optional" />
-    </div>
+    </details>
 
     <div class="status-line">
       <span class="dot" id="statusDot"></span>

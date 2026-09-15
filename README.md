@@ -7,23 +7,58 @@ anywhere at all.
 Open it, tap **Paste**, tap **Download**. On Android you can also share a link
 straight from YouTube into it, because it installs as a share target.
 
-## Three ways to get the file
+## One address, and it works out the rest
 
-Settings picks which one does the fetching. They answer the same four questions,
-so the rest of the app is identical whichever you choose.
+The device does the downloading. That is the default and it needs nothing: paste
+a direct file, an HLS stream or a page that declares its video, and the whole
+job — fetch, merge, convert, tag — happens in the tab you have open.
 
-On a first visit siphon picks for you, from the one fact that distinguishes the
-two situations: whether the page's own origin answers `/api/health`. The
-container serves both halves, so it does, and that setup keeps working with
-nothing configured. A static host does not, so browser mode is chosen — which
-works on arrival instead of opening on an instruction to go and set something
-up. Once you have chosen a mode yourself, nothing overrides it.
+Some sites refuse a web page outright, YouTube above all, and no amount of
+JavaScript changes that. For those, siphon takes **one optional address**, and
+works out on its own what is behind it:
 
-| | what runs it | what it covers | what it costs |
-|---|---|---|---|
-| **In this browser** | the page you are looking at | direct files, HLS, pages that declare their media | nothing |
-| **Your own server** | `server/`, running yt-dlp | everything yt-dlp supports | a container |
-| **A public instance** | someone else's [cobalt](https://github.com/imputnet/cobalt) | whatever they allow | your links, seen by them |
+| what you point it at | what it is asked to do |
+|---|---|
+| **your own siphon server** (`server/`) | with ffmpeg: everything, every site yt-dlp knows. Without ffmpeg: it resolves links, and this device does the work |
+| **a [cobalt](https://github.com/imputnet/cobalt) instance** | whatever this device could not read itself |
+| **a [Piped](https://github.com/TeamPiped/Piped) instance** | YouTube |
+| **a relay** (`relay/`) | carry the bytes of hosts that refuse a page, and nothing else |
+| nothing at all | this device only, and links that need more say so |
+
+You never pick a mode. Saving the address probes it once — a siphon server
+answers `/api/health` with its own name, cobalt answers its root, Piped answers
+`/config`, a relay fetches something for you — and what it turns out to be is
+remembered alongside it. Point it at a blog and it tells you so rather than
+failing later on a real link.
+
+On a first visit with nothing saved, the same probe runs against the page's own
+origin. The container serves both halves, so it answers and everything works
+with no configuration; a static host does not, so the device does it. Either
+way the first screen works rather than opening on an instruction.
+
+### The split: the server says where, the device fetches
+
+This is the shape [cobalt](https://github.com/imputnet/cobalt) found, and it is
+the right one. The single thing a browser genuinely cannot do is convince a site
+it is not a browser: YouTube checks who is asking, and a page is the wrong
+answer whatever headers it sets. Everything *after* that — downloading,
+merging, converting — a browser does perfectly well, and doing it there costs
+the server no disk, no CPU and no bandwidth.
+
+So a siphon server exposes two small endpoints beside the full job API:
+
+- `POST /api/resolve` runs yt-dlp's extractor and nothing else, and hands back
+  the formats with their URLs — the part that needs the server's identity, its
+  IP and your cookies.
+- `GET /api/tunnel?url=…` carries the bytes of a URL a resolve just named, for
+  the hosts that refuse a page. It only ever fetches hosts a recent resolve
+  produced, with the headers that resolve said they need, so it is a tunnel and
+  not an open proxy.
+
+A server **with** ffmpeg still takes the whole job: yt-dlp doing the entire
+download is more capable than anything else on offer, and it is your machine.
+A server **without** ffmpeg — or one you deliberately run thin — resolves, and
+your phone does the rest. Nothing in the UI changes either way.
 
 ### What the browser can actually do
 
@@ -61,14 +96,14 @@ before it leaves the browser. Signing the stream URL is the *easy* half — that
 is just JavaScript, and [YouTube.js](https://github.com/LuanRT/YouTube.js) does
 it in the page — but a signed URL you are not allowed to fetch is no use.
 
-So YouTube in browser mode needs one of three things, and the first needs
-nothing of yours running at all:
+So YouTube needs a helper, and three of the four need nothing of yours
+running at all:
 
 - **A [Piped](https://github.com/TeamPiped/Piped) instance.** Its API answers
   a web page directly and proxies the media with the headers the browser
   needs, so the browser mode's own pipeline — the planner, ffmpeg.wasm, the
-  queue — runs on top of it unchanged. Paste an instance's API address under
-  **Settings → In this browser** and YouTube works from a phone with nothing
+  queue — runs on top of it unchanged. Paste an instance's API address into
+  the one address field in settings and YouTube works from a phone with nothing
   deployed. It is someone else's server: it sees every YouTube link you paste,
   instances come and go, and YouTube blocks them in waves. There is no default
   baked in, deliberately, for the same reason there is none for cobalt. When
@@ -179,14 +214,15 @@ YouTube on a stock phone, because the native HTTP layer is not bound by CORS at
 all. It is not in this repo: it trades "nothing to install" — the premise the
 whole project is built on — for that one site.
 
-### Browser mode does not do everything
+### What the device alone does not do
 
-Worth knowing before you switch to it:
+Worth knowing before you rely on it with no helper set:
 
 - **No subtitles yet.** The app says so rather than handing back a file that
   quietly has none.
-- **One video at a time.** A playlist is offered whole by the server, because it
-  can build a zip; a tab cannot, so browser mode takes the video you linked.
+- **One video at a time.** A playlist is offered whole by a full server,
+  because it can build a zip; a tab cannot, so the device takes the video you
+  linked.
 - **No cookies.** There is nowhere safe to put them and nothing that would use
   them.
 - **Sites that build their player in JavaScript** hide the file from a markup
@@ -198,9 +234,9 @@ Worth knowing before you switch to it:
 
 ## The shortest setup: you are the client
 
-For anything browser mode does not cover — YouTube without a relay, a site that
-hides its player behind JavaScript, subtitles, a whole playlist — you want
-yt-dlp. You still do not have to host it anywhere. Put the interface on GitHub
+For anything the device does not cover on its own — YouTube, a site that hides
+its player behind JavaScript, subtitles, a whole playlist — you want yt-dlp. You
+still do not have to host it anywhere. Put the interface on GitHub
 Pages, run yt-dlp on the computer you are sitting at, and point one at the
 other:
 
@@ -487,9 +523,9 @@ fix, and the interface shows the running version next to the wordmark.
 
 ## Configuration
 
-Browser mode has two settings and both are in the app, because nothing of yours
-is running: the **relay** address, and where **ffmpeg.wasm** is fetched from if
-you would rather not depend on a CDN. Both are optional and both start empty.
+The app has three settings, all optional and all empty to begin with: the
+**helper** address, its **access key** if it wants one, and, under Advanced,
+where **ffmpeg.wasm** is fetched from if you would rather not depend on a CDN.
 
 The server has the rest. All server-side, all environment variables:
 
@@ -503,6 +539,7 @@ The server has the rest. All server-side, all environment variables:
 | `ALLOW_PRIVATE_HOSTS` | off | Lets the server fetch from private/LAN addresses. Off by default — see below. |
 | `COOKIES_FILE` | inside `DOWNLOAD_DIR` | Where the uploaded YouTube session is kept. Put it on a volume so it survives a restart. |
 | `POT_PROVIDER_URL` | *(unset)* | Address of a proof-of-origin provider, e.g. `http://potoken:4416`. Unset means the plugin stays inert. |
+| `TUNNEL_HOST_TTL` | `7200` | Seconds a host named by a resolve stays fetchable through `/api/tunnel`. Long enough for a download, short enough that the tunnel is never an open proxy. |
 | `PLAYLIST_LIMIT` | `50` | Most items one playlist download will fetch. |
 | `PORT` | `8000` | Listen port. |
 
@@ -524,12 +561,12 @@ used to smuggle arbitrary yt-dlp options.
 
 ## The public-instance fallback
 
-Settings also offers **a public instance**: the app asks a
-[cobalt](https://github.com/imputnet/cobalt) instance for a direct link instead
-of running anything itself. No server to deploy, but shared instances rate-limit,
-require captchas or API keys, and come and go — and every link you paste is sent
-to whoever runs it. There is no default instance baked in, deliberately: you have
-to supply an address you actually trust. Treat this as the fallback, not the plan.
+Point the address at a [cobalt](https://github.com/imputnet/cobalt) instance and
+it is used for whatever this device could not read by itself. No server to
+deploy, but shared instances rate-limit, require captchas or API keys, and come
+and go — and every link that reaches one is seen by whoever runs it. There is no
+default instance baked in, deliberately: you have to supply an address you
+actually trust. Treat this as the fallback, not the plan.
 
 ## Development
 
@@ -559,6 +596,10 @@ npm run test:deployed
 # Needs playwright and ffmpeg.
 npm run test:bridge
 
+# the split: a server that only resolves, a device that downloads through its
+# tunnel, against a media host that refuses the page. Needs playwright, ffmpeg.
+npm run test:split
+
 # what YouTube's API says to a bare request from this machine — one hand-built
 # call per client, then the same through youtubei.js, no browser, no relay.
 # The baseline a red below is read against.
@@ -570,7 +611,7 @@ npm run test:youtube
 ```
 
 All of it runs on every pull request. `fast` (the server suite and the unit
-tests) and `browser` (the three Playwright suites) gate the merge. `youtube`
+tests) and `browser` (the four Playwright suites) gate the merge. `youtube`
 does not: a runner is a datacentre IP, and whether YouTube answers one on a
 given day is YouTube's decision, not this code's. A red there says *look*,
 never *do not merge* — and the log says exactly why: every step announces
@@ -602,41 +643,32 @@ Where it lives:
 
 ## What was verified
 
-Against yt-dlp 2026.08.19, in a headless Chromium on a Pixel 7 profile:
+Every number here comes from a run, and the last section says plainly what is
+still unproven.
 
-- 29 server tests pass, covering the SSRF guard (including a hostname that
-  resolves to loopback), the preset allow-list, and the auth token on every
-  endpoint.
-- The full path works end to end: paste a link → metadata resolves → pick MP3 →
-  the browser receives a real `.mp3`.
-- Progress is real, not decorative: on a throttled 16 MB download the bar
-  advanced 3% → 56% → complete with live speed and ETA, and the whole file
-  arrived.
-- No horizontal scroll at phone width, and every visible control is at least
-  40 px tall.
-- A failed link produces a sentence, not a stack trace.
-- The Android share target prefills the link and scrubs it from the address bar.
+| suite | what it is | result |
+|---|---|---|
+| `pytest server/tests` | the server, without a network | 94 pass |
+| `npm test` | the extractor, the relay and endpoint detection, as pure logic | 80 pass |
+| `npm run test:e2e` | the device alone, real Chromium, two origins | 21 pass |
+| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker | 35 pass |
+| `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
+| `npm run test:split` | a server that only resolves, a device that downloads | 17 pass |
+| `npm run test:youtube` | YouTube, for real, in CI | informative — see below |
 
-### Browser mode
+### The device alone
 
-54 unit tests cover the parts that can be checked without a network. 41 of them
-are the extractor's pure logic: HLS attribute and playlist parsing, byte-range
-continuation, IV derivation, YouTube URL shapes, page-scraping precedence, and
-the whole preset → format decision table.
-
-The other 13 are the relay. `relay/worker.js` is a plain module with a
+The unit tests cover what needs no network: HLS attribute and playlist parsing,
+byte-range continuation, IV derivation, YouTube URL shapes, page-scraping
+precedence, the whole preset → format decision table, and the InnerTube fetch
+wrapper. The relay is in there too — `relay/worker.js` is a plain module with a
 `fetch(request, env)` export and nothing Workers-specific inside, so `node
---test` calls it directly with a stubbed upstream — which makes the headers it
-chooses to forward directly observable. Covered: preflight reflection, the host
-allow-list (including that `youtube.com.evil.example` does not pass the suffix
-match), the origin allow-list, the refusal of `file://`, loopback, RFC1918 and
-`169.254.169.254`, that cookies and `Authorization` cross in neither direction,
-that a `Range` request and its `206` survive, and that a dead upstream is a 502
-rather than a crash.
+--test` calls it directly with a stubbed upstream, which makes the headers it
+chooses to forward directly observable. Endpoint detection is covered with a
+stubbed fetch: each kind of helper, the refusals, and the sentences that follow.
 
-Then `npm run test:e2e`, which drives a real headless Chromium with the app on
-one origin and the media on another, so the CORS path under test is the real
-one. All 21 checks pass:
+`npm run test:e2e` then drives a real headless Chromium with the app on one
+origin and the media on another, so the CORS path under test is the real one:
 
 - A progressive MP4 arrives byte-identical to the source, and the 32 MB
   converter is never requested — verified on the wire, not assumed.
@@ -649,43 +681,71 @@ one. All 21 checks pass:
   comes back as AAC in an MP4 container with the video dropped.
 - A plain HTML page's `og:video` is found, fetched, and named after the page,
   and its `og:image` arrives in the MP3 as an attached cover.
-- A YouTube link with no relay fails with a sentence naming the reason, not a
-  stack trace.
+- A YouTube link with no helper fails with a sentence naming the reason.
 - A finished row survives a reload with its Save button intact, because the file
   is in OPFS.
-- No uncaught errors in the page across all of it.
+
+### The split
+
+`npm run test:split` puts a media host that sends no CORS headers behind a
+server that has no ffmpeg and exposes only `/api/resolve` and `/api/tunnel`,
+with an access key on both. It proves the client half of the arrangement:
+
+- A link the page cannot make sense of falls through to the server, which names
+  the formats; the preview shows the title the server reported.
+- An already-merged file comes back **byte-identical through the tunnel**, and
+  no media file is ever served to the page's own origin.
+- A video-only and an audio-only track are fetched separately and merged on the
+  device by ffmpeg.wasm; an HLS ladder the server found is fetched segment by
+  segment and remuxed.
+- Audio extraction and tagging happen on the device too.
+- The server is never asked to run a job, the tunnel refuses a request with no
+  key, and it refuses a host no resolve ever named.
+
+The server half — the shape `/api/resolve` returns, which formats are dropped,
+the client ladder on a bot wall, the headers the tunnel carries and the ones it
+strips, range requests, and the access key on both — is covered by the Python
+tests.
 
 ### As deployed
 
-`npm run test:deployed` covers what only happens on a real static host, neither
-of which the suite above touches — it runs over plain HTTP, where the service
-worker never registers, and against a host that answers the API. 26 checks
-pass:
+`npm run test:deployed` covers what only happens on a real static host: HTTPS,
+where the service worker actually registers, and a `/siphon/` subpath. Among
+the 35 checks: a first visit to a host with no API lands on a screen that
+works; a first visit to a host that answers `/api/health` recognises your own
+server; settings written by the older three-mode version are migrated, each
+one to the right helper, with the unrelated preferences intact; a deploy
+landing under a returning visitor replaces the old worker and its cache and
+renders the new app; with the network cut the shell still opens; and the
+settings sheet, driven the way a person drives it — one address, an
+unreachable one refused with its reason on screen and the sheet left open, a
+siphon server recognised from its address alone with the cookie jar appearing
+beside it, all of it surviving a reload, and nothing scrolling sideways at
+phone width.
 
-- A first visit to a host with no `/api/health` lands in browser mode, with a
-  header that says it is ready rather than a notice telling the visitor to go
-  and configure something.
-- A first visit to a host that *does* answer keeps server mode and names the
-  yt-dlp it found, so the container setup does not regress.
-- A mode the user already chose is never overridden, in any of the three.
-- A deploy landing under a returning visitor: the previous worker and its cache
-  are replaced, the old cache is swept, and the new app renders rather than the
-  cached old one — on that visit and the next.
-- With the network cut, the shell still opens, which is the only reason the
-  worker exists.
-- The settings sheet, driven the way a person drives it: every mode shows its
-  own fields and no others, the cookie jar appears only for the server we run
-  ourselves, **Test** names the missing relay rather than showing a green light
-  that means nothing, the choice survives a reload, and nothing scrolls sideways
-  at phone width.
+### YouTube, and what is still unproven
 
-**Not verified here:** how YouTube itself answers. The environment this was
-built in cannot reach YouTube or a CDN at all — the egress gateway refuses the
-connection — so the InnerTube client and the signature solving were written
-against youtubei.js's documented behaviour and reviewed, not run. The relay's
-own decisions are covered by the tests above; what is untested is the reply
-coming back. No emulator would have helped: the block is a network policy, and
-CORS would apply identically inside one anyway.
+The `youtube` job runs the whole thing against the real site on a GitHub
+runner. It is informative rather than gating, and running it found three real
+bugs in code that had never met the live service: the Node relay forwarded a
+`content-encoding` header over a body `fetch` had already decoded, so every
+client waited forever for a gzip stream; it streamed POST bodies as
+`transfer-encoding: chunked`, which Google's frontends refuse; and the
+InnerTube fetch wrapper dropped the library's own request init, sending
+`/player` a body with no session context at all. All three are fixed and
+covered.
+
+What the job reports now is YouTube's own answer, and on a datacentre IP that
+answer is **"Sign in to confirm you're not a bot"** — from hand-built requests,
+from youtubei.js driven in Node, and from the browser through the relay alike.
+`npm run test:innertube` asks that question directly from whatever machine you
+run it on, which is the baseline a red is read against.
+
+**So this is not verified:** a completed YouTube download from the browser
+mode. The code is correct up to the wall, checked request by request, but no
+machine available here has an IP YouTube will answer. From a home connection —
+`node relay/serve.mjs` on your own machine, its address in settings — that is
+the case the fix is for, and it is the one measurement still missing.
 
 ## Licence
 

@@ -86,7 +86,7 @@ async function session({ bridge }) {
   page.on('pageerror', (error) => errors.push(error.message));
 
   await page.addInitScript((coreUrl) => {
-    localStorage.setItem('siphon:settings', JSON.stringify({ mode: 'browser', preset: 'video_best', subs: 'off', relayUrl: '', pipedUrl: '', coreUrl }));
+    localStorage.setItem('siphon:settings', JSON.stringify({ endpoint: '', key: '', helper: { kind: 'none', label: 'this device only' }, preset: 'video_best', subs: 'off', coreUrl }));
     localStorage.setItem('siphon:install-dismissed', '1');
   }, process.env.SIPHON_CORE_URL || '');
 

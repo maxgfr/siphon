@@ -48,6 +48,7 @@ jobs:
       - run: npm run test:e2e
       - run: npm run test:deployed
       - run: npm run test:bridge
+      - run: npm run test:split
 
   # Informative, not gating. A runner is a datacentre IP, and whether YouTube
   # answers one on a given day is YouTube's decision, not this code's — a red

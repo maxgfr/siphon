@@ -1,21 +1,24 @@
 /**
- * The three ways this app can actually get a file, behind one interface.
+ * How a link becomes a file, behind one interface.
  *
- * Every backend answers the same four questions — are you there, what is this
- * link, start a download, how is it going — so app.js never branches on which
- * one is in use. Where they genuinely differ:
+ * There is one backend, `Siphon`, and it decides per link. Underneath it are
+ * the three things that can actually fetch — this device, your own server, a
+ * cobalt instance — and the decision is the same short rule every time:
  *
- *   server    runs yt-dlp; a job to poll, every site yt-dlp knows
- *   browser   runs the extractor in this page; a job to poll, no server at all
- *   public    asks a cobalt instance; one URL back, the browser downloads it
+ *   a server with ffmpeg does everything, because yt-dlp with your cookies is
+ *   the most capable thing on offer;
+ *   otherwise this device does everything it can, and asks for help only where
+ *   a page cannot go — a server that only resolves, an instance, a relay.
  *
- * The third has no progress to report, and the second cannot reach hosts that
- * refuse cross-origin reads. `supports*` flags say so rather than each caller
- * knowing which is which.
+ * app.js sees four questions — are you there, what is this link, start a
+ * download, how is it going — and never which of the three answered.
  */
 export { BackendError } from './errors.js';
 import { BackendError } from './errors.js';
 import { BrowserBackend } from './inbrowser.js';
+import { pipedResolver } from './extract.js';
+import { relayEscape } from './net.js';
+export { detectEndpoint, privacyNote, describeEndpoint } from './endpoint.js';
 
 /** The qualities the UI offers. The server validates against its own copy. */
 export const PRESETS = Object.freeze([
@@ -107,6 +110,17 @@ export class ServerBackend {
 
   probe(url) {
     return this.#json('/api/probe', { method: 'POST', body: JSON.stringify({ url }) });
+  }
+
+  /** The formats behind a link, from yt-dlp, for this page to download itself. */
+  resolve(url) {
+    return this.#json('/api/resolve', { method: 'POST', body: JSON.stringify({ url }) });
+  }
+
+  /** This server as an escape: it carries the bytes of hosts it just resolved. */
+  get escape() {
+    const headers = this.key ? { Authorization: `Bearer ${this.key}` } : {};
+    return { name: 'tunnel', via: (url) => `${this.base}/api/tunnel?url=${encodeURIComponent(url)}`, headers };
   }
 
   async start(url, preset, { playlist = false, subs = 'off', subLangs = 'en' } = {}) {
@@ -252,9 +266,125 @@ export class PublicBackend {
 
 export { BrowserBackend };
 
-/** Build whichever backend the saved settings describe. */
+/** A siphon server as a resolver: every site yt-dlp knows, with your cookies. */
+function serverResolver(server) {
+  return {
+    name: 'server',
+    generic: true,
+    resolve: (url) => server.resolve(url),
+  };
+}
+
+/* ------------------------------------------------------------------- siphon */
+
+/**
+ * The one backend.
+ *
+ * `helper` is what the address in settings turned out to be (see endpoint.js):
+ * nothing, a siphon server (with or without ffmpeg), a cobalt instance, a
+ * Piped instance, a relay. Everything below follows from that one fact.
+ */
+export class Siphon {
+  constructor({ endpoint = '', key = '', helper = null, coreUrl = '' } = {}) {
+    this.helper = helper || { kind: 'none', label: 'this device only' };
+    const kind = this.helper.kind;
+
+    this.server = kind === 'siphon' ? new ServerBackend({ base: endpoint, key }) : null;
+    this.instance = kind === 'cobalt' ? new PublicBackend({ base: endpoint, key }) : null;
+    /** Whether the server takes the whole job. */
+    this.full = Boolean(this.server && this.helper.ffmpeg !== false);
+
+    this.device = new BrowserBackend({
+      coreUrl,
+      escape: this.server ? this.server.escape : kind === 'relay' ? relayEscape(endpoint) : null,
+      resolvers: [this.server ? serverResolver(this.server) : null, kind === 'piped' ? pipedResolver(endpoint) : null],
+    });
+
+    this.supportsProgress = true;
+    this.supportsProbe = true;
+    this.supportsPlaylist = this.full;
+    /** @type {Map<string, object>} which backend owns a job id */
+    this.owners = new Map();
+  }
+
+  /** Where a job id came from, including ones started before a reload. */
+  #owner(id) {
+    return this.owners.get(id) || (String(id).startsWith('b-') ? this.device : this.server || this.device);
+  }
+
+  async health() {
+    if (this.full) {
+      const info = await this.server.health();
+      return { ...info, label: `${info.label} · your server` };
+    }
+    const info = await this.device.health();
+    const suffix = {
+      siphon: 'your server resolves',
+      cobalt: `${this.helper.label} for the rest`,
+      piped: 'Piped for YouTube',
+      relay: 'relay for hosts that refuse',
+      none: 'no helper',
+    }[this.helper.kind] || 'no helper';
+    return { ...info, label: `${info.label} · ${suffix}` };
+  }
+
+  async probe(url) {
+    if (this.full) return this.server.probe(url);
+    try {
+      return await this.device.probe(url);
+    } catch (error) {
+      // An instance offers no metadata, so a link only it can take shows no
+      // preview — and that is not a failure.
+      if (this.instance) return null;
+      throw error;
+    }
+  }
+
+  async start(url, preset, options = {}) {
+    if (this.full) {
+      const started = await this.server.start(url, preset, options);
+      this.owners.set(started.id, this.server);
+      return started;
+    }
+    try {
+      // identify() is what throws when the device has no way in; start() would
+      // fail later, inside the job, where an instance can no longer take over.
+      await this.device.identify(url);
+    } catch (error) {
+      if (this.instance) return this.instance.start(url, preset, options);
+      throw error;
+    }
+    const started = await this.device.start(url, preset, options);
+    this.owners.set(started.id, this.device);
+    return started;
+  }
+
+  poll(id) {
+    return this.#owner(id).poll(id);
+  }
+
+  fileUrl(id) {
+    return this.#owner(id).fileUrl(id);
+  }
+
+  cancel(id) {
+    const owner = this.#owner(id);
+    this.owners.delete(id);
+    return owner.cancel?.(id) || Promise.resolve();
+  }
+
+  putCookies(text) {
+    if (!this.server) throw new BackendError('Cookies only apply to your own server.');
+    return this.server.putCookies(text);
+  }
+
+  dropCookies() {
+    if (!this.server) throw new BackendError('Cookies only apply to your own server.');
+    return this.server.dropCookies();
+  }
+}
+
+/** Build the backend the saved settings describe. */
 export function makeBackend(settings) {
-  if (settings.mode === 'public') return new PublicBackend({ base: settings.publicUrl, key: settings.publicKey });
-  if (settings.mode === 'browser') return new BrowserBackend({ relay: settings.relayUrl, coreUrl: settings.coreUrl, piped: settings.pipedUrl });
-  return new ServerBackend({ base: settings.serverUrl, key: settings.serverKey });
+  return new Siphon({ endpoint: settings.endpoint, key: settings.key, helper: settings.helper, coreUrl: settings.coreUrl });
 }

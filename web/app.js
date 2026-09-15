@@ -11,21 +11,20 @@
  * primary action pinned within thumb reach, and no interaction that needs a
  * hover or a precise tap.
  */
-import { PRESETS, BackendError, makeBackend, ServerBackend } from './api.js';
+import { PRESETS, BackendError, makeBackend, detectEndpoint, privacyNote, describeEndpoint } from './api.js';
 
 const SETTINGS_KEY = 'siphon:settings';
 const POLL_MS = 700;
 
+const NO_HELPER = Object.freeze({ kind: 'none', label: 'this device only' });
+
 const DEFAULT_SETTINGS = Object.freeze({
-  mode: 'server',
-  serverUrl: '',
-  serverKey: '',
-  publicUrl: '',
-  publicKey: '',
-  // Browser mode: both optional. An empty relay is the honest default — it
-  // means "nothing but this device", and the hosts that need one say so.
-  relayUrl: '',
-  pipedUrl: '',
+  // One optional address, and what it turned out to be when it was saved.
+  // Empty is the honest default: this device, and the links that need more
+  // say so.
+  endpoint: '',
+  key: '',
+  helper: NO_HELPER,
   coreUrl: '',
   preset: 'video_best',
   subs: 'off',
@@ -53,30 +52,49 @@ const recent = [];
 function loadSettings() {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    return { settings: { ...DEFAULT_SETTINGS, ...JSON.parse(raw || '{}') }, firstVisit: !raw };
+    const saved = migrate(JSON.parse(raw || '{}'));
+    return { settings: { ...DEFAULT_SETTINGS, ...saved }, firstVisit: !raw };
   } catch {
     return { settings: { ...DEFAULT_SETTINGS }, firstVisit: true };
   }
 }
 
 /**
- * Which mode a brand-new visitor should land in.
+ * Settings saved by the version with three modes, carried into this one.
  *
- * `server` is only the right default when a server is actually there, which is
- * the case that matters: the container serves this page and the API from one
- * origin, and that setup must keep working with nothing configured. Anywhere
- * else — GitHub Pages, any static host — there is no server behind the page,
- * and defaulting to one means the first thing a visitor sees is a dead end
- * telling them to go and set something up. Browser mode works on arrival.
- *
- * The probe is one request, on the first visit only; the answer is saved.
+ * The address that mattered under the old mode becomes the helper; its kind
+ * is re-detected the next time the sheet is saved, and until then the old
+ * mode says enough to keep working.
  */
-async function pickInitialMode() {
+function migrate(saved) {
+  if (!saved || typeof saved !== 'object' || !('mode' in saved) || 'helper' in saved) return saved;
+  const { mode, serverUrl, serverKey, publicUrl, publicKey, relayUrl, pipedUrl, ...rest } = saved;
+  const picked =
+    mode === 'server'
+      ? { endpoint: serverUrl || '', key: serverKey || '', helper: { kind: 'siphon', label: 'yt-dlp', ffmpeg: true } }
+      : mode === 'public'
+        ? { endpoint: publicUrl || '', key: publicKey || '', helper: { kind: 'cobalt', label: 'cobalt', ffmpeg: true } }
+        : pipedUrl
+          ? { endpoint: pipedUrl, key: '', helper: { kind: 'piped', label: 'Piped instance' } }
+          : relayUrl
+            ? { endpoint: relayUrl, key: '', helper: { kind: 'relay', label: 'relay' } }
+            : { endpoint: '', key: '', helper: NO_HELPER };
+  return { ...rest, ...picked };
+}
+
+/**
+ * What a brand-new visitor gets: whatever answers at this page's own origin.
+ *
+ * The container serves this page and the API from one origin, and that setup
+ * must keep working with nothing configured. Anywhere else — GitHub Pages, any
+ * static host — nothing answers, and the device does it. One request, on the
+ * first visit only; the answer is saved.
+ */
+async function pickInitialHelper() {
   try {
-    await new ServerBackend({ base: '' }).health();
-    return 'server';
+    return await detectEndpoint('');
   } catch {
-    return 'browser';
+    return NO_HELPER;
   }
 }
 
@@ -541,50 +559,22 @@ async function restoreQueue() {
 
 /* ------------------------------------------------------------------ backend */
 
-const PRIVACY_NOTE = {
-  public: 'In public-instance mode, every link you paste is sent to that instance.',
-  server: 'Links go only to the server you configured. Nothing is sent anywhere else.',
-  browser: 'Downloads happen on this device. Links go to the site they point at, and nowhere else.',
-  browserRelay: 'Downloads happen on this device, except for hosts that refuse a web page — those go through your relay.',
-  browserPiped: 'Downloads happen on this device. YouTube links are sent to the Piped instance you configured.',
-};
-
 function applyBackend() {
   backend = makeBackend(settings);
-  $('privacyNote').textContent =
-    settings.mode === 'browser' && settings.pipedUrl
-      ? PRIVACY_NOTE.browserPiped
-      : settings.mode === 'browser' && settings.relayUrl
-        ? PRIVACY_NOTE.browserRelay
-        : PRIVACY_NOTE[settings.mode] || PRIVACY_NOTE.server;
+  $('privacyNote').textContent = privacyNote(settings.helper);
 }
 
 async function refreshBackendLabel() {
   const label = $('backendLabel');
-  label.textContent = 'checking server…';
+  label.textContent = 'checking…';
   try {
     const info = await backend.health();
-    const where = { public: 'public instance', browser: 'no server', server: 'your server' }[settings.mode];
-    label.textContent = info.ffmpeg === false ? `${info.label} · no ffmpeg` : `${info.label} · ${where}`;
-    if (info.ffmpeg === false) {
-      renderFeedback(
-        '<div class="notice"><p><strong>ffmpeg is missing on that server.</strong> ' +
-          'Audio conversion and merged high-quality video will fail until it is installed.</p></div>',
-      );
-    }
+    label.textContent = info.label;
   } catch (error) {
-    label.textContent = 'no server — open settings';
-    if (settings.mode === 'server' && !settings.serverUrl) {
-      renderFeedback(
-        '<div class="notice"><p><strong>No server set up yet.</strong> ' +
-          'Point this at one in settings — or switch to <strong>In this browser</strong>, ' +
-          'which needs nothing at all for direct files and HLS streams.</p>' +
-          '<button class="retry" type="button" id="openFromNotice">Open settings</button></div>',
-      );
-      $('openFromNotice')?.addEventListener('click', openSettings);
-    } else {
-      showError(error);
-    }
+    // The helper is not answering. The device still works on its own, so this
+    // is a note on the header, not a wall across the screen.
+    label.textContent = `${settings.helper.label} unreachable — open settings`;
+    showError(error);
   }
 }
 
@@ -631,30 +621,21 @@ async function runProbe(url) {
 /* ----------------------------------------------------------------- settings */
 
 function openSettings() {
-  for (const input of document.querySelectorAll('input[name="mode"]')) input.checked = input.value === settings.mode;
-  $('serverUrl').value = settings.serverUrl;
-  $('serverKey').value = settings.serverKey;
-  $('publicUrl').value = settings.publicUrl;
-  $('publicKey').value = settings.publicKey;
-  $('relayUrl').value = settings.relayUrl;
-  $('pipedUrl').value = settings.pipedUrl;
+  $('endpoint').value = settings.endpoint;
+  $('endpointKey').value = settings.key;
   $('coreUrl').value = settings.coreUrl;
-  syncSettingsFields();
-  setStatus('', 'Not checked yet');
+  reflectHelper(settings.helper);
   $('settings').showModal();
 }
 
-function syncSettingsFields() {
-  const mode = draftMode();
-  $('serverFields').hidden = mode !== 'server';
-  $('browserFields').hidden = mode !== 'browser';
-  $('publicFields').hidden = mode !== 'public';
+/** Show, in the sheet, what a helper is and what follows from it. */
+function reflectHelper(helper) {
+  setStatus(helper.kind === 'none' ? '' : 'ok', describeEndpoint(helper));
   // Only our own server has a cookie store to write to.
-  $('cookiesBlock').hidden = mode !== 'server';
+  $('cookiesBlock').hidden = helper.kind !== 'siphon';
+  if (helper.kind === 'siphon') setCookieState(helper.hasCookies === true);
+  showPhoneHint(helper.lanUrls || []);
 }
-
-/** Whichever mode radio is checked, without this file having to list them. */
-const draftMode = () => document.querySelector('input[name="mode"]:checked')?.value || DEFAULT_SETTINGS.mode;
 
 function setStatus(kind, text) {
   $('statusDot').className = `dot${kind ? ` ${kind}` : ''}`;
@@ -664,41 +645,32 @@ function setStatus(kind, text) {
 function draftSettings() {
   return {
     ...settings,
-    mode: draftMode(),
-    serverUrl: $('serverUrl').value.trim(),
-    serverKey: $('serverKey').value.trim(),
-    publicUrl: $('publicUrl').value.trim(),
-    publicKey: $('publicKey').value.trim(),
-    relayUrl: $('relayUrl').value.trim(),
-    pipedUrl: $('pipedUrl').value.trim(),
+    endpoint: $('endpoint').value.trim().replace(/\/+$/, ''),
+    key: $('endpointKey').value.trim(),
     coreUrl: $('coreUrl').value.trim(),
   };
 }
 
-async function testConnection() {
+/**
+ * Find out what the address in the sheet is. Returns the helper, or null with
+ * the reason shown in the status line.
+ */
+async function probeDraft() {
   setStatus('', 'Checking…');
   const draft = draftSettings();
-  if (draft.mode === 'browser') {
-    // There is nothing to reach, so the useful answer is what this device can
-    // and cannot do rather than a green light that means nothing.
-    setStatus('ok', draft.pipedUrl
-      ? 'Ready — a Piped instance is set, so YouTube goes through it'
-      : draft.relayUrl
-        ? 'Ready — relay set, so YouTube can be tried too'
-        : 'Ready — hosts that allow it only, no relay or instance set');
-    showPhoneHint([]);
-    return;
-  }
   try {
-    const info = await makeBackend(draft).health();
-    setStatus('ok', `Reachable — ${info.label}${info.ffmpeg === false ? ', but no ffmpeg' : ''}`);
-    showPhoneHint(info.lanUrls || []);
-    setCookieState(info.hasCookies === true);
+    const helper = await detectEndpoint(draft.endpoint, draft.key);
+    reflectHelper(helper);
+    return helper;
   } catch (error) {
-    setStatus('bad', error instanceof BackendError ? error.message : 'Could not reach it.');
+    setStatus('bad', error?.message || 'Could not reach it.');
+    $('cookiesBlock').hidden = true;
     showPhoneHint([]);
+    return null;
   }
 }
+
+const testConnection = probeDraft;
 
 /**
  * Answer "how do I use this from my phone?" with the actual address, rather
@@ -738,9 +710,9 @@ async function uploadCookies(file) {
   result.textContent = 'Uploading…';
   try {
     const text = await file.text();
-    const backend = makeBackend(draftSettings());
-    if (!backend.putCookies) throw new BackendError('Cookies only apply to your own server.');
-    const info = await backend.putCookies(text);
+    // The block is only shown once the address proved to be a siphon server.
+    const target = makeBackend({ ...draftSettings(), helper: { kind: 'siphon', label: 'yt-dlp', ffmpeg: true } });
+    const info = await target.putCookies(text);
     setCookieState(true, `Stored ${formatBytes(info.bytes)} of cookies. YouTube downloads will use your session.`);
   } catch (error) {
     setCookieState(false, error instanceof BackendError ? error.message : 'Could not store that file.');
@@ -749,7 +721,7 @@ async function uploadCookies(file) {
 
 async function removeCookies() {
   try {
-    await makeBackend(draftSettings()).dropCookies();
+    await makeBackend({ ...draftSettings(), helper: { kind: 'siphon', label: 'yt-dlp', ffmpeg: true } }).dropCookies();
     setCookieState(false, 'Removed.');
   } catch (error) {
     $('cookiesResult').textContent = error instanceof BackendError ? error.message : 'Could not remove them.';
@@ -821,7 +793,7 @@ function syncSubFields() {
   $('subLangsField').hidden = !wanted;
   // Better to say the setting will be ignored than to hand back a file that
   // quietly has no subtitles in it.
-  $('subsUnsupported').hidden = !(wanted && settings.mode === 'browser');
+  $('subsUnsupported').hidden = !(wanted && !backend?.full);
 }
 
 /**
@@ -853,6 +825,10 @@ function readSharedUrl() {
 function init() {
   const loaded = loadSettings();
   settings = loaded.settings;
+  // Normalise what is stored: a settings blob written by an older version is
+  // migrated on read, and leaving that only in memory means every reload does
+  // it again and nothing else ever sees the current shape.
+  if (!loaded.firstVisit) saveSettings();
   applyBackend();
   renderQualities();
   renderAction();
@@ -919,16 +895,11 @@ function init() {
 
   $('openSettings').addEventListener('click', openSettings);
   $('closeSettings').addEventListener('click', () => $('settings').close());
-  for (const input of document.querySelectorAll('input[name="mode"]')) {
-    input.addEventListener('change', syncSettingsFields);
-  }
   $('useLocalhost').addEventListener('click', () => {
     // 8000 is what docker-compose publishes, so this is the right guess far
     // more often than not — and it is one tap instead of typing a URL on a
     // keyboard that wants to autocapitalise it.
-    $('serverUrl').value = 'http://127.0.0.1:8000';
-    $('modeServer').checked = true;
-    syncSettingsFields();
+    $('endpoint').value = 'http://127.0.0.1:8000';
     testConnection();
   });
 
@@ -936,8 +907,12 @@ function init() {
   $('cookiesClear').addEventListener('click', removeCookies);
 
   $('testConnection').addEventListener('click', testConnection);
-  $('saveSettings').addEventListener('click', () => {
-    settings = draftSettings();
+  $('saveSettings').addEventListener('click', async () => {
+    // Saving is what settles what the address is; an address that cannot be
+    // reached is not saved, and the reason stays on screen.
+    const helper = await probeDraft();
+    if (!helper) return;
+    settings = { ...draftSettings(), helper };
     saveSettings();
     applyBackend();
     $('settings').close();
@@ -973,7 +948,7 @@ function init() {
  */
 async function boot(firstVisit) {
   if (firstVisit) {
-    settings.mode = await pickInitialMode();
+    settings.helper = await pickInitialHelper();
     saveSettings();
     applyBackend();
     syncSubFields();
