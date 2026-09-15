@@ -17,7 +17,7 @@ import { BackendError } from './errors.js';
 import { Fetcher } from './net.js';
 import { extract, planDownload, safeFilename, MIME_FOR } from './extract.js';
 import { parseMedia, segmentIv } from './m3u8.js';
-import { ensureFfmpeg, isLoaded, mux, toAudio, remuxStream, setCoreUrl } from './media.js';
+import { ensureFfmpeg, isLoaded, mux, toAudio, setCoreUrl } from './media.js';
 import * as store from './store.js';
 
 /** Matches the server's default, and for the same reason: bounded disk use. */
@@ -43,15 +43,10 @@ export class BrowserBackend {
     this.cache = new Map();
     if (coreUrl) setCoreUrl(coreUrl);
 
-    // Clear out whatever a previous session left behind, but keep anything the
-    // restored queue still points at.
-    let keys = new Set();
-    try {
-      keys = new Set((JSON.parse(localStorage.getItem('siphon:queue') || '[]') || []).map((entry) => entry.id));
-    } catch {
-      /* no queue to protect */
-    }
-    store.sweep(FILE_TTL_MS, keys);
+    // Clear out whatever a previous session left behind. Nothing is spared:
+    // the server sweeps finished files on the same clock and a restored row
+    // whose file is gone says so, which is the behaviour being matched.
+    store.sweep(FILE_TTL_MS);
   }
 
   async health() {
@@ -283,11 +278,13 @@ async function runJob(backend, job) {
     };
 
     if (plan.op === 'copy') {
-      const video = fetched.find((item) => item.track === plan.video);
-      const audio = fetched.find((item) => item.track === plan.audio);
-      output = video && !audio && video.track.protocol === 'hls'
-        ? await remuxStream({ data: video.data, sourceExt: video.ext, ext: plan.ext, tags, onProgress })
-        : await mux({ video, audio, ext: plan.ext, tags, onProgress });
+      output = await mux({
+        video: fetched.find((item) => item.track === plan.video),
+        audio: fetched.find((item) => item.track === plan.audio),
+        ext: plan.ext,
+        tags,
+        onProgress,
+      });
     } else {
       const source = fetched[0];
       const cover = await coverArt(net, info, signal);

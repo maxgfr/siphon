@@ -136,7 +136,7 @@ Pages, run yt-dlp on the computer you are sitting at, and point one at the
 other:
 
 ```sh
-docker compose up -d                      # yt-dlp, on your machine, port 8000
+docker run -d -p 8000:8000 -v siphon:/tmp/siphon ghcr.io/maxgfr/siphon
 ```
 
 Then open the Pages URL, go to **Settings → Use this computer**, and Save.
@@ -256,16 +256,26 @@ any phone, anywhere.
 
 ## Quick start (local)
 
-Everything in one container — the image serves the interface *and* the API, so
-there is no CORS to configure and no second thing to deploy:
+One command. Nothing to clone, nothing to build:
 
 ```sh
-git clone https://github.com/maxgfr/siphon
-cd siphon
-docker compose up -d
+docker run -d -p 8000:8000 -v siphon:/tmp/siphon ghcr.io/maxgfr/siphon
 ```
 
 Open `http://localhost:8000`. That is the whole setup.
+
+The image serves the interface *and* the API from one origin, so there is no
+CORS to configure and no second thing to deploy. It is published for amd64 and
+arm64, so the same command works on an Apple Silicon Mac or a Raspberry Pi.
+
+`docker compose up -d` does the same thing with the settings in
+`docker-compose.yml` — a named volume, a restart policy, and somewhere obvious
+to put `AUTH_TOKEN`. It pulls the same image rather than building one. To build
+from source, which is what you want if you are changing the server:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
 
 To reach it from your phone, put it behind something with a real hostname and
 HTTPS — Tailscale, a Cloudflare tunnel, or a reverse proxy. **Browsers block a
@@ -463,7 +473,7 @@ npm test
 npm run test:e2e
 
 # the app as deployed — HTTPS, a /siphon/ subpath, the service worker actually
-# running, and a first visit to a host with no API behind it.
+# running, a first visit to a host with no API behind it, and the settings sheet.
 # Needs playwright and openssl.
 npm run test:deployed
 ```
@@ -544,10 +554,10 @@ one. All 21 checks pass:
 
 ### As deployed
 
-`npm run test:deployed` covers the two things that only happen on a real static
-host, neither of which the suite above touches — it runs over plain HTTP, where
-the service worker never registers, and against a host that answers the API.
-15 checks pass:
+`npm run test:deployed` covers what only happens on a real static host, neither
+of which the suite above touches — it runs over plain HTTP, where the service
+worker never registers, and against a host that answers the API. 26 checks
+pass:
 
 - A first visit to a host with no `/api/health` lands in browser mode, with a
   header that says it is ready rather than a notice telling the visitor to go
@@ -560,6 +570,11 @@ the service worker never registers, and against a host that answers the API.
   cached old one — on that visit and the next.
 - With the network cut, the shell still opens, which is the only reason the
   worker exists.
+- The settings sheet, driven the way a person drives it: every mode shows its
+  own fields and no others, the cookie jar appears only for the server we run
+  ourselves, **Test** names the missing relay rather than showing a green light
+  that means nothing, the choice survives a reload, and nothing scrolls sideways
+  at phone width.
 
 **Not verified here:** how YouTube itself answers. The environment this was
 built in cannot reach YouTube or a CDN at all — the egress gateway refuses the

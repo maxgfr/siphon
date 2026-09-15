@@ -194,7 +194,71 @@ for (const [mode, api] of [['public', false], ['browser', true], ['server', fals
   await context.close();
 }
 
-/* 4. A deploy landing under a returning visitor, worker and all. */
+/* 4. The settings sheet, driven the way a person drives it. */
+{
+  const { context, page } = await fresh();
+  await setApi(false);
+  await page.goto(APP, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(2000);
+  await page.click('#openSettings');
+  await page.waitForTimeout(300);
+
+  const modes = await page.locator('.mode input[name="mode"]').count();
+  check('settings offers every mode', modes === 3, String(modes));
+
+  // Each mode shows its own fields and nothing else — the cookie jar in
+  // particular belongs only to the server we run ourselves.
+  for (const [mode, visible] of [['browser', 'browserFields'], ['public', 'publicFields'], ['server', 'serverFields']]) {
+    await page.check(`input[name="mode"][value="${mode}"]`);
+    const state = await page.evaluate(
+      (shown) => ({
+        shown: document.getElementById(shown).hidden,
+        others: ['serverFields', 'browserFields', 'publicFields']
+          .filter((id) => id !== shown)
+          .every((id) => document.getElementById(id).hidden),
+        cookies: document.getElementById('cookiesBlock').hidden,
+      }),
+      visible,
+    );
+    check(`"${mode}" shows its own fields and no others`, state.shown === false && state.others, JSON.stringify(state));
+    check(`"${mode}" handles the cookie jar correctly`, state.cookies === (mode !== 'server'));
+  }
+
+  // Test has nothing to reach in browser mode, so it must say something true.
+  await page.check('input[name="mode"][value="browser"]');
+  await page.click('#testConnection');
+  await page.waitForTimeout(400);
+  check('Test names the missing relay', /no relay set/i.test((await page.textContent('#statusText')) || ''),
+    (await page.textContent('#statusText')) || '');
+
+  await page.fill('#relayUrl', 'https://relay.example.workers.dev');
+  await page.click('#saveSettings');
+  await page.waitForTimeout(600);
+  check('the privacy note follows the relay', /relay/i.test((await page.textContent('#privacyNote')) || ''));
+
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForTimeout(1500);
+  await page.click('#openSettings');
+  await page.waitForTimeout(300);
+  const kept = await page.evaluate(() => ({
+    mode: document.querySelector('input[name="mode"]:checked')?.value,
+    relay: document.getElementById('relayUrl').value,
+  }));
+  check('the mode and relay survive a reload', kept.mode === 'browser' && kept.relay.includes('workers.dev'), JSON.stringify(kept));
+
+  // Phone width is what this app is for; the sheet must not scroll sideways.
+  const overflow = await page.evaluate(() => {
+    const sheet = document.querySelector('.sheet-inner');
+    return Math.max(
+      document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      sheet ? sheet.scrollWidth - sheet.clientWidth : 0,
+    );
+  });
+  check('the settings sheet does not scroll sideways at phone width', overflow <= 0, `${overflow}px over`);
+  await context.close();
+}
+
+/* 5. A deploy landing under a returning visitor, worker and all. */
 {
   const { context, page } = await fresh();
   await setApi(false);
@@ -222,7 +286,7 @@ for (const [mode, api] of [['public', false], ['browser', true], ['server', fals
   await page.waitForTimeout(2000);
   check('and still on the visit after that', (await page.locator('#modeBrowser').count()) === 1);
 
-  /* 5. Offline, which is the only reason the worker exists at all. */
+  /* 6. Offline, which is the only reason the worker exists at all. */
   await context.setOffline(true);
   let broke = null;
   try {

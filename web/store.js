@@ -80,14 +80,13 @@ export async function drop(key) {
  * browser evicts the whole origin's storage — which on iOS takes the settings
  * and the queue with it.
  */
-export async function sweep(ttlMs, keep = new Set()) {
+export async function sweep(ttlMs) {
   const folder = await directory();
   if (!folder?.entries) return;
   const cutoff = Date.now() - ttlMs;
   try {
     for await (const [name, handle] of folder.entries()) {
       if (handle.kind !== 'file') continue;
-      if (keep.has(name)) continue;
       const file = await handle.getFile().catch(() => null);
       if (!file || file.lastModified > cutoff) continue;
       await folder.removeEntry(name).catch(() => {});

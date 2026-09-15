@@ -627,9 +627,7 @@ async function runProbe(url) {
 /* ----------------------------------------------------------------- settings */
 
 function openSettings() {
-  $('modeServer').checked = settings.mode === 'server';
-  $('modeBrowser').checked = settings.mode === 'browser';
-  $('modePublic').checked = settings.mode === 'public';
+  for (const input of document.querySelectorAll('input[name="mode"]')) input.checked = input.value === settings.mode;
   $('serverUrl').value = settings.serverUrl;
   $('serverKey').value = settings.serverKey;
   $('publicUrl').value = settings.publicUrl;
@@ -650,7 +648,8 @@ function syncSettingsFields() {
   $('cookiesBlock').hidden = mode !== 'server';
 }
 
-const draftMode = () => ($('modeBrowser').checked ? 'browser' : $('modePublic').checked ? 'public' : 'server');
+/** Whichever mode radio is checked, without this file having to list them. */
+const draftMode = () => document.querySelector('input[name="mode"]:checked')?.value || DEFAULT_SETTINGS.mode;
 
 function setStatus(kind, text) {
   $('statusDot').className = `dot${kind ? ` ${kind}` : ''}`;
@@ -910,9 +909,9 @@ function init() {
 
   $('openSettings').addEventListener('click', openSettings);
   $('closeSettings').addEventListener('click', () => $('settings').close());
-  $('modeServer').addEventListener('change', syncSettingsFields);
-  $('modeBrowser').addEventListener('change', syncSettingsFields);
-  $('modePublic').addEventListener('change', syncSettingsFields);
+  for (const input of document.querySelectorAll('input[name="mode"]')) {
+    input.addEventListener('change', syncSettingsFields);
+  }
   $('useLocalhost').addEventListener('click', () => {
     // 8000 is what docker-compose publishes, so this is the right guess far
     // more often than not — and it is one tap instead of typing a URL on a
