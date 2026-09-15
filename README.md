@@ -559,20 +559,31 @@ npm run test:deployed
 # Needs playwright and ffmpeg.
 npm run test:bridge
 
+# what YouTube's API says to a bare request from this machine — one hand-built
+# call per client, then the same through youtubei.js, no browser, no relay.
+# The baseline a red below is read against.
+npm run test:innertube
+
 # YouTube, for real, through the local relay. Needs a network that reaches
 # youtube.com; runs in CI, where it is informative rather than gating.
 npm run test:youtube
 ```
 
 All of it runs on every pull request. `fast` (the server suite and the unit
-tests) and `browser` (the two Playwright suites) gate the merge. `youtube` does
-not: a runner is a datacentre IP, and whether YouTube answers one on a given
-day is YouTube's decision, not this code's. A red there says *look*, never *do
-not merge* — and it names the client that got through or the exact refusal.
+tests) and `browser` (the three Playwright suites) gate the merge. `youtube`
+does not: a runner is a datacentre IP, and whether YouTube answers one on a
+given day is YouTube's decision, not this code's. A red there says *look*,
+never *do not merge* — and the log says exactly why: every step announces
+itself, every refusal is printed with its body, and the probe that runs first
+shows what YouTube says to that machine with nothing of ours in between. As of
+this writing that answer, on a GitHub runner, is "Sign in to confirm you're
+not a bot" for every client — the wall the relay section above describes,
+seen from inside it.
 
 The frontend has no build step and no dependencies: plain ES modules, no
-framework, no bundler. Edit and reload. `package.json` exists only so
-`node --test` can reach the extractor; nothing in `web/` imports from it.
+framework, no bundler. Edit and reload. `package.json` carries only the test
+tooling — Playwright for the browser suites, youtubei.js for the probe —
+and nothing in `web/` imports from it.
 
 Tests live in `tests/`, not under `web/`, because the Pages workflow publishes
 that whole directory — anything left in it is served to the public site.
