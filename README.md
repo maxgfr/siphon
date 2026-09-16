@@ -283,8 +283,8 @@ with real network, by asking each candidate exactly what the page asks:
   instance's media through it;
 - **cobalt instances**: the directory at [cobalt.directory](https://cobalt.directory/)
   (and, behind its browser challenge, the opt-in list its
-  [repository](https://codeberg.org/hyperdefined/cobalt.directory) is built
-  from) — each instance listed as up for YouTube is sent the sample link as
+  [repository](https://codeberg.org/hyperdefined/cobalt.directory) keeps at
+  `backend/instances`) — each instance listed as up for YouTube is sent the sample link as
   the app would send it, and the first whose tunnel streams bytes is kept.
 
 The first that passes is written in and Pages redeploys; nothing passing

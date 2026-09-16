@@ -201,11 +201,13 @@ no   directory https://cobalt.directory/api/tests: HTTP 403 — <!DOCTYPE html>�
 ```
 
 That is a browser challenge, served to anything that is not a browser. The run
-now reads the list the site is built from — the instances that asked to be
-listed, one file each under `backend/instances` in
-[its repository](https://codeberg.org/hyperdefined/cobalt.directory), through
-Codeberg's plain API — and names each directory and the source with what it
-said. `cobalt.tools` itself is keyed, Turnstile-gated and blocked by YouTube.
+now reads the list the site is built from — the opt-in list
+[its repository](https://codeberg.org/hyperdefined/cobalt.directory) keeps at
+`backend/instances`, through Codeberg's plain API — and names each directory
+and the source with what it said. The third measurement reached that file
+(the API answered it with its content, where a folder had been expected) and
+the reader was taught its shape; the next log says what it lists.
+`cobalt.tools` itself is keyed, Turnstile-gated and blocked by YouTube.
 
 ## What follows
 

@@ -140,11 +140,11 @@ export async function evaluate(relay, { fetchImpl = globalThis.fetch, instances 
 export const COBALT_DIRECTORIES = [COBALT_DIRECTORY, 'https://cobalt.directory/api/tests'];
 export { COBALT_DIRECTORY };
 /**
- * The directory's own source, behind it: the instances that asked to be
- * listed, one file each under backend/instances in its repository on
- * Codeberg. The site answers anything that is not a browser with a
- * challenge page (measured: HTTP 403 "Just a moment..."); the repository
- * answers plainly, and it is the same opt-in list the site tests.
+ * The directory's own source, behind it: the opt-in list its repository on
+ * Codeberg keeps at backend/instances — measured to be one file there, read
+ * whether it is one file or a folder of them. The site answers anything that
+ * is not a browser with a challenge page (measured: HTTP 403 "Just a
+ * moment..."); the repository's API answers plainly.
  */
 export const COBALT_SOURCE = 'https://codeberg.org/api/v1/repos/hyperdefined/cobalt.directory/contents/backend/instances';
 export const WATCH = `https://www.youtube.com/watch?v=${VIDEO_ID}`;
@@ -161,20 +161,36 @@ export function cobaltCandidates(body, { limit = 12 } = {}) {
 }
 
 /**
- * One file of the source → something cobaltEntries can read: the JSON when
- * it parses, otherwise the `api` line of whatever text format it is in.
+ * One file of the source → the entries it lists. JSON is read as the
+ * directory's own answer would be; anything else is read line by line — a
+ * hostname or an address per line, or an `api = …` line, comments dropped —
+ * which is what a plain list of instances looks like in any text format.
  */
-export function sourceEntry(text) {
+export function sourceEntries(text) {
+  let body = null;
   try {
-    return JSON.parse(text);
+    body = JSON.parse(text);
   } catch {
-    /* not JSON: TOML, YAML, .env — the api line is enough */
+    /* not JSON: a list, TOML, YAML, .env */
   }
-  const match = String(text || '').match(/\bapi(?:_url|Url)?\b["']?\s*[:=]\s*["']?((?:https?:\/\/)?[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?(?:\/[^\s"']*)?)/i);
-  return match ? { api: match[1] } : null;
+  if (body !== null && typeof body === 'object') return cobaltEntries(body);
+  const entries = [];
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const line = raw.replace(/\s+(#|\/\/).*$/, '').trim();
+    if (!line || /^(#|\/\/|;)/.test(line)) continue;
+    const keyed = /^["']?api(?:_url|Url)?["']?\s*[:=]\s*["']?((?:https?:\/\/)?[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?(?:\/[^\s"',]*)?)/i.exec(line);
+    const bare = /^(?:https?:\/\/)?[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?(?:\/\S*)?$/i.test(line);
+    const address = keyed ? keyed[1] : bare ? line : null;
+    if (address) entries.push(...cobaltEntries([address]));
+  }
+  return entries;
 }
 
-/** The source repository's listing, then every file in it, read as entries. */
+/**
+ * The source: what the repository's API answers for that path — a folder
+ * (an array of files) or one file (an object carrying its content) — then
+ * every file's text, read as entries.
+ */
 export async function fromSource({ fetchImpl = globalThis.fetch, say = () => {}, source = COBALT_SOURCE, limit = 12, files = 40 } = {}) {
   const ask = (url) => fetchImpl(url, { headers: { Accept: 'application/json', 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(20_000) });
   let listing;
@@ -192,17 +208,26 @@ export async function fromSource({ fetchImpl = globalThis.fetch, say = () => {},
     } catch {
       body = null;
     }
-    listing = (Array.isArray(body) ? body : []).filter((f) => f && f.type === 'file' && typeof f.download_url === 'string').slice(0, files);
+    const isFile = (f) => f && typeof f === 'object' && (typeof f.download_url === 'string' || typeof f.content === 'string');
+    listing = (Array.isArray(body) ? body.filter((f) => isFile(f) && f.type !== 'dir') : isFile(body) ? [body] : []).slice(0, files);
     if (listing.length === 0) {
-      say(`no   source ${source}: no files listed — ${peek}`);
+      say(`no   source ${source}: no file there — ${peek}`);
       return [];
     }
   } catch (error) {
     say(`no   source ${source}: ${String(error?.cause?.code || error?.cause?.message || error?.message || error).slice(0, 80)}`);
     return [];
   }
-  const texts = await Promise.all(listing.map((f) => ask(f.download_url).then((r) => (r.ok ? r.text() : '')).catch(() => '')));
-  const candidates = cobaltCandidates(texts.map(sourceEntry).filter(Boolean), { limit });
+  // A file answered with its content needs no second request; one answered
+  // by reference is fetched.
+  const texts = await Promise.all(listing.map((f) =>
+    typeof f.content === 'string' && f.encoding === 'base64'
+      ? Promise.resolve(Buffer.from(f.content, 'base64').toString('utf8'))
+      : typeof f.content === 'string' && !f.encoding
+        ? Promise.resolve(f.content)
+        : ask(f.download_url).then((r) => (r.ok ? r.text() : '')).catch(() => ''),
+  ));
+  const candidates = cobaltCandidates(texts.flatMap(sourceEntries), { limit });
   const first = texts.find(Boolean) || '';
   say(`     source ${source}: ${listing.length} file(s), ${candidates.length} instance(s) to ask${candidates.length ? '' : ` — ${first.replace(/\s+/g, ' ').trim().slice(0, 160)}`}`);
   return candidates;

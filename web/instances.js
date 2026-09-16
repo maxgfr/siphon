@@ -68,8 +68,11 @@ const RESULT_KEYS = ['services', 'tests', 'results', 'working'];
  */
 export function cobaltEntries(body) {
   const data = body && typeof body === 'object' && !Array.isArray(body) && 'data' in body ? body.data : body;
+  const isEntry = (value) => value && typeof value === 'object' && ADDRESS_KEYS.some((key) => typeof value[key] === 'string');
   let list = [];
   if (Array.isArray(data)) list = data;
+  // One entry on its own — a file describing a single instance.
+  else if (isEntry(data)) list = [data];
   else if (data && typeof data === 'object') {
     const service = Object.keys(data).find((key) => /^youtube$/i.test(key));
     const byService = service ? data[service] : null;
