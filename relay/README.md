@@ -3,7 +3,7 @@
 One file, for one problem: hosts that refuse to let a web page read their
 files.
 
-siphon's **In this browser** mode does the whole download itself — reads the
+siphon's browser mode does the whole download itself — reads the
 link, solves the signature, picks a quality, fetches the stream, merges with
 ffmpeg.wasm. For most media that is the end of it and nothing here is needed.
 But a browser will not let a page read a cross-origin response unless the host
@@ -43,8 +43,7 @@ npx wrangler deploy
 npx wrangler secret put ALLOWED_ORIGINS     # https://yourname.github.io
 ```
 
-Then paste the worker's address into siphon under **Settings → In this browser
-→ Relay**.
+Then paste the worker's address into siphon under **Settings → Helper**.
 
 ## Or run it on your own machine, with no account at all
 

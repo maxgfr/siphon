@@ -108,6 +108,16 @@ const server = createServer(
       return response.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }).end('{"cobalt":{"version":"11.0"},"git":{}}');
     }
 
+    // An Invidious instance as most public ones are today: the stats endpoint
+    // names the software to anyone, the video endpoint refuses a page.
+    if (path === '/inv-closed/api/v1/stats') {
+      return response.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        .end('{"version":"2.0","software":{"name":"invidious","version":"2026.09.01","branch":"master"}}');
+    }
+    if (path.startsWith('/inv-closed/api/v1/videos/')) {
+      return response.writeHead(403, { 'Content-Type': 'text/plain' }).end('Endpoint disabled');
+    }
+
     // A relay, as far as detection can tell one apart: it fetches what it is
     // asked for. Only robots.txt is ever asked, and only its shape matters.
     if (path === '/relay' || path.startsWith('/relay/')) {
@@ -323,6 +333,17 @@ for (const [old, expected] of [
     await page.evaluate(() => document.getElementById('settings').open));
   check('and the reason is on screen', /could not reach|not a siphon/i.test((await page.textContent('#statusText')) || ''),
     (await page.textContent('#statusText')) || '');
+
+  // An instance that answers to its name but keeps its video endpoint shut —
+  // most public ones today — is recognised, and then said to be shut, before
+  // anyone saves it and finds out on a real link.
+  await page.fill('#endpoint', `${BASE}/inv-closed`);
+  await page.click('#testConnection');
+  await page.waitForFunction(() => /answers this page|does not answer this page|could not/i.test(document.getElementById('statusText').textContent || ''), null, { timeout: 15_000 });
+  const closed = (await page.textContent('#statusText')) || '';
+  check('an Invidious instance is recognised, and its shut video endpoint named before saving',
+    /An Invidious instance/.test(closed) && /does not answer this page for a video/.test(closed), closed.slice(0, 120));
+  check('with an amber light, not a green one', (await page.evaluate(() => document.getElementById('statusDot').className)) === 'dot warn');
 
   // The real one: this very host answers /api/health, so it is a siphon server.
   await page.fill('#endpoint', BASE);

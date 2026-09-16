@@ -10,7 +10,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { through, evaluate, choose, candidates, cobaltCandidates, evaluateCobalt, chooseCobalt, fromSource, sourceEntry, PUBLIC_RELAYS, COBALT_DIRECTORY, COBALT_DIRECTORIES, COBALT_SOURCE, USER_AGENT, ROBOTS, VIDEO_ID, WATCH } from '../scripts/relay-config.mjs';
+import { through, evaluate, choose, candidates, cobaltCandidates, evaluateCobalt, chooseCobalt, fromSource, sourceEntries, PUBLIC_RELAYS, COBALT_DIRECTORY, COBALT_DIRECTORIES, COBALT_SOURCE, USER_AGENT, ROBOTS, VIDEO_ID, WATCH } from '../scripts/relay-config.mjs';
 
 const STREAMS = { formatStreams: [{ url: '/videoplayback?itag=18', type: 'video/mp4' }] };
 
@@ -211,12 +211,34 @@ test('the walk skips the keyed instance and takes the first that delivers', asyn
   assert.ok(lines[2].startsWith('ok   https://open.example'));
 });
 
-test("a file of the source is read as JSON, or by its api line when it is not", () => {
-  assert.deepEqual(sourceEntry('{"api":"one.example","frontend":"one.example"}'), { api: 'one.example', frontend: 'one.example' });
-  assert.deepEqual(sourceEntry('# two\napi = "https://two.example"\nfrontend = "two.example"\n'), { api: 'https://two.example' });
-  assert.deepEqual(sourceEntry('api: api.three.example:9000\n'), { api: 'api.three.example:9000' });
-  assert.equal(sourceEntry('nothing of the kind'), null);
-  assert.equal(sourceEntry(''), null);
+test('a file of the source is read as JSON, or line by line when it is not', () => {
+  assert.deepEqual(sourceEntries('{"api":"one.example","frontend":"one.example"}').map((e) => e.api), ['https://one.example']);
+  assert.deepEqual(sourceEntries('[{"api":"a.example"},{"api":"b.example","online":false}]').map((e) => e.api), ['https://a.example']);
+  assert.deepEqual(sourceEntries('# two\napi = "https://two.example"\nfrontend = "two.example"\n').map((e) => e.api), ['https://two.example']);
+  assert.deepEqual(sourceEntries('api: api.three.example:9000\n').map((e) => e.api), ['https://api.three.example:9000']);
+  // The plain list: one instance per line, comments dropped, http left out.
+  assert.deepEqual(
+    sourceEntries('# instances that asked to be listed\napi.four.example\nhttps://five.example/ # keyed\nhttp://plain.example\n\n// six\nsix.example:8080\n').map((e) => e.api),
+    ['https://api.four.example', 'https://five.example', 'https://six.example:8080'],
+  );
+  assert.deepEqual(sourceEntries('nothing of the kind'), []);
+  assert.deepEqual(sourceEntries(''), []);
+});
+
+test('the source measured to be one file — an object with its content — is read without a second request', async () => {
+  const list = '# opt-in\napi.one.example\napi.two.example\n';
+  const asked = [];
+  const fetchImpl = async (url) => {
+    asked.push(url);
+    if (url === COBALT_SOURCE) {
+      return new Response(JSON.stringify({ name: 'instances', path: 'backend/instances', type: 'file', encoding: 'base64', content: Buffer.from(list).toString('base64'), download_url: 'https://raw.example/instances' }), { status: 200 });
+    }
+    return new Response('', { status: 404 });
+  };
+  const lines = [];
+  assert.deepEqual(await fromSource({ fetchImpl, say: (l) => lines.push(l) }), ['https://api.one.example', 'https://api.two.example']);
+  assert.equal(lines[0], `     source ${COBALT_SOURCE}: 1 file(s), 2 instance(s) to ask`);
+  assert.deepEqual(asked, [COBALT_SOURCE], 'the content came with the answer');
 });
 
 test('with both directories behind a challenge page, the source repository is read, file by file, and walked', async () => {
@@ -259,6 +281,9 @@ test('a source that lists files nothing reads is named with the first file, and 
   const lines = [];
   assert.deepEqual(await fromSource({ fetchImpl, say: (l) => lines.push(l) }), []);
   assert.equal(lines[0], `     source ${COBALT_SOURCE}: 1 file(s), 0 instance(s) to ask — frontend: only.example`);
+  const folder = [];
+  assert.deepEqual(await fromSource({ fetchImpl: async () => new Response('{"name":"x","type":"dir"}', { status: 200 }), say: (l) => folder.push(l) }), []);
+  assert.match(folder[0], /^no {3}source .*: no file there — \{"name":"x"/);
   const unreachable = [];
   assert.deepEqual(await fromSource({ fetchImpl: async () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } }); }, say: (l) => unreachable.push(l) }), []);
   assert.equal(unreachable[0], `no   source ${COBALT_SOURCE}: ECONNRESET`);

@@ -80,6 +80,8 @@ export async function detectEndpoint(address, key = '', fetchImpl = globalThis.f
       kind: 'siphon',
       label: `yt-dlp ${body.ytDlpVersion || '?'}`,
       ffmpeg: body.ffmpeg !== false,
+      // Older servers say nothing about it; only an explicit "no" is a warning.
+      jsRuntime: body.jsRuntime !== false,
       capabilities: Array.isArray(body.capabilities) ? body.capabilities : ['jobs'],
       lanUrls: Array.isArray(body.lanUrls) ? body.lanUrls : [],
       hasCookies: body.hasCookies === true,
@@ -151,10 +153,14 @@ export function privacyNote(endpoint) {
 /** The sentence in the settings sheet after Test. */
 export function describeEndpoint(endpoint) {
   switch (endpoint?.kind) {
-    case 'siphon':
-      return endpoint.ffmpeg
+    case 'siphon': {
+      const base = endpoint.ffmpeg
         ? `Your server — ${endpoint.label}, with ffmpeg. It does everything: every site yt-dlp knows, playlists, subtitles.`
         : `Your server — ${endpoint.label}, no ffmpeg. It resolves links; this device downloads and converts.`;
+      return endpoint.jsRuntime === false
+        ? `${base} It has no JavaScript runtime beside yt-dlp, so YouTube formats may be missing — install Deno there, or use the Docker image, which has one.`
+        : base;
+    }
     case 'cobalt':
       return `A ${endpoint.label} instance. This device does what it can; the rest goes to the instance.`;
     case 'piped':

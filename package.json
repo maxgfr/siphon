@@ -11,7 +11,8 @@
     "test:innertube": "node tests/innertube-probe.mjs",
     "relay": "node relay/serve.mjs",
     "test:bridge": "node tests/bridge.mjs",
-    "test:split": "node tests/split.mjs"
+    "test:split": "node tests/split.mjs",
+    "test:server": "node tests/server-youtube.mjs"
   },
   "devDependencies": {
     "playwright": "1.56.1",

@@ -553,6 +553,7 @@ dialog.sheet::backdrop { background: rgba(0, 0, 0, 0.55); }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
 .dot.ok { background: var(--accent); }
 .dot.bad { background: var(--danger); }
+.dot.warn { background: var(--warn); }
 
 .sheet-actions { display: flex; gap: 8px; margin-top: 18px; }
 .sheet-actions button {

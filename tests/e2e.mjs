@@ -40,8 +40,12 @@ const CORE_URL = process.env.SIPHON_CORE_URL || (VENDORED
   : 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.js');
 const MEDIA_PORT = 8788;
 const INV_PORT = 8789;
+const PIPED_PORT = 8792;
+const COBALT_PORT = 8793;
 const MEDIA = `http://127.0.0.1:${MEDIA_PORT}`;
 const INV = `http://127.0.0.1:${INV_PORT}`;
+const PIPED = `http://127.0.0.1:${PIPED_PORT}`;
+const COBALT = `http://127.0.0.1:${COBALT_PORT}`;
 
 /* -------------------------------------------------------------------- fixtures */
 
@@ -267,6 +271,102 @@ function serveInvidious(port) {
   return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
 }
 
+/* ----------------------------------------------------------------- a fake Piped */
+
+/** What the fake Piped instance was asked. */
+const piped = { streams: [], proxied: 0 };
+
+/**
+ * A Piped instance, as far as this app can tell one apart: `/config` naming
+ * an image proxy, `/streams/{id}` listing videoStreams and audioStreams with
+ * every media URL rewritten through the instance's own proxy, which sends
+ * CORS because Piped's own frontend is a separate origin. Shapes are the real
+ * API's; only the video is ours.
+ */
+function servePiped(port) {
+  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Expose-Headers': '*' };
+  const json = (response, status, body) =>
+    response.writeHead(status, { ...cors, 'Content-Type': 'application/json' }).end(JSON.stringify(body));
+  const server = createServer((request, response) => {
+    const url = new URL(request.url, 'http://x');
+    if (request.method === 'OPTIONS') return response.writeHead(204, cors).end();
+    if (url.pathname === '/config') {
+      return json(response, 200, { imageProxyUrl: `${PIPED}/proxy`, donationUrl: null, statusPageUrl: null });
+    }
+    const streams = /^\/streams\/([\w-]+)$/.exec(url.pathname);
+    if (streams) {
+      piped.streams.push(streams[1]);
+      const size = statSync(join(MEDIA_DIR, 'clip.mp4')).size;
+      return json(response, 200, {
+        title: 'A clip through Piped', uploader: 'the fixture', duration: 6, livestream: false,
+        thumbnailUrl: `${PIPED}/proxy/cover.jpg?host=i.ytimg.com`,
+        videoStreams: [{ url: `${PIPED}/proxy/clip.mp4?host=rr1---sn-example.googlevideo.com`, format: 'MPEG_4', quality: '360p', mimeType: 'video/mp4', codec: 'avc1.42001E', videoOnly: false, bitrate: 600000, contentLength: size, width: 640, height: 360, fps: 25 }],
+        audioStreams: [],
+        subtitles: [],
+      });
+    }
+    if (url.pathname === '/proxy/cover.jpg') {
+      const cover = readFileSync(join(MEDIA_DIR, 'cover.jpg'));
+      return response.writeHead(200, { ...cors, 'Content-Type': 'image/jpeg', 'Content-Length': cover.length }).end(cover);
+    }
+    if (url.pathname === '/proxy/clip.mp4') {
+      const source = join(MEDIA_DIR, 'clip.mp4');
+      const size = statSync(source).size;
+      const head = { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': size, 'Accept-Ranges': 'bytes' };
+      if (request.method === 'HEAD') return response.writeHead(200, head).end();
+      piped.proxied += 1;
+      response.writeHead(200, head);
+      return createReadStream(source).pipe(response);
+    }
+    return json(response, 404, { error: 'not found' });
+  });
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
+}
+
+/* ---------------------------------------------------------------- a fake cobalt */
+
+/** What the fake cobalt instance was asked: every POST body, and the tunnel reads. */
+const cobalt = { asks: [], tunnel: 0 };
+
+/**
+ * A cobalt instance, as far as this app can tell one apart: its root is JSON
+ * with a `cobalt` object, a POST of a link to that root answers a tunnel, and
+ * the tunnel streams the finished file as an attachment — the shape of the
+ * real API (v10), with our clip as the file.
+ */
+function serveCobalt(port) {
+  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Expose-Headers': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' };
+  const json = (response, status, body) =>
+    response.writeHead(status, { ...cors, 'Content-Type': 'application/json' }).end(JSON.stringify(body));
+  const server = createServer((request, response) => {
+    const url = new URL(request.url, 'http://x');
+    if (request.method === 'OPTIONS') return response.writeHead(204, cors).end();
+    if (url.pathname === '/' && request.method === 'GET') {
+      return json(response, 200, { cobalt: { version: '11.0', url: COBALT, startTime: '1', durationLimit: 10800, services: ['youtube'] }, git: { commit: 'abc', branch: 'main' } });
+    }
+    if (url.pathname === '/' && request.method === 'POST') {
+      let raw = '';
+      request.on('data', (chunk) => { raw += chunk; });
+      request.on('end', () => {
+        let body = {};
+        try { body = JSON.parse(raw); } catch { /* not JSON */ }
+        cobalt.asks.push(body);
+        json(response, 200, { status: 'tunnel', url: `${COBALT}/tunnel?id=1`, filename: 'A clip through cobalt.mp4' });
+      });
+      return undefined;
+    }
+    if (url.pathname === '/tunnel') {
+      const source = join(MEDIA_DIR, 'clip.mp4');
+      const size = statSync(source).size;
+      cobalt.tunnel += 1;
+      response.writeHead(200, { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': size, 'Content-Disposition': 'attachment; filename="A clip through cobalt.mp4"' });
+      return createReadStream(source).pipe(response);
+    }
+    return json(response, 404, { status: 'error', error: { code: 'error.api.generic' } });
+  });
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
+}
+
 /* ---------------------------------------------------------------------- checking */
 
 const results = [];
@@ -280,7 +380,7 @@ const resolutionIn = (report) => (/\b(\d{3,4}x\d{3,4})\b/.exec(report) || [])[1]
 /* ------------------------------------------------------------------------- run */
 
 buildFixtures();
-const servers = [await serve(WEB, APP_PORT, '/app'), await serve(WORK, MEDIA_PORT, ''), await serveInvidious(INV_PORT)];
+const servers = [await serve(WEB, APP_PORT, '/app'), await serve(WORK, MEDIA_PORT, ''), await serveInvidious(INV_PORT), await servePiped(PIPED_PORT), await serveCobalt(COBALT_PORT)];
 const browser = await chromium.launch(process.env.CHROMIUM ? { executablePath: process.env.CHROMIUM } : {});
 const context = await browser.newContext({ acceptDownloads: true });
 const page = await context.newPage();
@@ -297,7 +397,7 @@ page.on('console', (message) => {
   // Invidious instance answers 404 to /api/health, / and /config before its
   // stats endpoint says what it is, and Chrome reports each miss here. Those
   // three, on that one origin, are the probe doing its job.
-  if (/^http:\/\/127\.0\.0\.1:8789\/(api\/health|config)?$/.test(at) && /status of 404/.test(message.text())) return;
+  if (/^http:\/\/127\.0\.0\.1:(8789|8792|8793)\/(api\/health|config)?$/.test(at) && /status of 404/.test(message.text())) return;
   consoleErrors.push(`${message.text()} <${at}>`);
 });
 page.on('pageerror', (error) => consoleErrors.push(`pageerror: ${error.message}`));
@@ -497,6 +597,84 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   check('and embedded in the video, which keeps its picture and sound',
     /Subtitle: mov_text/.test(report) && /Video: h264/.test(report) && /Audio: aac/.test(report),
     (report.match(/Stream #0:\d[^\n]*/g) || []).map((line) => line.replace(/\s+/g, ' ').slice(0, 50)).join(' | '));
+  check('the page itself never touched googlevideo or youtube.com', strangers.length === 0, strangers.slice(0, 2).join(' ; '));
+}
+
+/* A Piped instance, the same way: recognised from its address, YouTube through its proxy. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  strangers.length = 0;
+
+  await page.click('#openSettings');
+  await page.fill('#endpoint', PIPED);
+  await page.click('#testConnection');
+  await page.waitForFunction(
+    () => /answers this page|does not answer|could not|not a siphon/i.test(document.getElementById('statusText').textContent || ''), null, { timeout: 15_000 });
+  const verdict = (await page.textContent('#statusText')) || '';
+  check('a Piped instance is recognised from its address alone', /A Piped instance/.test(verdict), verdict.slice(0, 70));
+  check('and said to answer this page for a video, since this one does', /It answers this page for a video/.test(verdict), verdict.slice(0, 120));
+  await page.click('#saveSettings');
+  await page.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 15_000 });
+  check('and the header says so', /Piped for YouTube/.test((await page.textContent('#backendLabel')) || ''), await page.textContent('#backendLabel'));
+
+  await page.check('input[name="quality"][value="video_best"]');
+  await page.fill('#url', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+  const waiting = page.waitForEvent('download', { timeout: 180_000 });
+  await page.click('#go');
+  const event = await waiting;
+  const saved = join(DOWNLOADS, `piped-${event.suggestedFilename()}`);
+  await event.saveAs(saved);
+  check('a YouTube link is resolved by the Piped instance', piped.streams.includes('dQw4w9WgXcQ'), piped.streams.join(','));
+  check("the file arrives through the instance's proxy, byte-identical", piped.proxied >= 1 && Buffer.compare(source, readFileSync(saved)) === 0, `${piped.proxied} proxy reads`);
+  check('named after the video', /clip through Piped/i.test(event.suggestedFilename()), event.suggestedFilename());
+  check('the page itself never touched googlevideo or youtube.com', strangers.length === 0, strangers.slice(0, 2).join(' ; '));
+}
+
+/* A cobalt instance: asked for the finished file, which arrives as its own download. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  strangers.length = 0;
+
+  await page.click('#openSettings');
+  await page.fill('#endpoint', COBALT);
+  await page.click('#testConnection');
+  await page.waitForFunction(() => !/checking|not checked/i.test(document.getElementById('statusText').textContent || ''), null, { timeout: 15_000 });
+  const verdict = (await page.textContent('#statusText')) || '';
+  check('a cobalt instance is recognised from its address alone', /cobalt 11\.0 instance/.test(verdict), verdict.slice(0, 70));
+  await page.click('#saveSettings');
+  await page.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 15_000 });
+  check('and the header names it', /cobalt 11\.0 for the rest/.test((await page.textContent('#backendLabel')) || ''), await page.textContent('#backendLabel'));
+
+  // No navigation from here on: the init script above would put the
+  // no-helper settings back on the next load.
+  const take = async (url, preset) => {
+    await page.check(`input[name="quality"][value="${preset}"]`);
+    await page.fill('#url', url);
+    const waiting = page.waitForEvent('download', { timeout: 60_000 });
+    await page.click('#go');
+    const event = await waiting;
+    const saved = join(DOWNLOADS, `cobalt-${event.suggestedFilename()}`);
+    await event.saveAs(saved);
+    return { saved, name: event.suggestedFilename() };
+  };
+
+  // A direct file still stays on this device: the instance is only for what
+  // the device cannot read itself.
+  cobalt.asks.length = 0;
+  const own = await take(`${MEDIA}/media/clip.mp4`, 'video_best');
+  check('a direct file still downloads on this device, not through the instance', cobalt.asks.length === 0 && Buffer.compare(source, readFileSync(own.saved)) === 0, `${cobalt.asks.length} asks`);
+
+  const got = await take('https://www.youtube.com/watch?v=dQw4w9WgXcQ', 'video_480');
+  const saved = got.saved;
+  const event = { suggestedFilename: () => got.name };
+  const ask = cobalt.asks[0] || {};
+  check('a YouTube link is sent to the instance with the quality asked for', ask.url === 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' && ask.videoQuality === '480', JSON.stringify(ask));
+  check("the finished file arrives from the instance's tunnel, byte-identical", cobalt.tunnel >= 1 && Buffer.compare(source, readFileSync(saved)) === 0, `${cobalt.tunnel} tunnel reads`);
+  check('under the name the instance gave it', /clip through cobalt/i.test(event.suggestedFilename()), event.suggestedFilename());
   check('the page itself never touched googlevideo or youtube.com', strangers.length === 0, strangers.slice(0, 2).join(' ; '));
 }
 

@@ -69,5 +69,5 @@ server.listen(PORT, HOST, () => {
   console.log(`relay listening on http://${HOST}:${PORT}`);
   console.log(`  hosts:   ${hosts}`);
   console.log(`  origins: ${origins}`);
-  console.log(`paste http://${HOST}:${PORT} into siphon under Settings → In this browser → Relay`);
+  console.log(`paste http://${HOST}:${PORT} into siphon under Settings → Helper`);
 });

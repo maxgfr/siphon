@@ -10,6 +10,7 @@ tests/.deployed/
 tests/.youtube/
 tests/.bridge/
 tests/.split/
+tests/.server/
 
 # ffmpeg.wasm, put beside the app by scripts/vendor_ffmpeg.py at deploy time
 web/vendor/
