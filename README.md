@@ -29,11 +29,25 @@ minute:
 | **The bridge** | install the userscript from [`bridge/`](bridge/) | everything stays on your device; no server anywhere |
 | **Your own server** | `docker run -d -p 8000:8000 -v siphon:/tmp/siphon ghcr.io/maxgfr/siphon` | the most capable: every site yt-dlp knows, playlists, subtitles, your cookies |
 
+**The default, measured.** `web/config.json` is what a fresh visitor starts
+from, and a daily workflow (`.github/workflows/relay-config.yml` running
+`scripts/relay-config.mjs`) decides what goes in it — from a machine with real
+network, by asking each candidate relay exactly what the page asks: fetch
+`youtube.com/robots.txt` for a page (with `Access-Control-Allow-Origin`), then
+some bundled Invidious instance's video endpoint through it, then the first
+64 KB of that instance's media through it. The first relay that passes all
+three is written in, with the instance that answered, and Pages redeploys.
+The candidates are your own relay first (the `SIPHON_RELAY_URL` variable),
+then a list of public CORS proxies — free tiers that come and go, which is
+the whole reason this is measured daily rather than written once. A public
+proxy is a stranger's server that sees every link routed through it, and
+the app says so on screen; your own relay is named as the site's.
+
 **Running this site for others?** Deploy the relay once, then set the
 repository variable `SIPHON_RELAY_URL` to its address (Settings → Secrets and
-variables → Actions → Variables). The next Pages deploy writes it into
-`web/config.json`, and every visitor gets YouTube through it with nothing to
-set — the app names it on screen, and clearing it is one tap.
+variables → Actions → Variables). It wins over any public proxy the moment
+it passes the same checks, and the next Pages deploy applies it without
+waiting for the daily run.
 
 The app always says which helper is in use, in the header and in the guide.
 

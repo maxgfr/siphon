@@ -1,0 +1,54 @@
+name: Find a relay that works, and make it the default
+
+# YouTube refuses web pages, and the public Invidious instances close their
+# video endpoint to pages — but not to a plain client, and a relay is one.
+# This measures, from a runner with real network, which relay carries the
+# exact requests the app makes, and writes the first that does into
+# web/config.json so every visitor of the site gets YouTube with nothing
+# to set. Your own relay (the SIPHON_RELAY_URL variable) is tried first and
+# wins when it works. Nothing working leaves the site with no relay rather
+# than a dead one.
+
+on:
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: relay-config
+  cancel-in-progress: true
+
+jobs:
+  find:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node scripts/relay-config.mjs
+        env:
+          SIPHON_RELAY_URL: ${{ vars.SIPHON_RELAY_URL }}
+      - id: diff
+        run: |
+          if git diff --quiet -- web/config.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add web/config.json
+          git commit -m "chore: the relay that works today, as the site's default"
+          git push
+      # A push made with GITHUB_TOKEN does not trigger other workflows.
+      - if: steps.diff.outputs.changed == 'true'
+        run: gh workflow run pages.yml
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -31,9 +31,20 @@ const isBlocked = (error) => error instanceof TypeError;
  */
 
 /** A relay as an escape: `${base}/?url=…`, the shape relay/worker.js answers. */
+/**
+ * A relay address is either a base — ours answer `base/?url=<encoded>` — or
+ * a template with `{url}` (encoded) or `{raw}` (as is) where the target goes,
+ * which is how a public CORS proxy of any shape fits the same slot.
+ */
+export const isRelayTemplate = (address) => /\{(url|raw)\}/.test(String(address || ''));
+export const relayTarget = (address, url) => {
+  const relay = String(address || '').trim();
+  if (isRelayTemplate(relay)) return relay.replace('{url}', encodeURIComponent(url)).replace('{raw}', url);
+  return `${relay.replace(/\/+$/, '')}/?url=${encodeURIComponent(url)}`;
+};
 export const relayEscape = (base) => {
-  const root = String(base || '').trim().replace(/\/+$/, '');
-  return root ? { name: 'relay', via: (url) => `${root}/?url=${encodeURIComponent(url)}` } : null;
+  const root = String(base || '').trim();
+  return root ? { name: 'relay', via: (url) => relayTarget(root, url) } : null;
 };
 
 export class Fetcher {

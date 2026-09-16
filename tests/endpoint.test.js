@@ -95,6 +95,22 @@ test('an Invidious instance with stats switched off is still known, by the sente
   assert.equal(helper.kind, 'invidious');
 });
 
+test('a relay given as a template is probed through the template, and is a relay', async () => {
+  const asked = [];
+  const fetchImpl = async (url) => {
+    asked.push(url);
+    return new Response(/youtube\.com%2Frobots\.txt$/.test(url) ? 'User-agent: *\n' : 'nope', { status: 200 });
+  };
+  const helper = await detectEndpoint('https://corsproxy.io/?url={url}', '', fetchImpl);
+  assert.equal(helper.kind, 'relay');
+  assert.deepEqual(asked, ['https://corsproxy.io/?url=https%3A%2F%2Fwww.youtube.com%2Frobots.txt'], 'one request, through the template');
+});
+
+test('a template that does not fetch for the page is refused with its status', async () => {
+  const fetchImpl = async () => new Response('forbidden', { status: 403 });
+  await assert.rejects(() => detectEndpoint('https://proxy.example/?url={url}', '', fetchImpl), /answered 403/);
+});
+
 test('a relay is known by fetching something through it', async () => {
   const { fetchImpl, asked } = stub({
     '/api/health': { status: 404, body: '' },

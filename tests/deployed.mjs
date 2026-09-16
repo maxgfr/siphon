@@ -362,7 +362,7 @@ for (const [old, expected] of [
 {
   // A first visit on a site whose owner set a relay: the visitor gets it with
   // nothing to do, is told whose it is, and the guide says YouTube is ready.
-  overrides.set('/siphon/config.json', JSON.stringify({ relay: `${BASE}/relay` }));
+  overrides.set('/siphon/config.json', JSON.stringify({ relay: `${BASE}/relay`, relayKind: 'own', instance: '' }));
   const { context, page } = await fresh();
   await setApi(false);
   await page.goto(APP, { waitUntil: 'networkidle' });
@@ -372,7 +372,7 @@ for (const [old, expected] of [
   check("the site's relay is taken as the helper on a first visit", saved.helper?.kind === 'relay' && saved.endpoint === `${BASE}/relay`,
     JSON.stringify({ helper: saved.helper?.kind, endpoint: saved.endpoint }));
   const notice = (await page.textContent('#feedback')) || '';
-  check('and the visitor is told whose relay it is', /This site has a relay/.test(notice) && notice.includes('127.0.0.1:8443'), notice.replace(/\s+/g, ' ').slice(0, 80));
+  check('and the visitor is told whose relay it is', /This site has a relay/.test(notice) && notice.includes('127.0.0.1:8443') && /which this site runs/.test(notice), notice.replace(/\s+/g, ' ').slice(0, 80));
   check('the header says so', /relay for YouTube/.test((await page.textContent('#backendLabel')) || ''), await page.textContent('#backendLabel'));
 
   // The guide is on the first screen, and its YouTube part reflects what is set.

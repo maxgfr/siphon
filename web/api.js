@@ -287,7 +287,7 @@ function serverResolver(server) {
  * Piped or Invidious instance, a relay. Everything below follows from that.
  */
 export class Siphon {
-  constructor({ endpoint = '', key = '', helper = null, coreUrl = '' } = {}) {
+  constructor({ endpoint = '', key = '', helper = null, coreUrl = '', firstInstance = '' } = {}) {
     this.helper = helper || { kind: 'none', label: 'this device only' };
     const kind = this.helper.kind;
 
@@ -306,7 +306,13 @@ export class Siphon {
         // A relay makes the public instances readable again (they refuse a
         // page, not a plain client), so with one the bundled list is walked
         // before InnerTube is tried through the same relay.
-        kind === 'relay' ? invidiousWalk({ others: () => invidiousInstances() }) : null,
+        kind === 'relay'
+          ? invidiousWalk({
+              // The instance the site's measurement saw answer through this
+              // relay goes first; the rest of the bundled list follows.
+              others: async () => [firstInstance, ...(await invidiousInstances())].filter(Boolean),
+            })
+          : null,
       ],
     });
 
@@ -397,5 +403,11 @@ export class Siphon {
 
 /** Build the backend the saved settings describe. */
 export function makeBackend(settings) {
-  return new Siphon({ endpoint: settings.endpoint, key: settings.key, helper: settings.helper, coreUrl: settings.coreUrl });
+  return new Siphon({
+    endpoint: settings.endpoint,
+    key: settings.key,
+    helper: settings.helper,
+    coreUrl: settings.coreUrl,
+    firstInstance: settings.siteInstance || '',
+  });
 }
