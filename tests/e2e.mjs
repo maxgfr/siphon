@@ -19,7 +19,7 @@
 import { chromium } from 'playwright';
 import { createServer } from 'node:http';
 import { execFileSync } from 'node:child_process';
-import { createReadStream, readFileSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, readFileSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { extname, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -30,8 +30,14 @@ const MEDIA_DIR = join(WORK, 'media');
 const DOWNLOADS = join(WORK, 'downloads');
 
 const FFMPEG = process.env.FFMPEG || 'ffmpeg';
-const CORE_URL = process.env.SIPHON_CORE_URL || 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.js';
 const APP_PORT = 8787;
+// The converter as deployed: beside the app, on the app's own origin. When
+// scripts/vendor_ffmpeg.py has run, the suite loads it from there — which is
+// what a visitor gets — and asserts so. SIPHON_CORE_URL still overrides.
+const VENDORED = existsSync(join(WEB, 'vendor', 'ffmpeg', 'ffmpeg-core.js'));
+const CORE_URL = process.env.SIPHON_CORE_URL || (VENDORED
+  ? `http://127.0.0.1:${APP_PORT}/app/vendor/ffmpeg/ffmpeg-core.js`
+  : 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.js');
 const MEDIA_PORT = 8788;
 const INV_PORT = 8789;
 const MEDIA = `http://127.0.0.1:${MEDIA_PORT}`;
@@ -314,13 +320,15 @@ page.on('request', (request) => {
 
 await page.addInitScript(
   (coreUrl) => {
+    // With the vendored copy in place, coreUrl stays blank — the app's own
+    // default is what is under test, not an override that happens to match.
     localStorage.setItem(
       'siphon:settings',
       JSON.stringify({ endpoint: '', key: '', helper: { kind: 'none', label: 'this device only' }, preset: 'video_best', subs: 'off', coreUrl }),
     );
     localStorage.setItem('siphon:install-dismissed', '1');
   },
-  CORE_URL,
+  VENDORED && !process.env.SIPHON_CORE_URL ? '' : CORE_URL,
 );
 
 async function download(url, preset) {
@@ -370,6 +378,8 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
 {
   const report = inspect(await download(`${MEDIA}/media/master.m3u8`, 'video_best'));
   check('hls remuxes to a playable mp4', /Video: h264/.test(report) && /Audio: aac/.test(report));
+  check(VENDORED ? 'the converter came from the app\'s own origin, with nothing configured' : 'the converter came from where it was pointed',
+    coreRequests > 0, `${coreRequests} request(s) to ${CORE_URL.replace(/^https?:\/\/[^/]+/, '')}`);
   check('hls output is an mp4 container', /Input #0, mov,mp4/.test(report));
   check('"Best" picks the top rendition', resolutionIn(report) === '1280x720', resolutionIn(report));
 }

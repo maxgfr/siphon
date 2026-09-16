@@ -22,6 +22,20 @@
 const trimSlash = (value) => String(value || '').trim().replace(/\/+$/, '');
 
 /**
+ * Whether a browser on the open internet can even resolve the host: the
+ * directories list overlay-network addresses under "https" too — `.ygg`,
+ * `.onion`, `.i2p` — and each would cost a probe and never answer.
+ */
+const reachable = (url) => {
+  try {
+    const { hostname } = new URL(url);
+    return hostname.includes('.') && !/\.(onion|i2p|ygg|local|lan|internal)$/i.test(hostname);
+  } catch {
+    return false;
+  }
+};
+
+/**
  * Where the projects publish their own instance lists.
  *
  * `read` pulls addresses out of whatever shape the directory answers with, and
@@ -54,7 +68,8 @@ export const DIRECTORIES = Object.freeze([
       (Array.isArray(body) ? body : [])
         .map((entry) => (Array.isArray(entry) ? entry[1] : null))
         .filter((d) => d && d.type === 'https' && d.api !== false && d.cors !== false && d.uri)
-        .map((d) => d.uri),
+        .map((d) => d.uri)
+        .filter(reachable),
   },
 ]);
 
@@ -106,6 +121,8 @@ export const SEED = Object.freeze([
   'https://inv.nadeko.net',
   'https://yewtu.be',
   'https://invidious.nerdvpn.de',
+  'https://yt.chocolatemoo53.com',
+  'https://invidious.tiekoetter.com',
   'https://pipedapi.kavin.rocks',
   'https://pipedapi.adminforge.de',
   'https://api.piped.private.coffee',

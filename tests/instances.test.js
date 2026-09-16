@@ -103,6 +103,7 @@ test('the Invidious directory is read in its own pair shape, and the unreachable
       ['dark.onion', { type: 'onion', uri: 'http://dark.onion', api: true }],
       ['noapi.example', { type: 'https', uri: 'https://noapi.example', api: false }],
       ['nocors.example', { type: 'https', uri: 'https://nocors.example', api: true, cors: false }],
+      ['ygg', { type: 'https', uri: 'https://inv.nadeko.ygg', api: true, cors: true }],
       'not a pair at all',
     ],
   });

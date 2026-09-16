@@ -32,6 +32,41 @@ const trimSlash = (value) => String(value || '').trim().replace(/\/+$/, '');
 const NOT_INSTANCES = /(^|\.)(invidious\.io|github\.com|githubusercontent\.com|uptime\.invidious\.io|matrix\.to|reddit\.com)$/i;
 
 /**
+ * Whether a browser on the open internet can even resolve the host.
+ *
+ * The API lists overlay-network addresses under type "https" too — a
+ * Yggdrasil `.ygg`, a Tor `.onion`, an I2P `.i2p` — and none of those is an
+ * address a phone's browser can reach. They would cost a probe each and
+ * never answer.
+ */
+export function reachable(url) {
+  try {
+    const { protocol, hostname } = new URL(url);
+    return protocol === 'https:' && hostname.includes('.') && !/\.(onion|i2p|ygg|local|lan|internal)$/i.test(hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Well-known instances, kept behind whatever the official list says.
+ *
+ * The official list is generated from a monitor, and a monitor has opinions:
+ * on a given day it may list three instances with the API on, two of them
+ * overlay-network addresses. These are long-standing public instances that
+ * serve the API; being here is not a promise that one answers today — the
+ * app probes every address before use — only that it is worth asking.
+ */
+export const SEED = Object.freeze([
+  'https://inv.nadeko.net',
+  'https://yewtu.be',
+  'https://invidious.nerdvpn.de',
+  'https://yt.chocolatemoo53.com',
+  'https://invidious.tiekoetter.com',
+  'https://inv.thepixora.com',
+]);
+
+/**
  * The API answers `[name, details]` pairs. Only clearnet ones with the API
  * on are of use to a page; the `cors` flag is honoured when present.
  */
@@ -40,7 +75,8 @@ export function fromDirectory(body) {
     (Array.isArray(body) ? body : [])
       .map((entry) => (Array.isArray(entry) ? entry[1] : null))
       .filter((d) => d && d.type === 'https' && d.api !== false && d.cors !== false && d.uri)
-      .map((d) => trimSlash(d.uri)),
+      .map((d) => trimSlash(d.uri))
+      .filter(reachable),
   );
 }
 
@@ -66,7 +102,7 @@ export function fromDocsPage(html) {
     links.filter((url) => {
       try {
         const { hostname, pathname } = new URL(url);
-        return !NOT_INSTANCES.test(hostname) && (pathname === '' || pathname === '/');
+        return !NOT_INSTANCES.test(hostname) && (pathname === '' || pathname === '/') && reachable(url);
       } catch {
         return false;
       }
@@ -85,17 +121,21 @@ async function fetchText(url, ms = 20_000) {
   return response.text();
 }
 
-/** Ask the API, then the page; say which one answered. */
+/** Ask the API, then the page; say which one answered; the seed behind either. */
 export async function refresh({ fetchImpl = fetchText } = {}) {
+  let source = 'api.invidious.io';
+  let list = [];
   try {
-    const list = fromDirectory(JSON.parse(await fetchImpl(API_URL)));
-    if (list.length > 0) return { source: 'api.invidious.io', invidious: list };
+    list = fromDirectory(JSON.parse(await fetchImpl(API_URL)));
   } catch {
     /* the page below is the fallback */
   }
-  const list = fromDocsPage(await fetchImpl(DOCS_URL));
+  if (list.length === 0) {
+    source = 'docs.invidious.io';
+    list = fromDocsPage(await fetchImpl(DOCS_URL));
+  }
   if (list.length === 0) throw new Error('neither the API nor the docs page listed a single instance');
-  return { source: 'docs.invidious.io', invidious: list };
+  return { source: `${source} + seed`, invidious: unique([...list, ...SEED]) };
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];

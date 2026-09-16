@@ -20,7 +20,7 @@ import { pipedResolver, invidiousResolver } from './extract.js';
 import { invidiousInstances } from './instances.js';
 import { relayEscape } from './net.js';
 export { detectEndpoint, privacyNote, describeEndpoint } from './endpoint.js';
-export { findInstance, looksUnreachable } from './instances.js';
+export { findInstance, invidiousInstances, looksUnreachable } from './instances.js';
 
 /** The qualities the UI offers. The server validates against its own copy. */
 export const PRESETS = Object.freeze([

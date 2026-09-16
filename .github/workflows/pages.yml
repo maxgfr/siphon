@@ -8,6 +8,7 @@ on:
     branches: [main]
     paths:
       - "web/**"
+      - "scripts/vendor_ffmpeg.py"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -42,6 +43,9 @@ jobs:
       - uses: actions/configure-pages@v5
         with:
           enablement: true
+
+      # The converter, beside the page: same-origin, nothing to configure.
+      - run: python3 scripts/vendor_ffmpeg.py
 
       - uses: actions/upload-pages-artifact@v4
         with:

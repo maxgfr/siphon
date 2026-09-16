@@ -22,6 +22,9 @@ RUN pip install --no-cache-dir bgutil-ytdlp-pot-provider
 
 COPY server/ ./server/
 COPY web/ ./web/
+# The converter beside the page, so the image needs no CDN at first use.
+COPY scripts/vendor_ffmpeg.py ./scripts/vendor_ffmpeg.py
+RUN python scripts/vendor_ffmpeg.py
 
 ENV WEB_DIR=/app/web \
     DOWNLOAD_DIR=/tmp/siphon \

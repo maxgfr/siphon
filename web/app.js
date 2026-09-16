@@ -11,7 +11,7 @@
  * primary action pinned within thumb reach, and no interaction that needs a
  * hover or a precise tap.
  */
-import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, looksUnreachable, privacyNote, describeEndpoint } from './api.js';
+import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, invidiousInstances, looksUnreachable, privacyNote, describeEndpoint } from './api.js';
 
 const SETTINGS_KEY = 'siphon:settings';
 const POLL_MS = 700;
@@ -770,7 +770,35 @@ function openSettings() {
   $('endpointKey').value = settings.key;
   $('coreUrl').value = settings.coreUrl;
   reflectHelper(settings.helper);
+  renderSuggested();
   $('settings').showModal();
+}
+
+/** How many instances to offer as chips; the rest are one "Find" away. */
+const SUGGESTED = 3;
+
+/**
+ * The first few Invidious instances from the bundled list, as chips.
+ *
+ * "Find a public instance" runs a search; these are the answer to "just give
+ * me one": tap it and the address is filled in and tested, and the sheet
+ * says what it found. The list is the project's own, refreshed daily, so the
+ * chips are today's instances, not the ones committed months ago.
+ */
+async function renderSuggested() {
+  const box = $('suggested');
+  const list = (await invidiousInstances().catch(() => [])).slice(0, SUGGESTED);
+  box.hidden = list.length === 0;
+  box.innerHTML = list
+    .map((address) => `<button type="button" class="chip-btn" data-address="${escapeHtml(address)}">${escapeHtml(hostOf(address))}</button>`)
+    .join('');
+  for (const chip of box.querySelectorAll('[data-address]')) {
+    chip.addEventListener('click', () => {
+      $('endpoint').value = chip.dataset.address;
+      $('endpointKey').value = '';
+      testConnection();
+    });
+  }
 }
 
 /** Show, in the sheet, what a helper is and what follows from it. */
@@ -800,14 +828,25 @@ function draftSettings() {
  * Find out what the address in the sheet is. Returns the helper, or null with
  * the reason shown in the status line.
  */
+/**
+ * Which probe is the current one. A tap on a chip, then a cleared field, then
+ * Test: three probes in flight, and only the last one's answer may reach the
+ * screen — an earlier, slower one landing afterwards would describe an
+ * address that is no longer in the box.
+ */
+let probeSeq = 0;
+
 async function probeDraft() {
+  const seq = ++probeSeq;
   setStatus('', 'Checking…');
   const draft = draftSettings();
   try {
     const helper = await detectEndpoint(draft.endpoint, draft.key);
+    if (seq !== probeSeq) return null;
     reflectHelper(helper);
     return helper;
   } catch (error) {
+    if (seq !== probeSeq) return null;
     setStatus('bad', error?.message || 'Could not reach it.');
     $('cookiesBlock').hidden = true;
     showPhoneHint([]);

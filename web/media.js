@@ -13,12 +13,19 @@ import { BackendError } from './errors.js';
 /**
  * Where the wasm core comes from.
  *
- * Overridable because there are three good reasons to move it: testing against
- * a local copy, self-hosting rather than depending on a CDN, and pinning a
- * different build. The default is an exact version — a floating tag would mean
- * the app changes under the user without a deploy.
+ * Beside the app, by default: the Pages deploy and the Docker image put
+ * @ffmpeg/core under vendor/ffmpeg/ (scripts/vendor_ffmpeg.py), so the
+ * converter is same-origin — nothing to configure, no CORS, no CDN to be
+ * blocked or slow, and the service worker caches it like the rest. The CDN
+ * copy of the same pinned version is the fallback for a deploy that skipped
+ * that step, and the settings override is for hosting your own build. An
+ * exact version everywhere — a floating tag would mean the app changes under
+ * the user without a deploy.
  */
-export const DEFAULT_CORE_URL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.js';
+export const CORE_VERSION = '0.12.10';
+export const BUNDLED_CORE_URL = new URL('./vendor/ffmpeg/ffmpeg-core.js', import.meta.url).href;
+export const CDN_CORE_URL = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/umd/ffmpeg-core.js`;
+export const DEFAULT_CORE_URL = BUNDLED_CORE_URL;
 
 let coreUrl = DEFAULT_CORE_URL;
 let worker = null;
@@ -76,18 +83,45 @@ function send(type, payload, transfer, onProgress) {
   }).finally(() => watchers.delete(id));
 }
 
-/** Load the core, at most once, however many jobs ask at the same time. */
+/** The load message for one core location; the other two files sit beside the .js. */
+const coreFiles = (url) => ({
+  coreURL: url,
+  wasmURL: url.replace(/\.js(\?.*)?$/, '.wasm$1'),
+  workerURL: url.replace(/\.js(\?.*)?$/, '.worker.js$1'),
+});
+
+/** Where the core was actually loaded from — the bundled copy, or the CDN fallback. */
+export let loadedFrom = '';
+
+/**
+ * Load the core, at most once, however many jobs ask at the same time.
+ *
+ * When the bundled copy is what is configured and it cannot be loaded — a
+ * deploy that skipped vendoring, a static host without the folder — the CDN
+ * copy of the same version is tried before giving up, so the app degrades to
+ * "fetched from a CDN" rather than to "cannot convert".
+ */
 export async function ensureFfmpeg() {
   if (isLoaded()) return;
   if (!loading) {
     worker = worker || spawn();
-    loading = send('load', {
-      coreURL: coreUrl,
-      // The core is published as a trio of files side by side, so the other two
-      // are derived rather than configured separately.
-      wasmURL: coreUrl.replace(/\.js(\?.*)?$/, '.wasm$1'),
-      workerURL: coreUrl.replace(/\.js(\?.*)?$/, '.worker.js$1'),
-    })
+    const attempts = coreUrl === BUNDLED_CORE_URL ? [BUNDLED_CORE_URL, CDN_CORE_URL] : [coreUrl];
+    loading = (async () => {
+      let last;
+      for (const url of attempts) {
+        try {
+          await send('load', coreFiles(url));
+          loadedFrom = url;
+          return;
+        } catch (error) {
+          last = error;
+          // A failed load leaves the worker in an unknown state; start clean.
+          worker?.terminate();
+          worker = spawn();
+        }
+      }
+      throw last;
+    })()
       .then(() => {
         loading = null;
       })

@@ -45,6 +45,9 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+      # The converter beside the app, as deployed — the suites load it from
+      # the app's own origin, which is what a visitor gets.
+      - run: python3 scripts/vendor_ffmpeg.py
       - run: npm run test:e2e
       - run: npm run test:deployed
       - run: npm run test:bridge
@@ -57,6 +60,10 @@ jobs:
   youtube:
     runs-on: ubuntu-latest
     continue-on-error: true
+    # The harness has its own 20-minute watchdog; this is the ceiling for
+    # everything around it (installs, the probe, a hung browser), so an
+    # informative job can never sit on a runner for hours.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v4
