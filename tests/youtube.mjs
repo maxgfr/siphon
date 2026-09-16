@@ -43,6 +43,15 @@ const PIPED = (process.env.SIPHON_PIPED_URL || '').replace(/\/+$/, '');
 // The bundled Invidious list, which is what a fresh visitor to the Pages
 // deploy starts from. Walked until one delivers, capped so a bad day for the
 // whole network cannot eat the deadline.
+// The relay the site ships as its default, if the relay-config workflow found
+// one: the exact thing a fresh visitor gets, so it is tried too.
+const SITE = (() => {
+  try {
+    return JSON.parse(readFileSync(join(WEB, 'config.json'), 'utf8'));
+  } catch {
+    return {};
+  }
+})();
 const INVIDIOUS = process.env.SIPHON_INVIDIOUS_URL
   ? [process.env.SIPHON_INVIDIOUS_URL.replace(/\/+$/, '')]
   : JSON.parse(readFileSync(join(WEB, 'instances.json'), 'utf8')).invidious.slice(0, Number(process.env.SIPHON_INVIDIOUS_TRIES || 4));
@@ -317,26 +326,27 @@ const verdict = (ok, label, detail = '') => {
   say(`${ok ? 'ok  ' : 'FAIL'} ${label}${detail ? ` — ${detail}` : ''}`);
 };
 
-async function attempt(preset, { piped = '', invidious = '' } = {}) {
+async function attempt(preset, { piped = '', invidious = '', relay = '' } = {}) {
   const instance = piped || invidious;
-  const label = piped ? `${preset} via piped` : invidious ? `${preset} via ${new URL(invidious).host}` : preset;
+  const label = piped ? `${preset} via piped` : invidious ? `${preset} via ${new URL(invidious).host}` : relay ? `${preset} via the site's relay` : preset;
   now(`${label}: loading the app`);
   await page.goto(`http://127.0.0.1:${APP_PORT}/`, { waitUntil: 'networkidle' });
   // One helper at a time, which is the app's model: the relay for the relay
   // attempts, the instance for the Piped and Invidious ones. autoInstance is
   // off so the app tests the address it was given, not one it went and found.
   await page.evaluate(
-    ([address, kind, relayUrl]) => {
+    ([address, kind, relayUrl, siteInstance]) => {
       localStorage.removeItem('siphon:queue');
       const settings = JSON.parse(localStorage.getItem('siphon:settings') || '{}');
       settings.endpoint = address || relayUrl;
+      settings.siteInstance = siteInstance || '';
       settings.helper = kind === 'piped' ? { kind: 'piped', label: 'Piped instance' }
         : kind === 'invidious' ? { kind: 'invidious', label: 'Invidious instance' }
           : { kind: 'relay', label: 'relay' };
       settings.autoInstance = false;
       localStorage.setItem('siphon:settings', JSON.stringify(settings));
     },
-    [instance, piped ? 'piped' : invidious ? 'invidious' : 'relay', `http://127.0.0.1:${RELAY_PORT}`],
+    [instance, piped ? 'piped' : invidious ? 'invidious' : 'relay', relay || `http://127.0.0.1:${RELAY_PORT}`, relay ? SITE.instance || '' : ''],
   );
   await page.reload({ waitUntil: 'networkidle' });
   await page.check(`input[name="quality"][value="${preset}"]`);
@@ -454,6 +464,20 @@ if (PIPED) {
   } else {
     verdict(false, `invidious: none of ${INVIDIOUS.length} instance(s) delivered the video`, refusals[0] || '');
   }
+}
+
+/* The site's default: the relay the relay-config workflow found, if any. */
+if (SITE.relay) {
+  say(`\nsite relay: ${SITE.relay} (${SITE.relayKind || '?'}, instance ${SITE.instance || '-'})`);
+  const r = await attempt('video_480', { relay: SITE.relay });
+  if (r.saved) {
+    const report = inspect(r.saved);
+    verdict(/Video: (h264|vp9|av1)/.test(report), `site relay: video_480 produced real video via ${r.client}`, (/\d{3,4}x\d{3,4}/.exec(report) || [])[0] || r.saved);
+  } else {
+    verdict(false, `site relay: no file (probe client: ${r.client})`, r.error);
+  }
+} else {
+  say('\nsite relay: none in web/config.json, skipped');
 }
 
 verdict(pageErrors.length === 0, 'no uncaught errors in the page', pageErrors.slice(0, 2).join(' ; '));

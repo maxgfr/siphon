@@ -119,8 +119,12 @@ function siteConfig() {
   if (!siteConfigPromise) {
     siteConfigPromise = fetch(new URL('./config.json', location.href).href, { credentials: 'omit', signal: AbortSignal.timeout(6000) })
       .then((response) => (response.ok ? response.json() : {}))
-      .then((body) => ({ relay: String(body?.relay || '').trim().replace(/\/+$/, '') }))
-      .catch(() => ({ relay: '' }));
+      .then((body) => ({
+        relay: String(body?.relay || '').trim().replace(/\/+$/, ''),
+        relayKind: body?.relayKind === 'own' ? 'own' : 'public',
+        instance: String(body?.instance || '').trim().replace(/\/+$/, ''),
+      }))
+      .catch(() => ({ relay: '', relayKind: '', instance: '' }));
   }
   return siteConfigPromise;
 }
@@ -138,7 +142,7 @@ async function adoptSiteRelay() {
   try {
     if (localStorage.getItem(SITE_RELAY_TAKEN) === '1') return false;
   } catch { /* storage off: once per session is the harmless side */ }
-  const { relay } = await siteConfig();
+  const { relay, relayKind, instance } = await siteConfig();
   if (!relay) return false;
   let helper;
   try {
@@ -153,14 +157,20 @@ async function adoptSiteRelay() {
   // turned out to be something else.
   if (helper.kind !== 'relay' || settings.helper.kind !== 'none' || settings.endpoint) return false;
 
-  settings = { ...settings, endpoint: relay, key: '', helper };
+  settings = { ...settings, endpoint: relay, key: '', helper, siteInstance: instance };
   saveSettings();
   applyBackend();
   refreshBackendLabel();
+  // Whose server the links reach is the one thing to be plain about: the
+  // site's own relay is the owner's; a public proxy is a stranger's, and it
+  // sees every link that goes through it.
   renderFeedback(
     '<div class="notice"><p><strong>This site has a relay.</strong> ' +
-      `YouTube links, and hosts that refuse a web page, go through <strong>${escapeHtml(hostOf(relay))}</strong>, ` +
-      'which this site runs; everything else stays on this device. Change or clear it in settings.</p></div>',
+      `YouTube links, and hosts that refuse a web page, go through <strong>${escapeHtml(hostOf(relay))}</strong>` +
+      (relayKind === 'own'
+        ? ', which this site runs; everything else stays on this device.'
+        : ' — a public proxy that sees those links; everything else stays on this device.') +
+      ' Change or clear it in settings.</p></div>',
   );
   return true;
 }

@@ -20,6 +20,9 @@
 
 const trimSlash = (value) => String(value || '').trim().replace(/\/+$/, '');
 
+/** Public, tiny, unmistakable: a 200 whose body names a User-agent came from YouTube. */
+const ROBOTS = 'https://www.youtube.com/robots.txt';
+
 /** @typedef {{ kind: 'none'|'siphon'|'cobalt'|'piped'|'invidious'|'relay', label: string, ffmpeg?: boolean, lanUrls?: string[], hasCookies?: boolean, requiresKey?: boolean }} Endpoint */
 
 const NONE = Object.freeze({ kind: 'none', label: 'this device only' });
@@ -31,6 +34,20 @@ const NONE = Object.freeze({ kind: 'none', label: 'this device only' });
  * @returns {Promise<Endpoint>}
  */
 export async function detectEndpoint(address, key = '', fetchImpl = globalThis.fetch) {
+  // A template — `{url}` or `{raw}` where the target goes — can only be a
+  // relay, and is probed the one way a relay can be: by fetching through it.
+  if (/\{(url|raw)\}/.test(String(address || ''))) {
+    const target = String(address).trim().replace('{url}', encodeURIComponent(ROBOTS)).replace('{raw}', ROBOTS);
+    let response;
+    try {
+      response = await fetchImpl(target, { credentials: 'omit', signal: AbortSignal.timeout(8000) });
+    } catch {
+      throw new Error('Could not reach that relay.');
+    }
+    const text = await response.text().catch(() => '');
+    if (response.status === 200 && /user-agent/i.test(text)) return { kind: 'relay', label: 'relay' };
+    throw new Error(`That relay answered ${response.status} rather than fetching for this page.`);
+  }
   const base = trimSlash(address);
   const sameOrigin = !base;
   const root = sameOrigin ? '' : base;
@@ -93,7 +110,7 @@ export async function detectEndpoint(address, key = '', fetchImpl = globalThis.f
     return { kind: 'invidious', label: 'Invidious instance' };
   }
 
-  const relay = await get(`/?url=${encodeURIComponent('https://www.youtube.com/robots.txt')}`);
+  const relay = await get(`/?url=${encodeURIComponent(ROBOTS)}`);
   if (relay?.status === 200 && /user-agent/i.test(relay.text)) {
     return { kind: 'relay', label: 'relay' };
   }

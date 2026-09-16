@@ -10,7 +10,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Fetcher } from '../web/net.js';
+import { Fetcher, relayEscape, relayTarget, isRelayTemplate } from '../web/net.js';
 
 const bytes = (from, to) => new Uint8Array(Array.from({ length: to - from }, (_, i) => (from + i) % 251));
 const WHOLE = bytes(0, 300);
@@ -228,4 +228,16 @@ test('a reset tells the writer to throw away what it has', async () => {
   } finally {
     stub.restore();
   }
+});
+
+/* ------------------------------------------------------------ relay shapes */
+
+test('a relay address is a base of ours or a template of anyone\'s', () => {
+  assert.equal(isRelayTemplate('https://mine.workers.dev'), false);
+  assert.equal(isRelayTemplate('https://corsproxy.io/?url={url}'), true);
+  assert.equal(relayTarget('https://mine.workers.dev/', 'https://a.b/c?d=1'), 'https://mine.workers.dev/?url=https%3A%2F%2Fa.b%2Fc%3Fd%3D1');
+  assert.equal(relayTarget('https://corsproxy.io/?url={url}', 'https://a.b/c?d=1'), 'https://corsproxy.io/?url=https%3A%2F%2Fa.b%2Fc%3Fd%3D1');
+  assert.equal(relayTarget('https://cors.eu.org/{raw}', 'https://a.b/c'), 'https://cors.eu.org/https://a.b/c');
+  assert.equal(relayEscape('https://cors.eu.org/{raw}').via('https://a.b/c'), 'https://cors.eu.org/https://a.b/c');
+  assert.equal(relayEscape(''), null);
 });

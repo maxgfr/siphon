@@ -47,11 +47,14 @@ jobs:
       # The converter, beside the page: same-origin, nothing to configure.
       - run: python3 scripts/vendor_ffmpeg.py
 
-      # The site's own relay, if its owner set one: Settings → Secrets and
-      # variables → Actions → Variables → SIPHON_RELAY_URL. Every visitor then
-      # gets YouTube through it with nothing to configure. Unset, the file
-      # stays as committed and the app looks for a public instance instead.
-      - run: printf '{ "relay": "%s" }\n' "${SIPHON_RELAY_URL}" > web/config.json
+      # web/config.json is what the relay-config workflow measured and
+      # committed. The owner's own relay (the SIPHON_RELAY_URL variable)
+      # overrides it here, so setting the variable is enough to take effect on
+      # the next deploy without waiting for the daily measurement.
+      - run: |
+          if [ -n "${SIPHON_RELAY_URL}" ]; then
+            node -e 'const f="web/config.json";const c=JSON.parse(require("fs").readFileSync(f,"utf8"));c.relay=process.env.SIPHON_RELAY_URL;c.relayKind="own";require("fs").writeFileSync(f,JSON.stringify(c,null,2)+"\n")'
+          fi
         env:
           SIPHON_RELAY_URL: ${{ vars.SIPHON_RELAY_URL }}
 

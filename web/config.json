@@ -1,1 +1,6 @@
-{ "relay": "" }
+{
+  "relay": "",
+  "relayKind": "",
+  "instance": "",
+  "checked": null
+}
