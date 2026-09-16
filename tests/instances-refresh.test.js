@@ -9,7 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { fromDirectory, fromDocsPage, refresh, API_URL, DOCS_URL } from '../scripts/instances.mjs';
+import { fromDirectory, fromDocsPage, reachable, refresh, API_URL, DOCS_URL, SEED } from '../scripts/instances.mjs';
 
 /** The shape of https://docs.invidious.io/instances/ — headings per address type, links under each. */
 const DOCS_HTML = `<!doctype html><html><body>
@@ -42,6 +42,20 @@ test('the API answer is read as [name, details] pairs, clearnet and API-on only'
   assert.deepEqual(list, ['https://yewtu.be', 'https://inv.nadeko.net']);
 });
 
+test('overlay-network addresses listed as https are still left out — a browser cannot resolve them', () => {
+  // What the API answered on 2026-09-16: three entries, one of them .ygg.
+  const list = fromDirectory([
+    ['invidious.f5.si', { type: 'https', uri: 'https://invidious.f5.si', api: true, cors: true }],
+    ['inv-ygg.nadeko.net', { type: 'https', uri: 'https://inv-ygg.nadeko.net', api: true, cors: true }],
+    ['inv.nadeko.ygg', { type: 'https', uri: 'https://inv.nadeko.ygg', api: true, cors: true }],
+  ]);
+  assert.deepEqual(list, ['https://invidious.f5.si', 'https://inv-ygg.nadeko.net']);
+  for (const bad of ['https://x.onion', 'https://x.i2p', 'https://x.ygg', 'https://localhost', 'http://plain.example', 'nonsense']) {
+    assert.equal(reachable(bad), false, bad);
+  }
+  assert.equal(reachable('https://inv.nadeko.net/'), true);
+});
+
 test('the docs page yields the links under its https heading, and nothing from the others', () => {
   const list = fromDocsPage(DOCS_HTML);
   assert.deepEqual(list, ['https://yewtu.be', 'https://inv.nadeko.net', 'https://invidious.nerdvpn.de']);
@@ -68,8 +82,17 @@ test('the API is asked first and named as the source', async () => {
       throw new Error('should not be asked');
     },
   });
-  assert.deepEqual(found, { source: 'api.invidious.io', invidious: ['https://a.example'] });
+  assert.equal(found.source, 'api.invidious.io + seed');
+  assert.deepEqual(found.invidious, ['https://a.example', ...SEED], 'the official list first, the seed behind it');
   assert.deepEqual(asked, [API_URL]);
+});
+
+test('an official entry that is also in the seed is listed once, where the official list put it', async () => {
+  const found = await refresh({
+    fetchImpl: async () => JSON.stringify([[SEED[1].replace('https://', ''), { type: 'https', uri: `${SEED[1]}/`, api: true }]]),
+  });
+  assert.equal(found.invidious.filter((url) => url === SEED[1]).length, 1);
+  assert.equal(found.invidious[0], SEED[1]);
 });
 
 test('when the API is down the docs page is read instead, and said so', async () => {
@@ -80,15 +103,15 @@ test('when the API is down the docs page is read instead, and said so', async ()
       throw new Error('unexpected');
     },
   });
-  assert.equal(found.source, 'docs.invidious.io');
-  assert.equal(found.invidious.length, 3);
+  assert.equal(found.source, 'docs.invidious.io + seed');
+  assert.equal(found.invidious.length, 3 + SEED.filter((url) => !['https://yewtu.be', 'https://inv.nadeko.net', 'https://invidious.nerdvpn.de'].includes(url)).length);
 });
 
 test('an API that answers an empty list is not trusted over the page', async () => {
   const found = await refresh({
     fetchImpl: async (url) => (url === API_URL ? '[]' : DOCS_HTML),
   });
-  assert.equal(found.source, 'docs.invidious.io');
+  assert.equal(found.source, 'docs.invidious.io + seed');
 });
 
 test('nothing from either is an error, never an empty file', async () => {

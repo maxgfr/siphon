@@ -139,6 +139,9 @@
       <button type="button" class="chip-btn" id="useLocalhost">Use this computer</button>
       <button type="button" class="chip-btn" id="findInstance">Find a public instance</button>
     </div>
+    <!-- The first few Invidious instances from the list deployed beside the app,
+         each one tap away: an address to try directly, not a search to run. -->
+    <div id="suggested" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px" hidden></div>
     <p class="hint">
       Any of these, and it is recognised on its own:
       <strong>your own siphon server</strong> — the <code>server/</code> folder, one <code>docker run</code>.
@@ -192,8 +195,9 @@
       <input type="url" id="coreUrl" inputmode="url" autocapitalize="off" autocorrect="off"
              spellcheck="false" placeholder="ffmpeg-core.js from a CDN" />
       <p class="hint">
-        Where ffmpeg.wasm is fetched from the first time a download needs converting on this
-        device — about 32 MB, cached afterwards. Blank uses jsDelivr; set it to host your own copy.
+        ffmpeg.wasm is deployed beside this app and fetched from there the first time a download
+        needs converting on this device — about 32 MB, cached afterwards. Nothing to set. This is
+        only for pointing at a different build.
       </p>
       <p class="hint">
         <strong>The bridge.</strong> A userscript that lets this page fetch anything, with no

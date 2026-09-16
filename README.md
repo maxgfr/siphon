@@ -42,7 +42,10 @@ When nothing is behind the page, a YouTube link would fail on arrival —
 correctly, but nobody pastes a link in order to read about CORS. So on that
 first visit, *after* the screen is usable, siphon looks for a public instance,
 probes what it finds, and fills in the first address that actually answers.
-**Find a public instance** in settings does the same on demand.
+**Find a public instance** in settings does the same on demand, and beside it
+the first three instances of the bundled list are offered as **chips**: tap
+one and the address is filled in and tested — an instance to try directly,
+not a search to run.
 
 Where it looks, in order:
 
@@ -199,7 +202,22 @@ than it is true. Read from their source rather than their READMEs:
 | [Local YouTube Downloader](https://greasyfork.org/en/scripts/484735-local-youtube-downloader) | a userscript that runs **on youtube.com's own origin**, so InnerTube and googlevideo are same-origin |
 
 So no full-frontend YouTube client works from a foreign origin. The ones that
-work have a server, a native shell, or run *on the site*. The transferable idea
+work have a server, a native shell, or run *on the site*.
+
+The useful question for a page on GitHub Pages is a narrower one: **which of
+those servers are run in public, and answer a page?** Read the same way:
+
+| project | public instances? | usable from a page? | here |
+|---|---|---|---|
+| [Invidious](https://github.com/iv-org/invidious) | yes — the project publishes [its own list](https://docs.invidious.io/instances/), dozens of them | yes: `/api/v1/*` sends CORS, and `local=true` proxies the media through the instance | **the plan**: bundled list, refreshed daily, walked until one delivers |
+| [Piped](https://github.com/TeamPiped/Piped) | a [list](https://piped-instances.kavin.rocks/), mostly dark since YouTube's 2024–25 blocks | yes, the same way | supported; ranked after Invidious |
+| [cobalt](https://github.com/imputnet/cobalt) | a [list](https://instances.cobalt.best/), but most now want an API key or a Turnstile pass | yes, when one lets you in | supported; asked for the finished file |
+| [Materialious](https://github.com/Materialious/Materialious), [Yattee](https://github.com/yattee/yattee), [Clipious](https://github.com/lamarios/clipious) | — | — | clients of Invidious's API: any instance that serves them serves this app |
+| [NewPipe](https://github.com/TeamNewPipe/NewPipe), [LibreTube](https://github.com/libre-tube/LibreTube), [FreeTube](https://github.com/FreeTubeApp/FreeTube) | — | no: native apps, the extractor runs in the app | — |
+| yt-dlp behind an HTTP API (dozens of small projects) | no public ones worth naming — a public yt-dlp box is abuse bait and dies fast | — | that is what `server/` is, for you to run |
+
+Invidious is the one network that is public, plural, and page-friendly, which
+is why it carries YouTube here by default. The transferable idea
 is the last one, and its general form is not "run on youtube.com" but **run
 with a userscript manager's privileges**: a script granted `GM_xmlhttpRequest`
 with `@connect *` fetches any URL with no cross-origin rule at all, because the
@@ -271,6 +289,15 @@ Worth knowing before you rely on it with no helper set:
   row says so above half a gigabyte rather than letting the tab die quietly.
   Downloads that need *no* conversion, which is most of them, never touch the
   heap at all: they stream straight to disk.
+
+**The converter is deployed beside the app.** The Pages deploy and the Docker
+image run `scripts/vendor_ffmpeg.py`, which fetches the pinned
+`@ffmpeg/core` from npm, checks it against the integrity hash the registry
+publishes, and puts the loader and the 31 MB wasm under `web/vendor/ffmpeg/`.
+It is same-origin: nothing to configure, no CORS, no CDN to be blocked or
+slow, cached by the service worker like the rest. The CDN copy of the same
+version is the fallback for a deploy that skipped the step. Nothing is in git —
+a 31 MB binary would be paid for by every clone forever.
 
 ## The shortest setup: you are the client
 
@@ -594,7 +621,8 @@ fix, and the interface shows the running version next to the wordmark.
 
 The app has three settings, all optional and all empty to begin with: the
 **helper** address, its **access key** if it wants one, and, under Advanced,
-where **ffmpeg.wasm** is fetched from if you would rather not depend on a CDN.
+where **ffmpeg.wasm** is fetched from — blank means the copy deployed beside
+the app, so this is only for pointing at a different build.
 
 The server has the rest. All server-side, all environment variables:
 
@@ -677,7 +705,9 @@ npm test
 
 # browser mode, end to end — builds its own fixtures with ffmpeg, serves the
 # app and the media on two origins, and drives Chromium through the real UI.
-# Needs playwright and ffmpeg; SIPHON_CORE_URL points at a local ffmpeg.wasm.
+# Needs playwright and ffmpeg. With `python3 scripts/vendor_ffmpeg.py` run
+# once, the suite loads the converter from the app's own origin, as deployed;
+# SIPHON_CORE_URL overrides.
 npm run test:e2e
 
 # the app as deployed — HTTPS, a /siphon/ subpath, the service worker actually
@@ -741,10 +771,10 @@ still unproven.
 
 | suite | what it is | result |
 |---|---|---|
-| `pytest server/tests` | the server, including two against real yt-dlp | 119 pass |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh | 136 pass |
-| `npm run test:e2e` | the device alone, real Chromium, two origins, a fake Invidious | 33 pass |
-| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker | 36 pass |
+| `pytest server/tests` | the server, including two against real yt-dlp, and the converter vendoring | 124 pass |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh | 138 pass |
+| `npm run test:e2e` | the device alone, real Chromium, two origins, a fake Invidious, the bundled converter | 34 pass |
+| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the suggested chips | 39 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
 | `npm run test:split` | a server that only resolves, a device that downloads | 24 pass |
 | `npm run test:youtube` | YouTube, for real, in CI — through the relay, Piped, and the bundled Invidious list | informative — see below |
@@ -786,6 +816,9 @@ origin and the media on another, so the CORS path under test is the real one:
 
 - A progressive MP4 arrives byte-identical to the source, and the 32 MB
   converter is never requested — verified on the wire, not assumed.
+- The converter is loaded from the app's own origin with nothing configured —
+  the requests to `/app/vendor/ffmpeg/` are counted on the wire — and the
+  deployed suite checks the default resolves under the `/siphon/` subpath.
 - An HLS master is parsed, the right rendition chosen (`Best` → 1280×720;
   `480p` → 640×360 out of 180/360/720), segments fetched and remuxed into an
   MP4 that ffmpeg reads back as h264 + aac.

@@ -77,6 +77,8 @@ const TYPES = {
 
 let root = WEB;
 let hasApi = false;
+/** Files answered with test content instead of what is on disk, by path. */
+const overrides = new Map();
 
 const server = createServer(
   { key: readFileSync(join(WORK, 'key.pem')), cert: readFileSync(join(WORK, 'cert.pem')) },
@@ -92,6 +94,12 @@ const server = createServer(
     if (path === '/__api') {
       hasApi = url.searchParams.get('on') === '1';
       return response.writeHead(200).end(String(hasApi));
+    }
+
+    // A test's own answer for a file — through the service worker too, which
+    // is what page.route cannot reach.
+    if (overrides.has(path)) {
+      return response.writeHead(200, { 'Content-Type': 'application/json' }).end(overrides.get(path));
     }
 
     // The one endpoint that tells a container apart from a static host.
@@ -251,6 +259,12 @@ for (const [old, expected] of [
   await page.waitForTimeout(2000);
   // Start from nothing, whatever the first-visit probe found.
   await page.evaluate(() => localStorage.setItem('siphon:settings', JSON.stringify({ endpoint: '', key: '', helper: { kind: 'none', label: 'this device only' }, preset: 'video_best', subs: 'off' })));
+  // The bundled list names real hosts, and this suite contacts nothing off
+  // this machine — so the list is answered with addresses on this host before
+  // the sheet opens and turns it into chips. Set at the server, because the
+  // page's fetch goes through the service worker, where page.route cannot see it.
+  const listed = ['https://127.0.0.1:1/one', `${BASE}/two`, 'https://127.0.0.1:3/three', 'https://127.0.0.1:4/four'];
+  overrides.set('/siphon/instances.json', JSON.stringify({ invidious: listed }));
   await page.reload({ waitUntil: 'networkidle' });
   await page.waitForTimeout(1200);
   await page.click('#openSettings');
@@ -262,6 +276,20 @@ for (const [old, expected] of [
     cookies: document.getElementById('cookiesBlock').hidden,
   }));
   check('the sheet asks for one address, not a mode', fields.address && fields.modes === 0, JSON.stringify(fields));
+
+  // The bundled list, served beside the app under the subpath, becomes chips:
+  // an instance to tap, not a search to run.
+  await page.waitForSelector('#suggested button', { timeout: 5_000 }).catch(() => {});
+  const chips = await page.$$eval('#suggested button', (nodes) => nodes.map((node) => node.textContent.trim()));
+  check('the first three of the bundled list are offered as chips', chips.length === 3 && chips.every((host, i) => host === new URL(listed[i]).host), chips.join(', '));
+  await page.click('#suggested button:nth-child(2)');
+  await page.waitForFunction(() => !/checking/i.test(document.getElementById('statusText').textContent || ''), null, { timeout: 15_000 });
+  const tapped = { address: await page.inputValue('#endpoint'), status: (await page.textContent('#statusText')) || '' };
+  check('tapping one fills the address in and tests it', tapped.address === `${BASE}/two` && !/not checked|checking/i.test(tapped.status),
+    `${tapped.address} — ${tapped.status.slice(0, 60)}`);
+  overrides.delete('/siphon/instances.json');
+  // Back to an empty box for what follows, which is written for one.
+  await page.fill('#endpoint', '');
   check('the cookie jar is hidden until the address proves to be a server', fields.cookies === true);
 
   // Nothing filled in, and nothing behind the page: the status line must
@@ -315,6 +343,11 @@ for (const [old, expected] of [
     );
   });
   check('the settings sheet does not scroll sideways at phone width', overflow <= 0, `${overflow}px over`);
+
+  // The converter's default location is the app's own origin — under the
+  // subpath, as deployed — so a static host serves it with nothing configured.
+  const core = await page.evaluate(async () => (await import('./media.js')).DEFAULT_CORE_URL);
+  check('the converter defaults to the app\'s own origin', core.startsWith(`${BASE}/siphon/vendor/ffmpeg/`), core);
   await context.close();
 }
 
