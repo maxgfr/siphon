@@ -17,6 +17,7 @@ export { BackendError } from './errors.js';
 import { BackendError } from './errors.js';
 import { BrowserBackend } from './inbrowser.js';
 import { pipedResolver, invidiousResolver } from './extract.js';
+import { invidiousInstances } from './instances.js';
 import { relayEscape } from './net.js';
 export { detectEndpoint, privacyNote, describeEndpoint } from './endpoint.js';
 export { findInstance, looksUnreachable } from './instances.js';
@@ -301,7 +302,7 @@ export class Siphon {
       resolvers: [
         this.server ? serverResolver(this.server) : null,
         kind === 'piped' ? pipedResolver(endpoint) : null,
-        kind === 'invidious' ? invidiousResolver(endpoint) : null,
+        kind === 'invidious' ? invidiousResolver(endpoint, { others: () => invidiousInstances() }) : null,
       ],
     });
 

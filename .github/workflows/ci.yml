@@ -65,9 +65,11 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
-      # A public instance for the Piped path. Instances come and go and YouTube
-      # blocks them in waves; a failure here is information about that
-      # instance today, which is exactly what this job is for.
+      # The Piped path gets one public instance; the Invidious path walks the
+      # bundled list in web/instances.json, which is what a fresh visitor to
+      # the Pages deploy starts from. Instances come and go and YouTube blocks
+      # them in waves; a failure here is information about them today, which
+      # is exactly what this job is for.
       # First, what YouTube's API says to a bare request from this runner:
       # one hand-built call per client, no browser, no relay, no library. A
       # red below is read against this instead of guessed at.

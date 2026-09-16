@@ -18,7 +18,7 @@
 import { chromium } from 'playwright';
 import { spawn, execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { createReadStream, mkdirSync, rmSync, statSync } from 'node:fs';
+import { createReadStream, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeSync } from 'node:fs';
@@ -40,6 +40,12 @@ const VIDEO = process.env.SIPHON_YT_URL || 'https://www.youtube.com/watch?v=jNQX
 const APP_PORT = 8790;
 const RELAY_PORT = 8791;
 const PIPED = (process.env.SIPHON_PIPED_URL || '').replace(/\/+$/, '');
+// The bundled Invidious list, which is what a fresh visitor to the Pages
+// deploy starts from. Walked until one delivers, capped so a bad day for the
+// whole network cannot eat the deadline.
+const INVIDIOUS = process.env.SIPHON_INVIDIOUS_URL
+  ? [process.env.SIPHON_INVIDIOUS_URL.replace(/\/+$/, '')]
+  : JSON.parse(readFileSync(join(WEB, 'instances.json'), 'utf8')).invidious.slice(0, Number(process.env.SIPHON_INVIDIOUS_TRIES || 4));
 
 rmSync(OUT, { recursive: true, force: true });
 mkdirSync(OUT, { recursive: true });
@@ -50,10 +56,11 @@ mkdirSync(OUT, { recursive: true });
  * Every wait below has its own timeout, but a job that is informative rather
  * than gating must never be able to sit on a runner for hours: the first CI
  * run of this file did, and nothing it could have reported was worth that.
- * The per-attempt budget is 60 s probe + 150 s download; three attempts and
- * setup fit comfortably in twelve minutes, so anything past that is a hang.
+ * The per-attempt budget is 60 s probe + 150 s download; the relay attempts,
+ * the Piped one and a short walk of Invidious instances fit in twenty
+ * minutes, so anything past that is a hang.
  */
-const DEADLINE_MS = 12 * 60 * 1000;
+const DEADLINE_MS = 20 * 60 * 1000;
 setTimeout(() => {
   say(`\nFAIL watchdog: still running after ${DEADLINE_MS / 60000} minutes — hung while ${stage}`);
   process.exit(1);
@@ -241,7 +248,7 @@ page.on('response', async (response) => {
   const url = response.url();
   // An instance's every answer is worth a line, not only its refusals: the
   // question "was it even asked?" has to be answerable from the log.
-  const instance = PIPED && url.startsWith(PIPED);
+  const instance = (PIPED && url.startsWith(PIPED)) || INVIDIOUS.some((address) => url.startsWith(address));
   if (response.status() < 400 && !instance) return;
   const target = url.startsWith(`http://127.0.0.1:${RELAY_PORT}/?url=`) ? `relay -> ${decodeURIComponent(url.slice(url.indexOf('=') + 1))}` : url;
   if (target.startsWith(`http://127.0.0.1:${APP_PORT}`)) return; // a missing icon is not news
@@ -265,21 +272,26 @@ const verdict = (ok, label, detail = '') => {
   say(`${ok ? 'ok  ' : 'FAIL'} ${label}${detail ? ` — ${detail}` : ''}`);
 };
 
-async function attempt(preset, { piped = '' } = {}) {
-  const label = piped ? `${preset} via piped` : preset;
+async function attempt(preset, { piped = '', invidious = '' } = {}) {
+  const instance = piped || invidious;
+  const label = piped ? `${preset} via piped` : invidious ? `${preset} via ${new URL(invidious).host}` : preset;
   now(`${label}: loading the app`);
   await page.goto(`http://127.0.0.1:${APP_PORT}/`, { waitUntil: 'networkidle' });
   // One helper at a time, which is the app's model: the relay for the relay
-  // attempts, the instance for the Piped one.
+  // attempts, the instance for the Piped and Invidious ones. autoInstance is
+  // off so the app tests the address it was given, not one it went and found.
   await page.evaluate(
-    ([instance, relayUrl]) => {
+    ([address, kind, relayUrl]) => {
       localStorage.removeItem('siphon:queue');
       const settings = JSON.parse(localStorage.getItem('siphon:settings') || '{}');
-      settings.endpoint = instance || relayUrl;
-      settings.helper = instance ? { kind: 'piped', label: 'Piped instance' } : { kind: 'relay', label: 'relay' };
+      settings.endpoint = address || relayUrl;
+      settings.helper = kind === 'piped' ? { kind: 'piped', label: 'Piped instance' }
+        : kind === 'invidious' ? { kind: 'invidious', label: 'Invidious instance' }
+          : { kind: 'relay', label: 'relay' };
+      settings.autoInstance = false;
       localStorage.setItem('siphon:settings', JSON.stringify(settings));
     },
-    [piped, `http://127.0.0.1:${RELAY_PORT}`],
+    [instance, piped ? 'piped' : invidious ? 'invidious' : 'relay', `http://127.0.0.1:${RELAY_PORT}`],
   );
   await page.reload({ waitUntil: 'networkidle' });
   await page.check(`input[name="quality"][value="${preset}"]`);
@@ -355,6 +367,36 @@ if (PIPED) {
   }
 } else {
   say('\npiped instance: not set (SIPHON_PIPED_URL), skipped');
+}
+
+/*
+ * Invidious: the plan for the Pages deploy. The bundled list is walked until
+ * one instance delivers the video to the browser mode — which is exactly what
+ * a fresh visitor gets — and the verdict names the instance that did.
+ */
+{
+  say(`\ninvidious: ${INVIDIOUS.length} instance(s) from the bundled list`);
+  let delivered = null;
+  const refusals = [];
+  for (const address of INVIDIOUS) {
+    const r = await attempt('video_480', { invidious: address });
+    if (r.saved) {
+      const report = inspect(r.saved);
+      if (/Video: (h264|vp9|av1)/.test(report)) {
+        delivered = { address, client: r.client, size: (/\d{3,4}x\d{3,4}/.exec(report) || [])[0] || r.saved };
+        break;
+      }
+      refusals.push(`${new URL(address).host}: a file, but not video`);
+    } else {
+      refusals.push(`${new URL(address).host}: ${r.error}`);
+    }
+  }
+  for (const line of refusals) say(`   ${line.slice(0, 200)}`);
+  if (delivered) {
+    verdict(true, `invidious: video_480 produced real video through ${new URL(delivered.address).host} (${delivered.client})`, delivered.size);
+  } else {
+    verdict(false, `invidious: none of ${INVIDIOUS.length} instance(s) delivered the video`, refusals[0] || '');
+  }
 }
 
 verdict(pageErrors.length === 0, 'no uncaught errors in the page', pageErrors.slice(0, 2).join(' ; '));
