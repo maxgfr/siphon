@@ -63,6 +63,12 @@ COOKIES_FILE = Path(os.environ.get("COOKIES_FILE", "")) if os.environ.get("COOKI
 # offers it to the plugin; when unset, nothing changes.
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "").strip().rstrip("/")
 
+# yt-dlp's own commentary on stderr — which client it tried, whether a
+# proof-of-origin token was minted, what YouTube answered — is worth having
+# when the question is "why is this failing", and noise the rest of the time.
+# Off by default; the CI measurement turns it on so its log can say.
+YTDLP_VERBOSE = os.environ.get("YTDLP_VERBOSE", "").strip().lower() in ("1", "true", "yes")
+
 # A playlist is the one input that can turn a tap into hours of disk and
 # bandwidth, so it is capped rather than trusted. Raise it if you know what you
 # are asking for.
@@ -435,8 +441,9 @@ def build_options(job: Job, client: str | None) -> dict[str, Any]:
         # fits 150 characters can still blow past a 255-byte filesystem limit.
         "outtmpl": str(job.directory / outtmpl_for(job)),
         "noplaylist": not job.is_playlist,
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": not YTDLP_VERBOSE,
+            "verbose": YTDLP_VERBOSE,
+        "no_warnings": not YTDLP_VERBOSE,
         "noprogress": True,
         "restrictfilenames": False,
         "windowsfilenames": True,
@@ -728,6 +735,9 @@ async def health(request: Request) -> dict[str, Any]:
         "service": "siphon",
         "ytDlpVersion": yt_dlp.version.__version__,
         "ffmpeg": shutil.which("ffmpeg") is not None,
+        # Whether yt-dlp has a JavaScript runtime to solve YouTube's signature
+        # challenge with. Without one, formats go missing; the page says so.
+        "jsRuntime": shutil.which("deno") is not None,
         # What this server can do for a page. `jobs` needs ffmpeg to be worth
         # much; `resolve` and `tunnel` need only yt-dlp, and let the page do
         # the downloading and converting itself.
@@ -748,8 +758,9 @@ async def probe(body: ProbeRequest, authorization: str | None = Header(default=N
 
     def extract() -> dict[str, Any]:
         options = {
-            "quiet": True,
-            "no_warnings": True,
+            "quiet": not YTDLP_VERBOSE,
+            "verbose": YTDLP_VERBOSE,
+            "no_warnings": not YTDLP_VERBOSE,
             "skip_download": True,
             # Look at the playlist without extracting every entry: a 200-track
             # album would otherwise mean 200 round trips before the page can
@@ -1092,8 +1103,9 @@ def resolve_url(url: str) -> dict[str, Any]:
     last_error: Exception | None = None
     for index, client in enumerate(attempts):
         options: dict[str, Any] = {
-            "quiet": True,
-            "no_warnings": True,
+            "quiet": not YTDLP_VERBOSE,
+            "verbose": YTDLP_VERBOSE,
+            "no_warnings": not YTDLP_VERBOSE,
             "skip_download": True,
             # A link that is a video *inside* a playlist stays one video; a link
             # that is only a playlist comes back as one, and is answered as a

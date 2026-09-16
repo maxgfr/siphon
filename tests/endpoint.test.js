@@ -149,6 +149,8 @@ test('the sentences follow from the kind', () => {
   assert.match(privacyNote({ kind: 'siphon', ffmpeg: true }), /your server/i);
   assert.match(privacyNote({ kind: 'siphon', ffmpeg: false }), /resolves/i);
   assert.match(describeEndpoint({ kind: 'siphon', ffmpeg: false, label: 'yt-dlp 1' }), /no ffmpeg/i);
+  assert.match(describeEndpoint({ kind: 'siphon', ffmpeg: true, jsRuntime: false, label: 'yt-dlp 1' }), /no JavaScript runtime.*Deno/i);
+  assert.doesNotMatch(describeEndpoint({ kind: 'siphon', ffmpeg: true, label: 'yt-dlp 1' }), /JavaScript runtime/, 'an older server that says nothing is not warned about');
   assert.match(describeEndpoint({ kind: 'relay' }), /relay/i);
   assert.match(privacyNote({ kind: 'invidious' }), /Invidious instance/);
   assert.match(describeEndpoint({ kind: 'invidious' }), /An Invidious instance/);

@@ -105,6 +105,9 @@ def test_health_reports_what_the_ui_needs(client: TestClient) -> None:
     # The frontend greys out audio presets when ffmpeg is missing, so this key
     # has to be present even when the answer is False.
     assert "ffmpeg" in body
+    # And whether yt-dlp has a JavaScript runtime for YouTube's signature
+    # challenge; present either way, so the page can warn when it is False.
+    assert "jsRuntime" in body
     assert {p["id"] for p in body["presets"]} == set(server_app.PRESETS)
 
 
@@ -1021,3 +1024,13 @@ def test_a_single_video_reports_its_subtitles_and_no_playlist(client: TestClient
     assert body["subtitles"] == [{"lang": "en", "ext": "vtt", "url": "https://subs.example/en.vtt", "auto": False}]
     # And the page can actually fetch it: the subtitle host is tunnelable too.
     assert "subs.example" in server_app.TUNNEL_HOSTS
+
+
+def test_yt_dlp_is_quiet_unless_asked_to_speak(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CI measurement turns verbose on to read what yt-dlp said; nobody else pays for it."""
+    job = server_app.Job(id="j", url="https://www.youtube.com/watch?v=abc", preset="video_best")
+    quiet = server_app.build_options(job, None)
+    assert quiet["quiet"] is True and quiet["verbose"] is False and quiet["no_warnings"] is True
+    monkeypatch.setattr(server_app, "YTDLP_VERBOSE", True)
+    loud = server_app.build_options(job, None)
+    assert loud["quiet"] is False and loud["verbose"] is True and loud["no_warnings"] is False

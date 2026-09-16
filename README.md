@@ -182,7 +182,11 @@ the next one if the previous fails:
 If all three fail it is almost certainly the IP: datacentre ranges get the
 strictest treatment, which is why your own machine is the first option here.
 And check the version — `docker compose build --pull` refreshes a months-old
-yt-dlp; the header shows the running one. The `server-youtube` job measures
+yt-dlp; the header shows the running one. Running the server outside the
+image? yt-dlp has needed a JavaScript runtime for YouTube since late 2025
+(it solves the signature challenge with YouTube's own player script); the
+image ships [Deno](https://deno.com), and **Test** in settings says when a
+server has none. The `server-youtube` job measures
 this path on every pull request, from a runner, plain and with the provider
 ([what it found](docs/verified.md#youtube-and-what-is-still-unproven)).
 
@@ -324,7 +328,9 @@ you first — ffmpeg.wasm wants the whole input in memory.
 ## Development
 
 ```sh
-pip install -r server/requirements.txt pytest httpx
+pip install -r server/requirements.txt pytest httpx       # yt-dlp[default] carries the signature solver
+# and a JavaScript runtime beside it — Deno — which yt-dlp needs for YouTube since late 2025;
+# the Docker image ships one, and the settings sheet says when a server has none.
 WEB_DIR=web uvicorn server.app:app --reload --port 8000   # the server
 pytest server/tests -q                                    # 124
 npm test                                                  # 170 — the extractor, detection, the measurements

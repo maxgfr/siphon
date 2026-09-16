@@ -104,6 +104,11 @@ jobs:
           python-version: "3.12"
       - run: pip install -r server/requirements.txt bgutil-ytdlp-pot-provider
       - run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+      # The JavaScript runtime yt-dlp solves YouTube's signature challenge
+      # with, as the Docker image ships it.
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
       - uses: actions/setup-node@v4
         with:
           node-version: "22"

@@ -9,6 +9,14 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
+# A JavaScript runtime is not optional either, since late 2025: YouTube's
+# signature challenge is solved by running its own player script, and yt-dlp
+# does that with an external runtime — Deno by default — plus the solver
+# scripts that ship in the yt-dlp[default] extras. Without the runtime it
+# warns that YouTube extraction is deprecated and formats go missing. The
+# official image publishes the bare binary for amd64 and arm64.
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
 WORKDIR /app
 
 COPY server/requirements.txt ./requirements.txt

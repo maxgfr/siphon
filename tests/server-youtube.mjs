@@ -107,6 +107,9 @@ async function startServer({ pot = '' } = {}) {
     // that check is. A YouTube run leaves the guard on.
     ...(IS_YOUTUBE ? {} : { ALLOW_PRIVATE_HOSTS: '1' }),
     POT_PROVIDER_URL: pot,
+    // yt-dlp's own commentary, so the log can say whether the provider was
+    // asked for a token and what YouTube answered, not only that it failed.
+    YTDLP_VERBOSE: '1',
   };
   delete env.AUTH_TOKEN;
   const child = spawn(PYTHON, ['-m', 'uvicorn', 'server.app:app', '--host', '127.0.0.1', '--port', String(PORT), '--log-level', 'warning'], {
@@ -118,6 +121,7 @@ async function startServer({ pot = '' } = {}) {
   child.stdout.on('data', (chunk) => { log += chunk; });
   child.stderr.on('data', (chunk) => { log += chunk; });
   child.on('exit', (code) => { if (code !== null && code !== 0 && stage !== 'closing') say(`   server exited with code ${code}\n${log.slice(-800)}`); });
+  child.said = () => log;
 
   const started = Date.now();
   while (Date.now() - started < 30_000) {
@@ -157,7 +161,7 @@ async function pass({ pot = '' } = {}) {
   say(`\n=== server, ${label}`);
   now(`${label}: starting the server`);
   const { child, health } = await startServer({ pot });
-  say(`   yt-dlp ${health.ytDlpVersion}, ffmpeg ${health.ffmpeg ? 'present' : 'MISSING'}, provider ${health.potProvider ? 'configured' : 'off'}, cookies ${health.hasCookies ? 'stored' : 'none'}`);
+  say(`   yt-dlp ${health.ytDlpVersion}, ffmpeg ${health.ffmpeg ? 'present' : 'MISSING'}, JS runtime ${health.jsRuntime ? 'present' : 'MISSING'}, provider ${health.potProvider ? 'configured' : 'off'}, cookies ${health.hasCookies ? 'stored' : 'none'}`);
 
   // 1. Resolve: the extractor alone, no download. This is what the split
   //    (a device downloading through the tunnel) starts with.
@@ -208,6 +212,14 @@ async function pass({ pot = '' } = {}) {
       verdict(false, `${label}: ${preset} did not produce a file (client ${job.client || '-'}, ${job.attempts || 0} wall(s) hit, ${job.state})`, String(job.error || 'no error text').slice(0, 400));
     }
   }
+
+  // What yt-dlp said while all that happened: the lines about clients, tokens
+  // and refusals, which are the evidence — in particular whether the provider
+  // was ever asked for a token, and what YouTube answered when it was.
+  const said = child.said().split(/\r?\n/).filter((line) => /po.?token|pot|proof|client|sign in|not a bot|warning|error|extract/i.test(line) && !/uvicorn|INFO:/.test(line));
+  const unique = [...new Set(said.map((line) => line.replace(/\x1b\[[0-9;]*m/g, '').trim()))].filter(Boolean);
+  say(`   yt-dlp said (${unique.length} distinct line(s) about clients, tokens and refusals):`);
+  for (const line of unique.slice(0, 40)) say(`      ${line.slice(0, 220)}`);
 
   now('closing');
   child.kill();
