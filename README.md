@@ -55,6 +55,9 @@ api.allorigins.win  robots: HTTP 522     (down)
 cors.eu.org         robots: HTTP 403
 thingproxy          ENOTFOUND            (gone)
 → no relay passed; the site keeps none
+
+(a later run the same day: api.allorigins.win answered robots with CORS
+ once, then HTTP 522 for every Invidious instance asked through it)
 ```
 
 Not one free proxy would fetch `robots.txt` for a page, so the site ships
@@ -76,9 +79,22 @@ once.
 
 The first cobalt measurement (2026-09-16) found the directory it was written
 against, `instances.cobalt.best`, gone from DNS — `fetch failed` from the
-runner, no answer from any resolver — so it read nothing. The run now names
-each directory with what it said, and shows the first bytes of an answer it
-cannot read, so the next log settles it either way.
+runner, no answer from any resolver — so it read nothing. The second, the
+same day, reached its successor and was turned away at the door:
+
+```
+cobalt instances:
+no   directory https://cobalt.directory/api/working?type=api: HTTP 403 — <!DOCTYPE html>…<title>Just a moment...</title>
+no   directory https://cobalt.directory/api/tests: HTTP 403 — <!DOCTYPE html>…<title>Just a moment...</title>
+```
+
+That is a browser challenge, served to anything that is not a browser. So
+the run now reads the list the site is built from — the instances that asked
+to be listed, one file each under `backend/instances` in
+[its repository](https://codeberg.org/hyperdefined/cobalt.directory), through
+Codeberg's plain API — and names each directory and the source with what it
+said, showing the first bytes of an answer it cannot read, so the next log
+settles it either way.
 
 ### What a browser can do about YouTube in 2026 — the research
 
@@ -909,7 +925,7 @@ still unproven.
 | suite | what it is | result |
 |---|---|---|
 | `pytest server/tests` | the server, including two against real yt-dlp, and the converter vendoring | 124 pass |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh, the relay-side walk, the page check, the cobalt measurement and its directory's shapes | 167 pass |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them | 170 pass |
 | `npm run test:e2e` | the device alone, real Chromium, two origins, a fake Invidious, the bundled converter | 34 pass |
 | `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips, the guide, the site's relay or cobalt instance | 55 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
