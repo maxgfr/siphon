@@ -650,6 +650,43 @@ function toFormat(format, index) {
   };
 }
 
+/* ---------------------------------------------------------------- instances */
+
+/**
+ * How long an instance gets to answer an API call.
+ *
+ * An instance that is down usually refuses, which is instant. One that
+ * drops the connection — a firewall that swallows datacentre traffic, an
+ * overloaded box — hangs, and without a bound the walk to the next replica
+ * waits on it forever. Fifteen seconds is generous for a JSON answer and
+ * short enough that three dead replicas cost under a minute, not ten.
+ */
+export const INSTANCE_TIMEOUT_MS = 15_000;
+
+/**
+ * The caller's signal, if any, plus the bound — whichever fires first.
+ *
+ * A plain timer rather than `AbortSignal.timeout`, for two reasons: the
+ * caller's signal has to be folded in without `AbortSignal.any`, which is
+ * newer than some phones' browsers, and a timeout signal's timer is unref'd
+ * under Node, which lets a test's event loop drain mid-request. `release`
+ * clears the timer once the answer is in, so a fast reply costs no wait.
+ */
+function bounded(signal, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new DOMException(`no answer within ${ms} ms`, 'TimeoutError')), ms);
+  const forward = () => controller.abort(signal.reason);
+  if (signal?.aborted) forward();
+  else signal?.addEventListener('abort', forward, { once: true });
+  return {
+    signal: controller.signal,
+    release: () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', forward);
+    },
+  };
+}
+
 /* -------------------------------------------------------------------- piped */
 
 /**
@@ -736,13 +773,17 @@ export function pipedResolver(base) {
 async function extractPiped(id, url, context) {
   const base = String(context.piped || '').replace(/\/+$/, '');
   let body;
+  const bound = bounded(context.signal, context.instanceTimeout ?? INSTANCE_TIMEOUT_MS);
   try {
-    body = await context.net.json(`${base}/streams/${encodeURIComponent(id)}`, { signal: context.signal });
+    body = await context.net.json(`${base}/streams/${encodeURIComponent(id)}`, { signal: bound.signal });
   } catch (error) {
+    bound.release();
+    if (context.signal?.aborted) throw error;
     throw new BackendError('The Piped instance did not answer for that video.', {
       hint: `${error instanceof BackendError ? error.message : 'It may be down, rate-limited, or blocked by YouTube.'} Instances come and go; try another, a relay, or your own server.`,
     });
   }
+  bound.release();
   if (body?.error) {
     throw new BackendError(`The Piped instance says: ${String(body.error).slice(0, 160)}`, {
       hint: 'That is YouTube refusing the instance, not this app. Try another instance, a relay, or your own server.',
@@ -858,7 +899,7 @@ const ABOUT_THE_VIDEO = /\bprivate\b|\bunavailable\b|\bmembers|\bage[- ]?restric
  * @param {{ others?: () => Promise<string[]>, spare?: number }} [options]
  *   `others` yields the bundled list; `spare` caps how many more are asked
  */
-export function invidiousResolver(base, { others = async () => [], spare = 3 } = {}) {
+export function invidiousResolver(base, { others = async () => [], spare = 3, timeout = INSTANCE_TIMEOUT_MS } = {}) {
   const root = String(base || '').trim().replace(/\/+$/, '');
   if (!root) return null;
   return {
@@ -869,7 +910,7 @@ export function invidiousResolver(base, { others = async () => [], spare = 3 } =
       if (!id) throw new BackendError('That YouTube link has no video in it.', { retryable: false });
       let failure;
       try {
-        return await extractInvidious(id, url, { ...context, invidious: root });
+        return await extractInvidious(id, url, { ...context, invidious: root, instanceTimeout: timeout });
       } catch (error) {
         if (error instanceof BackendError && error.retryable === false) throw error;
         failure = error;
@@ -881,7 +922,7 @@ export function invidiousResolver(base, { others = async () => [], spare = 3 } =
       for (const replica of replicas) {
         if (context.signal?.aborted) throw failure;
         try {
-          return await extractInvidious(id, url, { ...context, invidious: replica });
+          return await extractInvidious(id, url, { ...context, invidious: replica, instanceTimeout: timeout });
         } catch (error) {
           if (error instanceof BackendError && error.retryable === false) throw error;
           failure = error;
@@ -900,15 +941,24 @@ export function invidiousResolver(base, { others = async () => [], spare = 3 } =
 async function extractInvidious(id, url, context) {
   const base = String(context.invidious || '').replace(/\/+$/, '');
   let body;
+  const bound = bounded(context.signal, context.instanceTimeout ?? INSTANCE_TIMEOUT_MS);
   try {
     // `local=true` is the whole point: without it the URLs are googlevideo's
     // own, and those refuse a page before the first byte.
-    body = await context.net.json(`${base}/api/v1/videos/${encodeURIComponent(id)}?local=true`, { signal: context.signal });
+    body = await context.net.json(`${base}/api/v1/videos/${encodeURIComponent(id)}?local=true`, { signal: bound.signal });
   } catch (error) {
-    throw new BackendError('The Invidious instance did not answer for that video.', {
-      hint: `${error instanceof BackendError ? error.message : 'It may be down, rate-limited, or blocked by YouTube.'} Instances come and go; try another, a relay, or your own server.`,
-    });
+    bound.release();
+    // The person cancelling is not the instance failing.
+    if (context.signal?.aborted) throw error;
+    const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+    throw new BackendError(
+      timedOut ? `${new URL(base).host} did not answer within ${Math.round((context.instanceTimeout ?? INSTANCE_TIMEOUT_MS) / 1000)}s.` : 'The Invidious instance did not answer for that video.',
+      {
+        hint: `${error instanceof BackendError ? error.message : 'It may be down, rate-limited, or blocked by YouTube.'} Instances come and go; try another, a relay, or your own server.`,
+      },
+    );
   }
+  bound.release();
   if (body?.error) {
     // "This video is private" is the same on every instance; "sign in to
     // confirm you're not a bot" is YouTube talking to *this* instance, and

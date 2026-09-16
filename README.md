@@ -772,7 +772,7 @@ still unproven.
 | suite | what it is | result |
 |---|---|---|
 | `pytest server/tests` | the server, including two against real yt-dlp, and the converter vendoring | 124 pass |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh | 138 pass |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh | 141 pass |
 | `npm run test:e2e` | the device alone, real Chromium, two origins, a fake Invidious, the bundled converter | 34 pass |
 | `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the suggested chips | 39 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
@@ -936,6 +936,19 @@ The same job then walks the bundled Invidious list from the runner — the path
 a fresh visitor to the Pages deploy takes — and its verdict names the instance
 that delivered the video to the browser mode, or every refusal if none did.
 That is the measurement for the plan as shipped, made on every pull request.
+
+The first such walk (2026-09-16) was instructive in a way a green would not
+have been: three public instances answered the runner with **nothing** — not
+a 403, not a 429, no response at all — and each silently ate the full probe
+and download budget before the next was tried. Two things changed because of
+it. Every call to an instance is now bounded to fifteen seconds, so a replica
+that swallows the connection costs fifteen seconds and the walk moves on,
+with the row naming who kept quiet. And the job now says *why*: a bare
+request to each instance from the runner before any browser opens, and the
+browser's own reason for a request that never completed. Whether those
+instances drop datacentre traffic on purpose or were simply down that hour is
+what the next walks will show; from a phone on a home connection they are
+not the same question at all.
 
 **So this is not verified:** a completed YouTube download from the browser
 mode. The code is correct up to the wall, checked request by request, but no

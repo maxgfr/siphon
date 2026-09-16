@@ -180,6 +180,24 @@ await within(10_000, 'app.listen', new Promise((resolve, reject) => {
   const direct = await probe(ROBOTS);
   if (direct) bail(`youtube.com is not reachable from this machine — ${direct}`);
 
+  // And what each Invidious instance says to a bare request from this
+  // machine, before any browser is involved: a status is an answer, a
+  // timeout is the instance (or a firewall in front of it) swallowing the
+  // runner's traffic, and the two read very differently in the walk below.
+  say('\ninvidious instances, straight from this machine:');
+  for (const address of INVIDIOUS) {
+    const started = Date.now();
+    let line;
+    try {
+      const response = await fetch(`${address}/api/v1/stats`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
+      const body = (await response.text()).replace(/\s+/g, ' ').slice(0, 120);
+      line = `HTTP ${response.status} in ${Date.now() - started}ms — ${body}`;
+    } catch (error) {
+      line = error?.name === 'TimeoutError' ? `no answer in 15s` : `${error?.cause?.code || error?.name || 'error'}: ${String(error?.cause?.message || error?.message || error).slice(0, 120)}`;
+    }
+    say(`   ${new URL(address).host.padEnd(28)} ${line}`);
+  }
+
   now('preflight: youtube.com through the relay');
   const relayed = await probe(`http://127.0.0.1:${RELAY_PORT}/?url=${encodeURIComponent(ROBOTS)}`);
   if (relayed) bail(`youtube.com is reachable, but not through the relay — ${relayed}`);
@@ -260,6 +278,15 @@ page.on('response', async (response) => {
   }
   say(`   ${response.status()} ${target.slice(0, 160)}\n        ${body}`);
 });
+// A request that never got a response is the one case the response listener
+// above cannot describe — and it is what three Invidious instances did to
+// the first walk. The browser's own reason for giving up is the fact to log.
+page.on('requestfailed', (request) => {
+  const url = request.url();
+  const instance = (PIPED && url.startsWith(PIPED)) || INVIDIOUS.some((address) => url.startsWith(address));
+  if (!instance) return;
+  say(`   FAILED ${url.slice(0, 160)}\n        ${request.failure()?.errorText || '(no reason given)'}`);
+});
 page.on('request', (request) => {
   const url = request.url();
   if (/googlevideo\.com/.test(url)) routes.direct += 1;
@@ -302,7 +329,14 @@ async function attempt(preset, { piped = '', invidious = '' } = {}) {
   let client = '(no preview)';
   now(`${label}: probing the video`);
   try {
-    await page.waitForSelector('.preview-meta:not(.skeleton)', { timeout: 60_000 });
+    // A preview, or the app's own sentence about why there is none — whichever
+    // comes first. Waiting the full minute on a probe that failed in fifteen
+    // seconds is what made the first walk take three and a half minutes an
+    // instance.
+    await page.waitForFunction(
+      () => document.querySelector('.preview-meta:not(.skeleton)') || (document.getElementById('feedback')?.textContent || '').trim(),
+      null, { timeout: 60_000 });
+    if (!(await page.$('.preview-meta:not(.skeleton)'))) throw new Error('no preview');
     client = ((await page.textContent('.preview-meta')) || '').split('·').pop().trim();
   } catch {
     // A probe the app refused outright is written to #feedback as a sentence;
