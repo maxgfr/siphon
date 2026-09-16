@@ -11,7 +11,7 @@
  * primary action pinned within thumb reach, and no interaction that needs a
  * hover or a precise tap.
  */
-import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, invidiousInstances, looksUnreachable, privacyNote, describeEndpoint } from './api.js';
+import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, invidiousInstances, looksUnreachable, privacyNote, describeEndpoint, servesPages } from './api.js';
 
 const SETTINGS_KEY = 'siphon:settings';
 const POLL_MS = 700;
@@ -193,7 +193,7 @@ async function offerPublicInstance() {
   } catch {
     /* storage off: offering once per session is the harmless side */
   }
-  const found = await findInstance({ detect: (address) => detectEndpoint(address) }).catch(() => null);
+  const found = await findInstance({ detect: (address) => detectEndpoint(address), verify: servesPages }).catch(() => null);
   try {
     localStorage.setItem(INSTANCE_OFFERED, '1');
   } catch { /* nothing to do */ }
@@ -554,6 +554,7 @@ async function switchInstance(entry) {
   const dead = hostOf(settings.endpoint);
   const found = await findInstance({
     detect: (address) => detectEndpoint(address),
+    verify: servesPages,
     exclude: [...spentInstances],
   }).catch(() => null);
   if (!found) {
@@ -1166,9 +1167,9 @@ function init() {
     button.disabled = true;
     setStatus('', 'Looking for one that answers…');
     try {
-      const found = await findInstance({ detect: (address) => detectEndpoint(address) });
+      const found = await findInstance({ detect: (address) => detectEndpoint(address), verify: servesPages });
       if (!found) {
-        setStatus('bad', 'No public instance answered. They come and go; try again later, or run your own.');
+        setStatus('bad', 'No public instance will answer this page for a video right now. Most keep that door shut; a relay or your own server is not refused.');
         return;
       }
       $('endpoint').value = found.endpoint;

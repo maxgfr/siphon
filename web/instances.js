@@ -162,6 +162,39 @@ function interleave(lists) {
   return out;
 }
 
+/** A public video that is not going anywhere: the first one ever uploaded. */
+const SAMPLE_ID = 'jNQXAC9IVRw';
+
+/**
+ * Whether an instance will answer a *page* for a video, not just for its
+ * own name.
+ *
+ * The probe that recognises an instance is its stats endpoint, which every
+ * public instance answers to anyone. The endpoint a download needs is a
+ * different door, and most public instances now keep it shut to web pages:
+ * a 403 "Endpoint disabled", a reverse proxy's 403, no CORS header. Taking
+ * such an instance as the helper hands the person a failure later, with a
+ * sentence about cross-origin headers. So the video endpoint is asked, from
+ * this page, before an instance is adopted — a fetch that the browser
+ * refuses is a no, exactly as it would be for the real link.
+ */
+export async function servesPages(endpoint, helper, { fetchImpl = globalThis.fetch, timeout = 8000 } = {}) {
+  const kind = helper?.kind;
+  const path = kind === 'invidious' ? `/api/v1/videos/${SAMPLE_ID}?local=true` : kind === 'piped' ? `/streams/${SAMPLE_ID}` : null;
+  if (!path) return true;
+  try {
+    const response = await fetchImpl(`${trimSlash(endpoint)}${path}`, { credentials: 'omit', signal: AbortSignal.timeout(timeout) });
+    if (!response.ok) return false;
+    const body = await response.json();
+    const streams = kind === 'invidious'
+      ? [...(body?.formatStreams || []), ...(body?.adaptiveFormats || [])]
+      : [...(body?.videoStreams || []), ...(body?.audioStreams || [])];
+    return streams.some((stream) => stream?.url);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Find a public instance that actually answers.
  *
@@ -171,9 +204,12 @@ function interleave(lists) {
  * @param {number} [options.candidates]  how many addresses to probe at most
  * @param {number} [options.timeout]  per-request budget, milliseconds
  * @param {string[]} [options.exclude]  addresses already known not to work
+ * @param {(endpoint: string, helper: object) => Promise<boolean>} [options.verify]
+ *   a second question after recognition — the app asks `servesPages`, so an
+ *   instance that will refuse the page for a video is never adopted
  * @returns {Promise<{ endpoint: string, helper: object }|null>}
  */
-export async function findInstance({ fetchImpl = globalThis.fetch, detect, candidates = 8, timeout = 6000, exclude = [] } = {}) {
+export async function findInstance({ fetchImpl = globalThis.fetch, detect, candidates = 8, timeout = 6000, exclude = [], verify = async () => true } = {}) {
   const seen = new Set(exclude.map(trimSlash));
   const fresh = (addresses) =>
     addresses.filter((address) => {
@@ -188,8 +224,10 @@ export async function findInstance({ fetchImpl = globalThis.fetch, detect, candi
           try {
             const helper = await detect(endpoint);
             // A siphon server or a relay in a public instance list is not what
-            // was asked for; only the kinds that answer for a video count.
-            return helper && PUBLIC.has(helper.kind) ? { endpoint, helper } : null;
+            // was asked for; only the kinds that answer for a video count —
+            // and only if they answer this page for one.
+            if (!helper || !PUBLIC.has(helper.kind)) return null;
+            return (await verify(endpoint, helper)) ? { endpoint, helper } : null;
           } catch {
             return null;
           }
