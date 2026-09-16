@@ -9,7 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { findInstance, invidiousInstances, looksUnreachable, DIRECTORIES, SEED } from '../web/instances.js';
+import { findInstance, invidiousInstances, looksUnreachable, servesPages, DIRECTORIES, SEED } from '../web/instances.js';
 
 /** A fetch that answers the directories from a table, and records the asks. */
 function directories(table) {
@@ -351,4 +351,42 @@ test('a failure about the video is not', () => {
   ]) {
     assert.equal(looksUnreachable(message), false, message);
   }
+});
+
+/* ------------------------------------------ does it answer a page for a video? */
+
+test('an instance is adopted only if it answers this page for a video, not just for its name', async () => {
+  const { fetchImpl } = directories({ bundled: ['https://shut.example', 'https://open.example'], [COBALT_LIST]: [], [PIPED_LIST]: [], [INVIDIOUS_LIST]: [] });
+  const { detect, probed } = prober({
+    'https://shut.example': { kind: 'invidious', label: 'Invidious instance' },
+    'https://open.example': { kind: 'invidious', label: 'Invidious instance' },
+  });
+  const verified = [];
+  const verify = async (endpoint) => {
+    verified.push(endpoint);
+    return endpoint === 'https://open.example';
+  };
+  const found = await findInstance({ fetchImpl, detect, verify });
+  assert.equal(found.endpoint, 'https://open.example');
+  assert.ok(probed.includes('https://shut.example') && verified.includes('https://shut.example'), 'the shut one was recognised, then asked, then left');
+});
+
+test('servesPages asks the video endpoint and reads the answer the way the download would', async () => {
+  const asked = [];
+  const fetchImpl = async (url) => {
+    asked.push(url);
+    if (url.startsWith('https://open.example/api/v1/videos/')) return new Response(JSON.stringify({ formatStreams: [{ url: '/videoplayback?itag=18' }] }), { status: 200 });
+    if (url.startsWith('https://shut.example/')) return new Response('Endpoint disabled', { status: 403 });
+    if (url.startsWith('https://empty.example/')) return new Response(JSON.stringify({ error: 'no' }), { status: 200 });
+    if (url.startsWith('https://piped.example/streams/')) return new Response(JSON.stringify({ videoStreams: [{ url: 'https://p/x' }] }), { status: 200 });
+    throw new TypeError('Failed to fetch'); // what a CORS refusal looks like from a page
+  };
+  const inv = { kind: 'invidious' };
+  assert.equal(await servesPages('https://open.example/', inv, { fetchImpl }), true);
+  assert.ok(asked[0].startsWith('https://open.example/api/v1/videos/') && asked[0].includes('local=true'), asked[0]);
+  assert.equal(await servesPages('https://shut.example', inv, { fetchImpl }), false, 'a 403 is a no');
+  assert.equal(await servesPages('https://empty.example', inv, { fetchImpl }), false, 'an answer with no streams is a no');
+  assert.equal(await servesPages('https://cors.example', inv, { fetchImpl }), false, 'a refused fetch is a no');
+  assert.equal(await servesPages('https://piped.example', { kind: 'piped' }, { fetchImpl }), true);
+  assert.equal(await servesPages('https://c.example', { kind: 'cobalt' }, { fetchImpl }), true, 'cobalt has no such endpoint to ask; its own request is the test');
 });

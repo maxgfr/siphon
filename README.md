@@ -43,11 +43,30 @@ the whole reason this is measured daily rather than written once. A public
 proxy is a stranger's server that sees every link routed through it, and
 the app says so on screen; your own relay is named as the site's.
 
-**Running this site for others?** Deploy the relay once, then set the
-repository variable `SIPHON_RELAY_URL` to its address (Settings → Secrets and
-variables → Actions → Variables). It wins over any public proxy the moment
-it passes the same checks, and the next Pages deploy applies it without
-waiting for the daily run.
+The first measurement (2026-09-16) is worth quoting, because it settles what
+a page can count on from strangers:
+
+```
+corsproxy.io        robots: HTTP 401     (a key is required)
+api.cors.lol        robots: HTTP 429     (rate-limited)
+proxy.corsfix.com   robots: HTTP 403     (origin refused)
+api.codetabs.com    robots: HTTP 522     (down)
+api.allorigins.win  robots: HTTP 522     (down)
+cors.eu.org         robots: HTTP 403
+thingproxy          ENOTFOUND            (gone)
+→ no relay passed; the site keeps none
+```
+
+Not one free proxy would fetch `robots.txt` for a page, so the site ships
+with no relay, and a fresh visitor is not pointed at a dead one. The
+measurement keeps running daily in case that changes; it is not the plan.
+
+**Running this site for others?** This is the plan. Deploy the relay once,
+then set the repository variable `SIPHON_RELAY_URL` to its address (Settings
+→ Secrets and variables → Actions → Variables). It wins over any public proxy
+the moment it passes the same checks, and the next Pages deploy applies it
+without waiting for the daily run. Every visitor then has YouTube with
+nothing to configure.
 
 The app always says which helper is in use, in the header and in the guide.
 
@@ -108,7 +127,12 @@ Where it looks, in order:
 The directory is a hint; the probe is the truth. A list can be stale, a host
 can be down, an instance can be blocked by YouTube this week, and none of that
 is visible in a JSON file — so nothing is used until it has answered for
-itself, through the same detection a typed-in address goes through. Invidious
+itself, through the same detection a typed-in address goes through — **and,
+for an instance, until it has answered this page for a video**: the stats
+endpoint that recognises an instance is open to everyone, the video endpoint
+a download needs is shut to pages on most public instances now, and an
+instance that would refuse the real link is not adopted on the strength of
+its name. Invidious
 ranks first among the public kinds because it is the only one with a real
 chance of answering a page at all; cobalt's public instances mostly want a key
 or a Turnstile pass today, and Piped's network has largely gone dark. Read
@@ -835,7 +859,7 @@ still unproven.
 | suite | what it is | result |
 |---|---|---|
 | `pytest server/tests` | the server, including two against real yt-dlp, and the converter vendoring | 124 pass |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh, the relay-side walk | 144 pass |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh, the relay-side walk, the page check | 157 pass |
 | `npm run test:e2e` | the device alone, real Chromium, two origins, a fake Invidious, the bundled converter | 34 pass |
 | `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips, the guide, the site's relay | 52 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
