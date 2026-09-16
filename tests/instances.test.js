@@ -41,6 +41,7 @@ function prober(table) {
 
 const COBALT_LIST = DIRECTORIES[0].url;
 const PIPED_LIST = DIRECTORIES[1].url;
+const INVIDIOUS_LIST = DIRECTORIES[2].url;
 
 test('a listed instance is only used once it has answered for itself', async () => {
   const { fetchImpl } = directories({
@@ -78,6 +79,41 @@ test('Piped is taken when no cobalt instance answers', async () => {
   const { detect } = prober({ 'https://p.example': { kind: 'piped', label: 'Piped instance' } });
 
   assert.equal((await findInstance({ fetchImpl, detect })).endpoint, 'https://p.example');
+});
+
+test('the Invidious directory is read in its own pair shape, and the unreachable are left out', async () => {
+  // api.invidious.io answers [name, details] pairs: onion and i2p entries a
+  // browser cannot reach, instances with the API off, and clearnet ones.
+  const { fetchImpl } = directories({
+    [COBALT_LIST]: [],
+    [PIPED_LIST]: [],
+    [INVIDIOUS_LIST]: [
+      ['inv.example', { type: 'https', uri: 'https://inv.example', api: true, cors: true }],
+      ['dark.onion', { type: 'onion', uri: 'http://dark.onion', api: true }],
+      ['noapi.example', { type: 'https', uri: 'https://noapi.example', api: false }],
+      ['nocors.example', { type: 'https', uri: 'https://nocors.example', api: true, cors: false }],
+      'not a pair at all',
+    ],
+  });
+  const { detect, probed } = prober({ 'https://inv.example': { kind: 'invidious', label: 'Invidious instance' } });
+
+  const found = await findInstance({ fetchImpl, detect, candidates: 1 });
+  assert.equal(found.endpoint, 'https://inv.example');
+  assert.deepEqual(probed, ['https://inv.example'], 'the first candidate was the one clearnet entry with an API');
+});
+
+test('Invidious is preferred over Piped, both reaching only YouTube', async () => {
+  const { fetchImpl } = directories({
+    [COBALT_LIST]: [],
+    [PIPED_LIST]: [{ api_url: 'https://p.example' }],
+    [INVIDIOUS_LIST]: [['inv.example', { type: 'https', uri: 'https://inv.example', api: true }]],
+  });
+  const { detect } = prober({
+    'https://p.example': { kind: 'piped', label: 'Piped instance' },
+    'https://inv.example': { kind: 'invidious', label: 'Invidious instance' },
+  });
+
+  assert.equal((await findInstance({ fetchImpl, detect })).helper.kind, 'invidious');
 });
 
 test('a directory that is down falls back to the seed rather than failing', async () => {
@@ -141,6 +177,23 @@ test('the number of strangers contacted on a first visit is capped', async () =>
   assert.equal(probed.length, 6);
 });
 
+test('the cap is spread across the directories, not spent on the first list', async () => {
+  // cobalt publishes a long list. If it were walked first, the budget would
+  // be gone before a single YouTube-only instance was tried.
+  const many = Array.from({ length: 20 }, (_, i) => ({ api: `c${i}.example` }));
+  const { fetchImpl } = directories({
+    [COBALT_LIST]: many,
+    [PIPED_LIST]: [{ api_url: 'https://p.example' }],
+    [INVIDIOUS_LIST]: [['inv.example', { type: 'https', uri: 'https://inv.example', api: true }]],
+  });
+  const { detect, probed } = prober({});
+
+  await findInstance({ fetchImpl, detect, candidates: 4 });
+  assert.equal(probed.length, 4);
+  assert.ok(probed.includes('https://p.example'), 'Piped was within the budget');
+  assert.ok(probed.includes('https://inv.example'), 'and so was Invidious');
+});
+
 test('http-only instances are addressed as http, and duplicates are dropped', async () => {
   const { fetchImpl } = directories({
     [COBALT_LIST]: [{ api: 'plain.example', protocol: 'http' }, { api: 'plain.example', protocol: 'http' }],
@@ -175,6 +228,7 @@ test('a failure about the helper is worth another instance', () => {
   for (const message of [
     'Could not reach the server.',
     'The Piped instance did not answer for that video.',
+    'The Invidious instance did not answer for that video.',
     'pipedapi.example does not let a web page read its files.',
     'api.example answered 502.',
     'This instance is rate-limiting you. Wait a bit.',

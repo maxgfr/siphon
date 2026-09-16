@@ -16,7 +16,7 @@
 export { BackendError } from './errors.js';
 import { BackendError } from './errors.js';
 import { BrowserBackend } from './inbrowser.js';
-import { pipedResolver } from './extract.js';
+import { pipedResolver, invidiousResolver } from './extract.js';
 import { relayEscape } from './net.js';
 export { detectEndpoint, privacyNote, describeEndpoint } from './endpoint.js';
 export { findInstance, looksUnreachable } from './instances.js';
@@ -283,7 +283,7 @@ function serverResolver(server) {
  *
  * `helper` is what the address in settings turned out to be (see endpoint.js):
  * nothing, a siphon server (with or without ffmpeg), a cobalt instance, a
- * Piped instance, a relay. Everything below follows from that one fact.
+ * Piped or Invidious instance, a relay. Everything below follows from that.
  */
 export class Siphon {
   constructor({ endpoint = '', key = '', helper = null, coreUrl = '' } = {}) {
@@ -298,7 +298,11 @@ export class Siphon {
     this.device = new BrowserBackend({
       coreUrl,
       escape: this.server ? this.server.escape : kind === 'relay' ? relayEscape(endpoint) : null,
-      resolvers: [this.server ? serverResolver(this.server) : null, kind === 'piped' ? pipedResolver(endpoint) : null],
+      resolvers: [
+        this.server ? serverResolver(this.server) : null,
+        kind === 'piped' ? pipedResolver(endpoint) : null,
+        kind === 'invidious' ? invidiousResolver(endpoint) : null,
+      ],
     });
 
     this.supportsProgress = true;
@@ -323,6 +327,7 @@ export class Siphon {
       siphon: 'your server resolves',
       cobalt: `${this.helper.label} for the rest`,
       piped: 'Piped for YouTube',
+      invidious: 'Invidious for YouTube',
       relay: 'relay for hosts that refuse',
       none: 'no helper',
     }[this.helper.kind] || 'no helper';

@@ -21,14 +21,14 @@ works out on its own what is behind it:
 |---|---|
 | **your own siphon server** (`server/`) | with ffmpeg: everything, every site yt-dlp knows. Without ffmpeg: it resolves links, and this device does the work |
 | **a [cobalt](https://github.com/imputnet/cobalt) instance** | whatever this device could not read itself |
-| **a [Piped](https://github.com/TeamPiped/Piped) instance** | YouTube |
+| **an [Invidious](https://github.com/iv-org/invidious) or [Piped](https://github.com/TeamPiped/Piped) instance** | YouTube |
 | **a relay** (`relay/`) | carry the bytes of hosts that refuse a page, and nothing else |
 | nothing at all | this device only, and links that need more say so |
 
 You never pick a mode. Saving the address probes it once — a siphon server
 answers `/api/health` with its own name, cobalt answers its root, Piped answers
-`/config`, a relay fetches something for you — and what it turns out to be is
-remembered alongside it. Point it at a blog and it tells you so rather than
+`/config`, Invidious names itself at `/api/v1/stats`, a relay fetches something
+for you — and what it turns out to be is remembered alongside it. Point it at a blog and it tells you so rather than
 failing later on a real link.
 
 On a first visit with nothing saved, the same probe runs against the page's own
@@ -40,16 +40,18 @@ way the first screen works rather than opening on an instruction.
 
 When nothing is behind the page, a YouTube link would fail on arrival —
 correctly, but nobody pastes a link in order to read about CORS. So on that
-first visit, *after* the screen is usable, siphon asks the cobalt and Piped
-projects for their own published instance lists, probes what comes back, and
-fills in the first address that actually answers. **Find a public instance** in
+first visit, *after* the screen is usable, siphon asks the cobalt, Invidious
+and Piped projects for their own published instance lists, probes what comes
+back, and fills in the first address that actually answers. **Find a public instance** in
 settings does the same on demand.
 
 The directory is a hint; the probe is the truth. A list can be stale, a host
 can be down, an instance can be blocked by YouTube this week, and none of that
 is visible in a JSON file — so nothing is used until it has answered for
 itself, through the same detection a typed-in address goes through. cobalt is
-preferred over Piped, because it reaches more than one site.
+preferred, because it reaches more than one site; of the two that reach only
+YouTube, Invidious comes before Piped, because far more of its public
+instances are still standing.
 
 Two rules make this safe to do automatically, and they hold everywhere:
 whichever instance is chosen is **named on screen** the moment it is, and
@@ -120,15 +122,18 @@ it in the page — but a signed URL you are not allowed to fetch is no use.
 So YouTube needs a helper, and three of the four need nothing of yours
 running at all:
 
-- **A [Piped](https://github.com/TeamPiped/Piped) instance.** Its API answers
+- **An [Invidious](https://github.com/iv-org/invidious) or
+  [Piped](https://github.com/TeamPiped/Piped) instance.** Either API answers
   a web page directly and proxies the media with the headers the browser
-  needs, so the browser mode's own pipeline — the planner, ffmpeg.wasm, the
-  queue — runs on top of it unchanged. Paste an instance's API address into
-  the one address field in settings and YouTube works from a phone with nothing
-  deployed. It is someone else's server: it sees every YouTube link you paste,
-  instances come and go, and YouTube blocks them in waves. There is no default
-  baked in, deliberately, for the same reason there is none for cobalt. When
-  one is set it is tried first and a relay is the fallback.
+  needs — Invidious when asked with `local=true`, Piped always — so the
+  browser mode's own pipeline — the planner, ffmpeg.wasm, the queue — runs on
+  top of it unchanged. Paste an instance's address into the one address field
+  in settings and YouTube works from a phone with nothing deployed. It is
+  someone else's server: it sees every YouTube link you paste, instances come
+  and go, and YouTube blocks them in waves. There is no default baked in,
+  deliberately, for the same reason there is none for cobalt: the first visit
+  goes and *finds* one that answers today, and says which. When one is set it
+  is tried first and a relay is the fallback.
 - **[A relay](relay/)** — one file that adds the missing header and forwards
   nothing else. No yt-dlp, no ffmpeg, no state, and nothing to maintain when
   YouTube changes, because the part that changes is running in your browser.
@@ -143,8 +148,8 @@ running at all:
 
 Projects advertising a backend-free YouTube downloader are, as far as we can
 tell, all using someone else's server for that last hop. This one is honest
-about which hop that is — and the Piped option *is* that: the instance is the
-hop, and the app says so in its privacy line.
+about which hop that is — and an Invidious or Piped instance *is* that: the
+instance is the hop, and the app says so in its privacy line.
 
 ### What actually moves the wall — and what does not
 
@@ -612,10 +617,18 @@ used to smuggle arbitrary yt-dlp options.
 
 ## The public-instance fallback
 
-Point the address at a [cobalt](https://github.com/imputnet/cobalt) or
+Point the address at a [cobalt](https://github.com/imputnet/cobalt),
+[Invidious](https://github.com/iv-org/invidious) or
 [Piped](https://github.com/TeamPiped/Piped) instance and it is used for whatever
 this device could not read by itself — and with nothing saved, siphon will go
 and find one, as above.
+
+An Invidious or Piped instance is asked for a video's streams and hands back
+URLs that go through its own proxy, which is the only kind a page can fetch:
+the device then downloads, merges and converts as it does for any other link,
+and the instance never sees more than the video id. Their subtitle tracks come
+along, so **In the video** works with an instance too. cobalt is asked for the
+finished file instead, since that is the shape of its API.
 
 It is worth being plain about what that means. Shared instances rate-limit,
 require captchas or API keys, and come and go, and **every link that reaches one
@@ -706,8 +719,8 @@ still unproven.
 | suite | what it is | result |
 |---|---|---|
 | `pytest server/tests` | the server, including two against real yt-dlp | 119 pass |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding | 107 pass |
-| `npm run test:e2e` | the device alone, real Chromium, two origins | 23 pass |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding | 118 pass |
+| `npm run test:e2e` | the device alone, real Chromium, two origins, a fake Invidious | 33 pass |
 | `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker | 36 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
 | `npm run test:split` | a server that only resolves, a device that downloads | 24 pass |
@@ -719,8 +732,13 @@ Finding a public instance is covered with both the directories and the probe
 stubbed: that a listed address is only used once it has answered for itself,
 that an instance listed as offline is never even contacted, that a directory
 which changed shape is ignored rather than thrown on, that a siphon server or a
-relay appearing in such a list is not mistaken for an instance, and that the
-number of strangers contacted on a first visit is capped.
+relay appearing in such a list is not mistaken for an instance, that the
+Invidious directory's `[name, details]` pairs are read with onion, API-less
+and CORS-less entries left out, and that the number of strangers contacted on
+a first visit is capped — and spread across the directories, so a long cobalt
+list cannot crowd the YouTube-only kinds out of that budget. Detection is covered for every kind, including an
+Invidious instance whose stats endpoint is switched off — the default — which
+is then known by the one sentence it refuses with.
 
 The unit tests cover what needs no network: HLS attribute and playlist parsing,
 byte-range continuation, IV derivation, YouTube URL shapes, page-scraping
@@ -754,6 +772,16 @@ origin and the media on another, so the CORS path under test is the real one:
   names how far it got when the attempts run out.
 - A finished row survives a reload with its Save button intact, because the file
   is in OPFS.
+- **An Invidious instance carries YouTube.** A fake one speaking the real API —
+  `/api/v1/stats` naming the software, `/api/v1/videos/{id}` with numbers as
+  strings and media paths relative to the instance, `/videoplayback`, WebVTT at
+  `/api/v1/captions` — is typed into the settings sheet, recognised from the
+  address alone, and named in the header and the privacy line. A YouTube link
+  is then resolved by it with `local=true` (the only form a page can fetch),
+  the file arrives through its proxy byte-identical, and is named after the
+  video. With **In the video** on, its caption is fetched and embedded as
+  `mov_text` beside the untouched picture and sound. The page itself contacts
+  neither googlevideo nor youtube.com at any point — checked on the wire.
 
 ### The split
 

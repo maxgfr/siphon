@@ -145,14 +145,14 @@
       With ffmpeg it does everything: every site yt-dlp knows, playlists, subtitles, your YouTube
       cookies. Without ffmpeg it only resolves links and this device downloads and converts.
       <strong>A cobalt instance</strong>, for what this device cannot read.
-      <strong>A Piped instance</strong>, for YouTube. <strong>A relay</strong> — <code>relay/</code>,
+      <strong>An Invidious or Piped instance</strong>, for YouTube. <strong>A relay</strong> — <code>relay/</code>,
       a free Cloudflare Worker — which adds the missing header and nothing else.
       Leave it empty and this device still handles direct files, HLS and pages that allow it.
     </p>
     <p class="hint">
-      <strong>Find a public instance</strong> asks the cobalt and Piped projects for their own
-      published instance lists, then tries each one until something answers, and fills in the
-      first that does. It is someone else&#39;s server: the address it picks is named here and on
+      <strong>Find a public instance</strong> asks the cobalt, Invidious and Piped projects for
+      their own published instance lists, then tries each one until something answers, and
+      fills in the first that does. It is someone else&#39;s server: the address it picks is named here and on
       the main screen, it sees every link it is asked about, and clearing the field undoes it.
     </p>
 

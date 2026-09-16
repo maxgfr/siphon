@@ -71,9 +71,34 @@ test('a Piped instance is known by its config', async () => {
   assert.equal(helper.kind, 'piped');
 });
 
+test('an Invidious instance is known by its stats', async () => {
+  const { fetchImpl } = stub({
+    '/api/health': { status: 404, body: '' },
+    '/api/v1/stats': { body: { version: '2.20260901.0', software: { name: 'invidious', version: '2.20260901.0', branch: 'master' } } },
+    '/config': { status: 404, body: '' },
+    '/': { status: 404, body: '<html>Invidious</html>' },
+  });
+  const helper = await detectEndpoint('https://inv.example', '', fetchImpl);
+  assert.equal(helper.kind, 'invidious');
+});
+
+test('an Invidious instance with stats switched off is still known, by the sentence it refuses with', async () => {
+  // `statistics_enabled: false` is the default in an instance's config, and
+  // then the endpoint answers 400 — with a body nothing else on the web says.
+  const { fetchImpl } = stub({
+    '/api/health': { status: 404, body: '' },
+    '/api/v1/stats': { status: 400, body: { error: 'Statistics are not enabled.' } },
+    '/config': { status: 404, body: '' },
+    '/': { status: 404, body: '' },
+  });
+  const helper = await detectEndpoint('https://inv.example', '', fetchImpl);
+  assert.equal(helper.kind, 'invidious');
+});
+
 test('a relay is known by fetching something through it', async () => {
   const { fetchImpl, asked } = stub({
     '/api/health': { status: 404, body: '' },
+    '/api/v1/stats': { status: 400, body: { error: 'no url parameter' } },
     '/config': { status: 404, body: '' },
     '/?url=': { body: 'User-agent: *\nDisallow: /comment\n' },
     '/': { status: 400, body: { error: 'no url parameter' } },
@@ -95,7 +120,7 @@ test('a relay that refuses this origin says what to change', async () => {
 
 test('an address that answers as none of them is refused with the list', async () => {
   const { fetchImpl } = stub({ '/': { body: '<html>hello</html>' } });
-  await assert.rejects(() => detectEndpoint('https://blog.example', '', fetchImpl), /siphon server, a cobalt or Piped instance, or a relay/);
+  await assert.rejects(() => detectEndpoint('https://blog.example', '', fetchImpl), /siphon server, a cobalt, Piped or Invidious instance, or a relay/);
 });
 
 test('an address nothing answers at is "could not reach", not a guess', async () => {
@@ -109,5 +134,7 @@ test('the sentences follow from the kind', () => {
   assert.match(privacyNote({ kind: 'siphon', ffmpeg: false }), /resolves/i);
   assert.match(describeEndpoint({ kind: 'siphon', ffmpeg: false, label: 'yt-dlp 1' }), /no ffmpeg/i);
   assert.match(describeEndpoint({ kind: 'relay' }), /relay/i);
+  assert.match(privacyNote({ kind: 'invidious' }), /Invidious instance/);
+  assert.match(describeEndpoint({ kind: 'invidious' }), /An Invidious instance/);
   assert.match(describeEndpoint(null), /helper/i);
 });
