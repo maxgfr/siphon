@@ -64,13 +64,21 @@ measurement keeps running daily in case that changes; it is not the plan.
 The same run also walks the **public cobalt instances** — the other shape of
 "it just works in a browser": the instance does the whole download and
 streams the file back, so the page needs no CORS on the media at all. The
-directory at `instances.cobalt.best` is read, each instance that claims
-YouTube is sent the sample link exactly as the app would send it, and the
-first whose tunnel streams bytes goes into `config.json` as `cobalt`. A
-visitor with nothing set — and no relay — takes it, named on screen as a
-public instance that sees the links. `cobalt.tools` itself is keyed,
-Turnstile-gated and blocked by YouTube; the community ones come and go, which
-is again why this is measured daily rather than written once.
+directory at [`cobalt.directory`](https://cobalt.directory/) is read (its
+`api/working?type=api` list, the full `api/tests` table behind it), each
+instance it lists as up for YouTube is sent the sample link exactly as the
+app would send it, and the first whose tunnel streams bytes goes into
+`config.json` as `cobalt`. A visitor with nothing set — and no relay — takes
+it, named on screen as a public instance that sees the links. `cobalt.tools`
+itself is keyed, Turnstile-gated and blocked by YouTube; the community ones
+come and go, which is again why this is measured daily rather than written
+once.
+
+The first cobalt measurement (2026-09-16) found the directory it was written
+against, `instances.cobalt.best`, gone from DNS — `fetch failed` from the
+runner, no answer from any resolver — so it read nothing. The run now names
+each directory with what it said, and shows the first bytes of an answer it
+cannot read, so the next log settles it either way.
 
 ### What a browser can do about YouTube in 2026 — the research
 
@@ -324,9 +332,9 @@ those servers are run in public, and answer a page?** Read the same way:
 
 | project | public instances? | usable from a page? | here |
 |---|---|---|---|
-| [Invidious](https://github.com/iv-org/invidious) | yes — the project publishes [its own list](https://docs.invidious.io/instances/) | **less and less.** The stats endpoint sends CORS everywhere; the *videos* endpoint a page needs is being closed to other apps: measured 2026-09-16, `inv.nadeko.net` answers `403 Endpoint disabled`, `yewtu.be` a nginx `403`, `invidious.nerdvpn.de` times out, `invidious.f5.si` answers a bare client but not a browser | bundled list, refreshed daily, walked in seconds — a chance, not a plan |
+| [Invidious](https://github.com/iv-org/invidious) | yes — the project publishes [its own list](https://docs.invidious.io/instances/) | **less and less.** The stats endpoint sends CORS everywhere; the *videos* endpoint a page needs is being closed to other apps: measured 2026-09-16 from a runner, all seven on the bundled list: `inv.nadeko.net` answers `403 Endpoint disabled`, `yewtu.be` and `invidious.tiekoetter.com` a nginx `403`, `yt.chocolatemoo53.com` `403 forbidden`, `inv.thepixora.com` a `303` to its own page, `invidious.nerdvpn.de` times out, and `invidious.f5.si` answers `200` with CORS but an empty body to a bare client and nothing to a browser | bundled list, refreshed daily, walked in seconds — a chance, not a plan |
 | [Piped](https://github.com/TeamPiped/Piped) | a [list](https://piped-instances.kavin.rocks/), mostly dark since YouTube's 2024–25 blocks | yes, the same way | supported; ranked after Invidious |
-| [cobalt](https://github.com/imputnet/cobalt) | a [list](https://instances.cobalt.best/), but most now want an API key or a Turnstile pass | yes, when one lets you in | supported; asked for the finished file |
+| [cobalt](https://github.com/imputnet/cobalt) | a [list](https://cobalt.directory/) (the older `instances.cobalt.best` left DNS in 2026), but most now want an API key or a Turnstile pass | yes, when one lets you in | supported; asked for the finished file |
 | [Materialious](https://github.com/Materialious/Materialious), [Yattee](https://github.com/yattee/yattee), [Clipious](https://github.com/lamarios/clipious) | — | — | clients of Invidious's API: any instance that serves them serves this app |
 | [NewPipe](https://github.com/TeamNewPipe/NewPipe), [LibreTube](https://github.com/libre-tube/LibreTube), [FreeTube](https://github.com/FreeTubeApp/FreeTube) | — | no: native apps, the extractor runs in the app | — |
 | yt-dlp behind an HTTP API (dozens of small projects) | no public ones worth naming — a public yt-dlp box is abuse bait and dies fast | — | that is what `server/` is, for you to run |
@@ -901,7 +909,7 @@ still unproven.
 | suite | what it is | result |
 |---|---|---|
 | `pytest server/tests` | the server, including two against real yt-dlp, and the converter vendoring | 124 pass |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh, the relay-side walk, the page check, the cobalt measurement | 163 pass |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh, the relay-side walk, the page check, the cobalt measurement and its directory's shapes | 167 pass |
 | `npm run test:e2e` | the device alone, real Chromium, two origins, a fake Invidious, the bundled converter | 34 pass |
 | `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips, the guide, the site's relay or cobalt instance | 55 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |

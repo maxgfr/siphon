@@ -36,6 +36,65 @@ const reachable = (url) => {
 };
 
 /**
+ * cobalt's instance directory. `instances.cobalt.best` — the list the project
+ * pointed at for years — left DNS in 2026; `cobalt.directory` is the same
+ * author's successor, and this endpoint is the one that lists the APIs found
+ * working, per service, at its last test.
+ */
+export const COBALT_DIRECTORY = 'https://cobalt.directory/api/working?type=api';
+
+const passes = (value) =>
+  value === true || value === 1 || (typeof value === 'string' && /^(ok|pass(ed)?|success|working|true|online|up)$/i.test(value)) ||
+  (value && typeof value === 'object' && (value.ok === true || value.working === true || value.success === true || value.passed === true || passes(value.status)));
+const fails = (value) =>
+  value === false || value === 0 || (typeof value === 'string' && !passes(value)) ||
+  (value && typeof value === 'object' && (value.ok === false || value.working === false || value.success === false || value.passed === false || (typeof value.status === 'string' && !passes(value.status))));
+
+const ADDRESS_KEYS = ['api', 'api_url', 'apiUrl', 'url', 'host', 'hostname', 'domain', 'instance'];
+const RESULT_KEYS = ['services', 'tests', 'results', 'working'];
+
+/**
+ * @param {unknown} body whatever the cobalt directory answered
+ * @returns {{ api: string, score: number }[]} the https API addresses it lists as up, with YouTube not marked failing
+ *
+ * Written to survive the directory changing shape, because it has: the answer
+ * may be a bare array, or `{ lastUpdatedUTC, data }` where `data` is an array
+ * of entries, a map keyed by service (`youtube: [...]`), or a map keyed by
+ * host. An entry may be a hostname, an address, or an object naming its API
+ * under one of a few keys, with online flags, a score and per-service
+ * results. Only an explicit "down" or an explicit YouTube failure excludes
+ * an entry; the measurement that follows is the real test. Anything
+ * unrecognised yields nothing rather than throwing.
+ */
+export function cobaltEntries(body) {
+  const data = body && typeof body === 'object' && !Array.isArray(body) && 'data' in body ? body.data : body;
+  let list = [];
+  if (Array.isArray(data)) list = data;
+  else if (data && typeof data === 'object') {
+    const service = Object.keys(data).find((key) => /^youtube$/i.test(key));
+    const byService = service ? data[service] : null;
+    if (Array.isArray(byService)) list = byService;
+    else if (byService && typeof byService === 'object') list = Object.entries(byService).map(([host, rest]) => ({ host, ...(rest && typeof rest === 'object' ? rest : {}) }));
+    else list = Object.entries(data).map(([host, rest]) => (rest && typeof rest === 'object' ? { host, ...rest } : null)).filter(Boolean);
+  }
+  const entries = [];
+  for (const entry of list) {
+    const record = typeof entry === 'string' ? { api: entry } : entry && typeof entry === 'object' ? entry : null;
+    if (!record) continue;
+    const address = ADDRESS_KEYS.map((key) => record[key]).find((value) => typeof value === 'string' && value.trim());
+    if (!address) continue;
+    if (record.online === false || record.api_online === false || record.protocol === 'http' || fails(record.status)) continue;
+    const results = RESULT_KEYS.map((key) => record[key]).find((value) => value && typeof value === 'object');
+    const youtubeKey = results && Object.keys(results).find((key) => /^youtube$/i.test(key));
+    if (youtubeKey && fails(results[youtubeKey])) continue;
+    const api = trimSlash(/^[a-z]+:\/\//i.test(address) ? address : `https://${address.trim()}`);
+    if (!api.startsWith('https://')) continue;
+    entries.push({ api, score: Number(record.score) || 0 });
+  }
+  return entries;
+}
+
+/**
  * Where the projects publish their own instance lists.
  *
  * `read` pulls addresses out of whatever shape the directory answers with, and
@@ -46,11 +105,8 @@ const reachable = (url) => {
 export const DIRECTORIES = Object.freeze([
   {
     kind: 'cobalt',
-    url: 'https://instances.cobalt.best/api/instances.json',
-    read: (body) =>
-      (Array.isArray(body) ? body : [])
-        .filter((entry) => entry && entry.api && entry.online !== false && entry.api_online !== false)
-        .map((entry) => `${entry.protocol === 'http' ? 'http' : 'https'}://${entry.api}`),
+    url: COBALT_DIRECTORY,
+    read: (body) => cobaltEntries(body).map((entry) => entry.api),
   },
   {
     kind: 'piped',
