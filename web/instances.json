@@ -1,11 +1,9 @@
 {
-  "updated": null,
-  "source": "seed — the instances workflow replaces this with the list docs.invidious.io publishes",
+  "updated": "2026-09-16",
+  "source": "api.invidious.io",
   "invidious": [
-    "https://inv.nadeko.net",
-    "https://yewtu.be",
-    "https://invidious.nerdvpn.de",
-    "https://iv.nboeck.de",
-    "https://invidious.privacyredirect.com"
+    "https://invidious.f5.si",
+    "https://inv-ygg.nadeko.net",
+    "https://inv.nadeko.ygg"
   ]
 }
