@@ -9,7 +9,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { fromDirectory, fromDocsPage, reachable, refresh, API_URL, DOCS_URL, SEED } from '../scripts/instances.mjs';
+import { fromDirectory, fromDocsPage, onTheInternet, reachable, refresh, API_URL, DOCS_URL, SEED } from '../scripts/instances.mjs';
+
+/** A resolver that puts every name on the internet, for the tests about lists rather than DNS. */
+const anywhere = { resolve4: async () => ['203.0.113.1'], resolve6: async () => [] };
 
 /** The shape of https://docs.invidious.io/instances/ — headings per address type, links under each. */
 const DOCS_HTML = `<!doctype html><html><body>
@@ -76,6 +79,7 @@ test('a page with no https section yields nothing rather than every link on it',
 test('the API is asked first and named as the source', async () => {
   const asked = [];
   const found = await refresh({
+    resolve: anywhere,
     fetchImpl: async (url) => {
       asked.push(url);
       if (url === API_URL) return JSON.stringify([['a', { type: 'https', uri: 'https://a.example', api: true }]]);
@@ -89,6 +93,7 @@ test('the API is asked first and named as the source', async () => {
 
 test('an official entry that is also in the seed is listed once, where the official list put it', async () => {
   const found = await refresh({
+    resolve: anywhere,
     fetchImpl: async () => JSON.stringify([[SEED[1].replace('https://', ''), { type: 'https', uri: `${SEED[1]}/`, api: true }]]),
   });
   assert.equal(found.invidious.filter((url) => url === SEED[1]).length, 1);
@@ -97,6 +102,7 @@ test('an official entry that is also in the seed is listed once, where the offic
 
 test('when the API is down the docs page is read instead, and said so', async () => {
   const found = await refresh({
+    resolve: anywhere,
     fetchImpl: async (url) => {
       if (url === API_URL) throw new Error('api.invidious.io answered 503');
       if (url === DOCS_URL) return DOCS_HTML;
@@ -109,14 +115,46 @@ test('when the API is down the docs page is read instead, and said so', async ()
 
 test('an API that answers an empty list is not trusted over the page', async () => {
   const found = await refresh({
+    resolve: anywhere,
     fetchImpl: async (url) => (url === API_URL ? '[]' : DOCS_HTML),
   });
   assert.equal(found.source, 'docs.invidious.io + seed');
 });
 
+test('a name whose only address is Yggdrasil is not on the internet, and is left out', async () => {
+  const notFound = Object.assign(new Error('ENOTFOUND'), { code: 'ENOTFOUND' });
+  const table = {
+    'inv-ygg.nadeko.net': { v4: [], v6: ['202:415c:2061:a9c0:9dbc:b95d:66ec:1347'] },
+    'inv.nadeko.net': { v4: ['203.0.113.7'], v6: ['2a01:4f8::1'] },
+    'v6only.example': { v4: [], v6: ['2606:4700::1'] },
+    'gone.example': null,
+  };
+  const resolve = {
+    resolve4: async (host) => { if (!table[host]) throw notFound; return table[host].v4; },
+    resolve6: async (host) => { if (!table[host]) throw notFound; return table[host].v6; },
+  };
+  assert.equal(await onTheInternet('https://inv-ygg.nadeko.net', resolve), false);
+  assert.equal(await onTheInternet('https://inv.nadeko.net', resolve), true);
+  assert.equal(await onTheInternet('https://v6only.example', resolve), true, 'a real IPv6 address counts');
+  assert.equal(await onTheInternet('https://gone.example', resolve), false);
+  // A resolver that is itself broken must not empty the list.
+  const broken = { resolve4: async () => { throw Object.assign(new Error('timeout'), { code: 'ETIMEOUT' }); }, resolve6: async () => { throw Object.assign(new Error('timeout'), { code: 'ETIMEOUT' }); } };
+  assert.equal(await onTheInternet('https://inv.nadeko.net', broken), true);
+
+  const found = await refresh({
+    resolve,
+    fetchImpl: async () => JSON.stringify([
+      ['inv-ygg.nadeko.net', { type: 'https', uri: 'https://inv-ygg.nadeko.net', api: true }],
+      ['inv.nadeko.net', { type: 'https', uri: 'https://inv.nadeko.net', api: true }],
+    ]),
+  });
+  assert.ok(!found.invidious.includes('https://inv-ygg.nadeko.net'));
+  assert.ok(found.invidious.includes('https://inv.nadeko.net'));
+});
+
 test('nothing from either is an error, never an empty file', async () => {
   await assert.rejects(
-    () => refresh({ fetchImpl: async () => '<html></html>' }),
+    () => refresh({ resolve: anywhere, fetchImpl: async () => '<html></html>' }),
     /not.*a single instance|neither/i,
   );
 });
