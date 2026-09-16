@@ -61,6 +61,48 @@ Not one free proxy would fetch `robots.txt` for a page, so the site ships
 with no relay, and a fresh visitor is not pointed at a dead one. The
 measurement keeps running daily in case that changes; it is not the plan.
 
+The same run also walks the **public cobalt instances** — the other shape of
+"it just works in a browser": the instance does the whole download and
+streams the file back, so the page needs no CORS on the media at all. The
+directory at `instances.cobalt.best` is read, each instance that claims
+YouTube is sent the sample link exactly as the app would send it, and the
+first whose tunnel streams bytes goes into `config.json` as `cobalt`. A
+visitor with nothing set — and no relay — takes it, named on screen as a
+public instance that sees the links. `cobalt.tools` itself is keyed,
+Turnstile-gated and blocked by YouTube; the community ones come and go, which
+is again why this is measured daily rather than written once.
+
+### What a browser can do about YouTube in 2026 — the research
+
+Before building any of the above it is worth knowing why "just do it in the
+page" is not an option anyone has, whatever a search result promises:
+
+- YouTube no longer puts direct links in the page. Playback is a POST with a
+  Protobuf body to a single streaming endpoint, the answer is a multiplexed
+  `application/vnd.yt-ump` blob, and most requests need a proof-of-origin
+  token minted by YouTube's own bot-detection script inside a real session
+  — without it, a 403. That is SABR, and it is why the old browser tricks
+  died ([Koudela, 2026](https://medium.com/@vlastimil.koudela/how-to-download-from-youtube-in-2026-and-why-the-old-browser-trick-died-b44474d7e350)).
+- Every "no install" site Reddit recommends is a server: cobalt (its own
+  API, [blocked for YouTube and keyed since](https://github.com/imputnet/cobalt/discussions/860)),
+  or a SEO site running yt-dlp on its own box. The community's actual
+  answer for power users is yt-dlp on your machine
+  ([r/DataHoarder, r/youtubedl consensus](https://www.notelm.ai/blog/youtube-downloader-reddit-picks);
+  [what still works in 2026](https://joinotto.com/blog/youtube-video-downloader-reddit)).
+  Self-hosting a cobalt instance is the documented fix
+  ([run an instance](https://github.com/imputnet/cobalt/blob/main/docs/run-an-instance.md)).
+- The open-source frontends — Invidious, Piped — are backends with a web
+  client, and their public instances have closed the video API to pages
+  (measured above); the [official list](https://docs.invidious.io/instances/)
+  is five clearnet instances today.
+
+So the three shapes of "it works" are the three this project ships, in the
+order a visitor meets them: something the site's owner runs once for
+everyone (the relay, `SIPHON_RELAY_URL`); something someone else runs and
+the daily measurement found working today (a cobalt instance in
+`config.json`); and something that is yours (the bridge, or the server).
+There is no fourth, and the README will not pretend there is.
+
 **Running this site for others?** This is the plan. Deploy the relay once,
 then set the repository variable `SIPHON_RELAY_URL` to its address (Settings
 → Secrets and variables → Actions → Variables). It wins over any public proxy
@@ -859,9 +901,9 @@ still unproven.
 | suite | what it is | result |
 |---|---|---|
 | `pytest server/tests` | the server, including two against real yt-dlp, and the converter vendoring | 124 pass |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh, the relay-side walk, the page check | 157 pass |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh, the relay-side walk, the page check, the cobalt measurement | 163 pass |
 | `npm run test:e2e` | the device alone, real Chromium, two origins, a fake Invidious, the bundled converter | 34 pass |
-| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips, the guide, the site's relay | 52 pass |
+| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips, the guide, the site's relay or cobalt instance | 55 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
 | `npm run test:split` | a server that only resolves, a device that downloads | 24 pass |
 | `npm run test:youtube` | YouTube, for real, in CI — through the relay, Piped, and the bundled Invidious list | informative — see below |

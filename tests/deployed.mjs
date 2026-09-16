@@ -102,6 +102,12 @@ const server = createServer(
       return response.writeHead(200, { 'Content-Type': 'application/json' }).end(overrides.get(path));
     }
 
+    // A cobalt instance, as far as detection can tell: its root is JSON
+    // with a `cobalt` object.
+    if (path === '/cobalt' || path === '/cobalt/') {
+      return response.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }).end('{"cobalt":{"version":"11.0"},"git":{}}');
+    }
+
     // A relay, as far as detection can tell one apart: it fetches what it is
     // asked for. Only robots.txt is ever asked, and only its shape matters.
     if (path === '/relay' || path.startsWith('/relay/')) {
@@ -396,6 +402,23 @@ for (const [old, expected] of [
   await page.waitForTimeout(1500);
   const again = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:settings') || '{}'));
   check('a helper the visitor cleared is not put back', again.helper?.kind === 'none' && !again.endpoint, JSON.stringify(again.helper));
+  check('nothing was contacted off this machine', context.__offsite.length === 0, context.__offsite.slice(0, 3).join(', '));
+  await context.close();
+  overrides.delete('/siphon/config.json');
+}
+
+/* 5b. No relay, but a cobalt instance the measurement saw deliver: adopted, and named as public. */
+{
+  overrides.set('/siphon/config.json', JSON.stringify({ relay: '', relayKind: '', instance: '', cobalt: `${BASE}/cobalt` }));
+  const { context, page } = await fresh();
+  await setApi(false);
+  await page.goto(APP, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(2500);
+  const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:settings') || '{}'));
+  check("the site's measured cobalt instance is taken when there is no relay", saved.helper?.kind === 'cobalt' && saved.endpoint === `${BASE}/cobalt`,
+    JSON.stringify({ helper: saved.helper?.kind, endpoint: saved.endpoint }));
+  const notice = (await page.textContent('#feedback')) || '';
+  check('and named as a public instance that sees the links', /public cobalt instance/.test(notice) && notice.includes('127.0.0.1:8443'), notice.replace(/\s+/g, ' ').slice(0, 90));
   check('nothing was contacted off this machine', context.__offsite.length === 0, context.__offsite.slice(0, 3).join(', '));
   await context.close();
   overrides.delete('/siphon/config.json');

@@ -123,8 +123,9 @@ function siteConfig() {
         relay: String(body?.relay || '').trim().replace(/\/+$/, ''),
         relayKind: body?.relayKind === 'own' ? 'own' : 'public',
         instance: String(body?.instance || '').trim().replace(/\/+$/, ''),
+        cobalt: String(body?.cobalt || '').trim().replace(/\/+$/, ''),
       }))
-      .catch(() => ({ relay: '', relayKind: '', instance: '' }));
+      .catch(() => ({ relay: '', relayKind: '', instance: '', cobalt: '' }));
   }
   return siteConfigPromise;
 }
@@ -142,20 +143,38 @@ async function adoptSiteRelay() {
   try {
     if (localStorage.getItem(SITE_RELAY_TAKEN) === '1') return false;
   } catch { /* storage off: once per session is the harmless side */ }
-  const { relay, relayKind, instance } = await siteConfig();
-  if (!relay) return false;
+  const { relay, relayKind, instance, cobalt } = await siteConfig();
+  // The relay first — it keeps the download on this device — and, failing
+  // one, a cobalt instance the daily measurement saw deliver a YouTube file:
+  // that one does the whole download itself and sees every link.
+  const address = relay || cobalt;
+  if (!address) return false;
   let helper;
   try {
-    helper = await detectEndpoint(relay);
+    helper = await detectEndpoint(address);
   } catch {
     return false;
   }
   try {
     localStorage.setItem(SITE_RELAY_TAKEN, '1');
   } catch { /* nothing to do */ }
-  // A helper the person chose in the meantime wins; so does a relay that
-  // turned out to be something else.
-  if (helper.kind !== 'relay' || settings.helper.kind !== 'none' || settings.endpoint) return false;
+  // A helper the person chose in the meantime wins; so does an address that
+  // turned out to be something else than the measurement said.
+  const expected = relay ? 'relay' : 'cobalt';
+  if (helper.kind !== expected || settings.helper.kind !== 'none' || settings.endpoint) return false;
+
+  if (!relay) {
+    settings = { ...settings, endpoint: cobalt, key: '', helper };
+    saveSettings();
+    applyBackend();
+    refreshBackendLabel();
+    renderFeedback(
+      '<div class="notice"><p><strong>Using a public instance.</strong> ' +
+        `Links this device cannot read itself go to <strong>${escapeHtml(hostOf(cobalt))}</strong>, a public cobalt instance ` +
+        'that does the download and sees those links — it was the one that delivered YouTube today. Change or clear it in settings.</p></div>',
+    );
+    return true;
+  }
 
   settings = { ...settings, endpoint: relay, key: '', helper, siteInstance: instance };
   saveSettings();
