@@ -5,8 +5,8 @@ still unproven.
 
 | suite | what it is | result |
 |---|---|---|
-| `pytest server/tests` | the server, including two against real yt-dlp on loopback, and the converter vendoring | 124 pass |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them | 170 pass |
+| `pytest server/tests` | the server, including two against real yt-dlp on loopback, and the converter vendoring | 125 pass |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them | 171 pass |
 | `npm run test:e2e` | the device alone, real Chromium, two origins; a fake Invidious, a fake Piped and a fake cobalt each carrying a YouTube link; the bundled converter | 48 pass |
 | `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips, an instance whose video endpoint is shut, the guide, the site's relay or cobalt instance | 57 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
