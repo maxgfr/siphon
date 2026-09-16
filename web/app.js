@@ -469,12 +469,14 @@ function cancelEntry(key) {
  * failure that is about the video rather than the helper, and never silently.
  */
 const SWITCH_LIMIT = 2;
+/** The helpers that are someone else's public instance, and so have peers to fall back to. */
+const PUBLIC_KINDS = new Set(['cobalt', 'piped', 'invidious']);
 let switches = 0;
 const spentInstances = new Set();
 
 async function switchInstance(entry) {
   if (!settings.autoInstance) return false;
-  if (settings.helper.kind !== 'cobalt' && settings.helper.kind !== 'piped') return false;
+  if (!PUBLIC_KINDS.has(settings.helper.kind)) return false;
   if (switches >= SWITCH_LIMIT || !looksUnreachable(entry.error || '')) return false;
 
   switches += 1;

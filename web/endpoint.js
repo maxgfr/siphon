@@ -2,24 +2,25 @@
  * One address, and what it turns out to be.
  *
  * The settings hold a single optional address. It may be a siphon server, a
- * cobalt instance, a Piped instance or a bare relay — four different things
- * with four different protocols, and asking the user which is the kind of
- * question this app exists not to ask. So the address is probed, once, when
- * it is saved, and the answer is kept alongside it.
+ * cobalt instance, a Piped or Invidious instance, or a bare relay — five
+ * different things with five different protocols, and asking the user which
+ * is the kind of question this app exists not to ask. So the address is
+ * probed, once, when it is saved, and the answer is kept alongside it.
  *
  * Each probe is one small request that is unmistakable for that kind:
  *
- *   siphon   GET /api/health          → JSON with service: "siphon"
- *   cobalt   GET /  (Accept: json)    → JSON with a `cobalt` object
- *   piped    GET /config              → JSON naming an image proxy
- *   relay    GET /?url=<robots.txt>   → 200 whose body names a User-agent
+ *   siphon     GET /api/health          → JSON with service: "siphon"
+ *   cobalt     GET /  (Accept: json)    → JSON with a `cobalt` object
+ *   piped      GET /config              → JSON naming an image proxy
+ *   invidious  GET /api/v1/stats        → JSON whose `software.name` is invidious
+ *   relay      GET /?url=<robots.txt>   → 200 whose body names a User-agent
  *
  * The fetch is injectable so the classification can be tested with no network.
  */
 
 const trimSlash = (value) => String(value || '').trim().replace(/\/+$/, '');
 
-/** @typedef {{ kind: 'none'|'siphon'|'cobalt'|'piped'|'relay', label: string, ffmpeg?: boolean, lanUrls?: string[], hasCookies?: boolean, requiresKey?: boolean }} Endpoint */
+/** @typedef {{ kind: 'none'|'siphon'|'cobalt'|'piped'|'invidious'|'relay', label: string, ffmpeg?: boolean, lanUrls?: string[], hasCookies?: boolean, requiresKey?: boolean }} Endpoint */
 
 const NONE = Object.freeze({ kind: 'none', label: 'this device only' });
 
@@ -85,6 +86,13 @@ export async function detectEndpoint(address, key = '', fetchImpl = globalThis.f
     return { kind: 'piped', label: 'Piped instance' };
   }
 
+  // Stats can be switched off in an instance's config, and then the endpoint
+  // answers 400 with a sentence only Invidious says — which is still an answer.
+  const invidious = await get('/api/v1/stats');
+  if (invidious?.json && (/invidious/i.test(String(invidious.json.software?.name || '')) || /statistics are not enabled/i.test(String(invidious.json.error || '')))) {
+    return { kind: 'invidious', label: 'Invidious instance' };
+  }
+
   const relay = await get(`/?url=${encodeURIComponent('https://www.youtube.com/robots.txt')}`);
   if (relay?.status === 200 && /user-agent/i.test(relay.text)) {
     return { kind: 'relay', label: 'relay' };
@@ -93,14 +101,14 @@ export async function detectEndpoint(address, key = '', fetchImpl = globalThis.f
     throw new Error('That relay does not allow this page. Add this origin to its ALLOWED_ORIGINS.');
   }
 
-  if (!health && !cobalt && !piped && !relay) {
+  if (!health && !cobalt && !piped && !invidious && !relay) {
     throw new Error(
       typeof location !== 'undefined' && location.protocol === 'https:' && base.startsWith('http://')
         ? 'Blocked: this page is HTTPS and the address is plain HTTP. Browsers refuse mixed content.'
         : 'Could not reach that address.',
     );
   }
-  throw new Error('That address answers, but not as a siphon server, a cobalt or Piped instance, or a relay.');
+  throw new Error('That address answers, but not as a siphon server, a cobalt, Piped or Invidious instance, or a relay.');
 }
 
 /** The sentence under the link box: where a pasted link goes. */
@@ -114,6 +122,8 @@ export function privacyNote(endpoint) {
       return 'Downloads happen on this device where the site allows it. The rest are sent to the cobalt instance you configured.';
     case 'piped':
       return 'Downloads happen on this device. YouTube links are sent to the Piped instance you configured.';
+    case 'invidious':
+      return 'Downloads happen on this device. YouTube links are sent to the Invidious instance you configured.';
     case 'relay':
       return 'Downloads happen on this device, except for hosts that refuse a web page — those go through your relay.';
     default:
@@ -132,6 +142,8 @@ export function describeEndpoint(endpoint) {
       return `A ${endpoint.label} instance. This device does what it can; the rest goes to the instance.`;
     case 'piped':
       return 'A Piped instance. YouTube goes through it; everything else stays on this device.';
+    case 'invidious':
+      return 'An Invidious instance. YouTube goes through it; everything else stays on this device.';
     case 'relay':
       return 'A relay. This device does everything; hosts that refuse a page go through the relay.';
     default:

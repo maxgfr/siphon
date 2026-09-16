@@ -33,7 +33,9 @@ const FFMPEG = process.env.FFMPEG || 'ffmpeg';
 const CORE_URL = process.env.SIPHON_CORE_URL || 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.js';
 const APP_PORT = 8787;
 const MEDIA_PORT = 8788;
+const INV_PORT = 8789;
 const MEDIA = `http://127.0.0.1:${MEDIA_PORT}`;
+const INV = `http://127.0.0.1:${INV_PORT}`;
 
 /* -------------------------------------------------------------------- fixtures */
 
@@ -198,6 +200,67 @@ function serve(root, port, prefix) {
   return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
 }
 
+/* ------------------------------------------------------------- a fake Invidious */
+
+/** What the fake instance was asked, so a check can say what the app did. */
+const invidious = { videos: [], playback: 0, captions: 0 };
+
+/**
+ * An Invidious instance, as far as this app can tell one apart: the stats
+ * endpoint that names the software, the video endpoint that rewrites media
+ * URLs through its own /videoplayback only when asked with `local=true`, the
+ * captions endpoint serving WebVTT. The shapes are the real API's, down to
+ * numbers as strings and paths relative to the instance; only the video is
+ * ours. Without `local=true` a real instance answers googlevideo's own URLs,
+ * which refuse a page — and so does this one.
+ */
+function serveInvidious(port) {
+  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Expose-Headers': '*' };
+  const json = (response, status, body) =>
+    response.writeHead(status, { ...cors, 'Content-Type': 'application/json' }).end(JSON.stringify(body));
+  const server = createServer((request, response) => {
+    const url = new URL(request.url, 'http://x');
+    if (request.method === 'OPTIONS') return response.writeHead(204, cors).end();
+
+    if (url.pathname === '/api/v1/stats') {
+      return json(response, 200, { version: '2.20260901.0', software: { name: 'invidious', version: '2.20260901.0', branch: 'master' } });
+    }
+    const video = /^\/api\/v1\/videos\/([\w-]+)$/.exec(url.pathname);
+    if (video) {
+      const local = url.searchParams.get('local') === 'true';
+      invidious.videos.push({ id: video[1], local });
+      const media = local ? '/videoplayback?expire=1&itag=18' : 'https://rr1---sn-example.googlevideo.com/videoplayback?itag=18';
+      return json(response, 200, {
+        title: 'A clip through Invidious', videoId: video[1], author: 'the fixture', lengthSeconds: 6, liveNow: false,
+        videoThumbnails: [{ quality: 'medium', url: `/vi/${video[1]}/mqdefault.jpg`, width: 320, height: 180 }],
+        formatStreams: [{ url: media, itag: '18', type: 'video/mp4; codecs="avc1.42001E, mp4a.40.2"', quality: 'medium', bitrate: '600000', container: 'mp4', encoding: 'h264', qualityLabel: '360p', resolution: '360p', size: '640x360', fps: 25 }],
+        adaptiveFormats: [],
+        captions: [{ label: 'English', language_code: 'en', url: `/api/v1/captions/${video[1]}?label=English` }],
+      });
+    }
+    if (url.pathname.startsWith('/api/v1/captions/')) {
+      invidious.captions += 1;
+      return response.writeHead(200, { ...cors, 'Content-Type': 'text/vtt' })
+        .end('WEBVTT\n\n00:00:00.000 --> 00:00:03.000\nhello from invidious\n');
+    }
+    if (url.pathname.startsWith('/vi/')) {
+      const cover = readFileSync(join(MEDIA_DIR, 'cover.jpg'));
+      return response.writeHead(200, { ...cors, 'Content-Type': 'image/jpeg', 'Content-Length': cover.length }).end(cover);
+    }
+    if (url.pathname === '/videoplayback') {
+      const source = join(MEDIA_DIR, 'clip.mp4');
+      const size = statSync(source).size;
+      const head = { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': size, 'Accept-Ranges': 'bytes' };
+      if (request.method === 'HEAD') return response.writeHead(200, head).end();
+      invidious.playback += 1;
+      response.writeHead(200, head);
+      return createReadStream(source).pipe(response);
+    }
+    return json(response, 404, { error: 'not found' });
+  });
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
+}
+
 /* ---------------------------------------------------------------------- checking */
 
 const results = [];
@@ -211,7 +274,7 @@ const resolutionIn = (report) => (/\b(\d{3,4}x\d{3,4})\b/.exec(report) || [])[1]
 /* ------------------------------------------------------------------------- run */
 
 buildFixtures();
-const servers = [await serve(WEB, APP_PORT, '/app'), await serve(WORK, MEDIA_PORT, '')];
+const servers = [await serve(WEB, APP_PORT, '/app'), await serve(WORK, MEDIA_PORT, ''), await serveInvidious(INV_PORT)];
 const browser = await chromium.launch(process.env.CHROMIUM ? { executablePath: process.env.CHROMIUM } : {});
 const context = await browser.newContext({ acceptDownloads: true });
 const page = await context.newPage();
@@ -222,8 +285,14 @@ page.on('console', (message) => {
   // The cut-connection case deliberately breaks one response, and the browser
   // says so. That one resource is excused by URL; every other console error,
   // including any other failed load, still counts.
-  if ((message.location()?.url || '').includes('/flaky.mp4')) return;
-  consoleErrors.push(message.text());
+  const at = message.location()?.url || '';
+  if (at.includes('/flaky.mp4')) return;
+  // Working out what an address is means asking it things it is not: an
+  // Invidious instance answers 404 to /api/health, / and /config before its
+  // stats endpoint says what it is, and Chrome reports each miss here. Those
+  // three, on that one origin, are the probe doing its job.
+  if (/^http:\/\/127\.0\.0\.1:8789\/(api\/health|config)?$/.test(at) && /status of 404/.test(message.text())) return;
+  consoleErrors.push(`${message.text()} <${at}>`);
 });
 page.on('pageerror', (error) => consoleErrors.push(`pageerror: ${error.message}`));
 
@@ -231,6 +300,17 @@ page.on('pageerror', (error) => consoleErrors.push(`pageerror: ${error.message}`
 // claim rests on, so watch the wire rather than trusting the plan.
 let coreRequests = 0;
 page.on('request', (request) => request.url().startsWith(CORE_URL) && (coreRequests += 1));
+
+// Everything the page asks for off this machine, other than the converter.
+// A YouTube link carried by an instance must never make the page touch
+// googlevideo or youtube.com itself — the whole point is that it cannot.
+const CORE_DIR = CORE_URL.replace(/[^/]*$/, '');
+const strangers = [];
+page.on('request', (request) => {
+  const url = request.url();
+  if (/^(http:\/\/127\.0\.0\.1|blob:|data:)/.test(url) || url.startsWith(CORE_DIR)) return;
+  strangers.push(url);
+});
 
 await page.addInitScript(
   (coreUrl) => {
@@ -351,6 +431,63 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   const label = (await page.textContent('#queueList li .q-msg')) || '';
   const save = await page.locator('#queueList li a.q-act').count();
   check('a finished row comes back after a reload', save > 0 && !/no longer/i.test(label), label.slice(0, 60));
+}
+
+/* An Invidious instance, given as the one address, carries YouTube for the device. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  strangers.length = 0;
+
+  // Through the settings sheet, the way a person does it: type the address,
+  // watch it be recognised, save. No reload afterwards — the init script
+  // above would put the no-helper settings back.
+  await page.click('#openSettings');
+  await page.fill('#endpoint', INV);
+  await page.click('#testConnection');
+  await page.waitForFunction(
+    () => !/checking|not checked/i.test(document.getElementById('statusText').textContent || ''), null, { timeout: 15_000 });
+  const verdict = (await page.textContent('#statusText')) || '';
+  check('an Invidious instance is recognised from its address alone', /An Invidious instance/.test(verdict), verdict.slice(0, 70));
+  await page.click('#saveSettings');
+  await page.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 15_000 });
+  const header = (await page.textContent('#backendLabel')) || '';
+  check('and the header says so', /Invidious for YouTube/.test(header), header);
+  const privacy = (await page.textContent('#privacyNote')) || '';
+  check('and the privacy line names it', /Invidious instance/.test(privacy), privacy.slice(0, 80));
+
+  const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
+  const take = async (url) => {
+    await page.fill('#url', url);
+    const waiting = page.waitForEvent('download', { timeout: 180_000 });
+    await page.click('#go');
+    const event = await waiting;
+    const saved = join(DOWNLOADS, `invidious-${event.suggestedFilename()}`);
+    await event.saveAs(saved);
+    return { saved, name: event.suggestedFilename() };
+  };
+
+  // A YouTube link now. The device cannot read YouTube; the instance can.
+  await page.check('input[name="quality"][value="video_best"]');
+  const raw = await take('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+  check('a YouTube link is resolved by the instance', invidious.videos.length >= 1, `${invidious.videos.length} asks`);
+  check('and asked for local URLs, the only kind a page can fetch',
+    invidious.videos.length > 0 && invidious.videos.every((ask) => ask.local), JSON.stringify(invidious.videos[0]));
+  check("the file arrives through the instance's own proxy, byte-identical",
+    invidious.playback >= 1 && Buffer.compare(source, readFileSync(raw.saved)) === 0, `${invidious.playback} playback asks, ${source.length} bytes`);
+  check('named after the video, not the link', /clip through Invidious/i.test(raw.name), raw.name);
+
+  // Once more with subtitles in the video: the instance's caption is fetched
+  // and muxed in, so the raw hand-over becomes a copy through ffmpeg.
+  await page.check('input[name="subs"][value="embed"]');
+  const subbed = await take('https://youtu.be/jNQXAC9IVRw');
+  const report = inspect(subbed.saved);
+  check("the instance's caption track is fetched", invidious.captions === 1, `${invidious.captions} asks`);
+  check('and embedded in the video, which keeps its picture and sound',
+    /Subtitle: mov_text/.test(report) && /Video: h264/.test(report) && /Audio: aac/.test(report),
+    (report.match(/Stream #0:\d[^\n]*/g) || []).map((line) => line.replace(/\s+/g, ' ').slice(0, 50)).join(' | '));
+  check('the page itself never touched googlevideo or youtube.com', strangers.length === 0, strangers.slice(0, 2).join(' ; '));
 }
 
 check('no uncaught errors in the page', consoleErrors.length === 0, consoleErrors.slice(0, 2).join(' ; '));
