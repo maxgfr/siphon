@@ -9,7 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { findInstance, invidiousInstances, looksUnreachable, servesPages, DIRECTORIES, SEED } from '../web/instances.js';
+import { cobaltEntries, findInstance, invidiousInstances, looksUnreachable, servesPages, COBALT_DIRECTORY, DIRECTORIES, SEED } from '../web/instances.js';
 
 /** A fetch that answers the directories from a table, and records the asks. */
 function directories(table) {
@@ -288,16 +288,20 @@ test('the cap is spread across the directories, not spent on the first list', as
   assert.ok(probed.includes('https://inv.example'), 'and so was Invidious');
 });
 
-test('http-only instances are addressed as http, and duplicates are dropped', async () => {
+test('http-only instances are left out — a page on https cannot call them — and duplicates are dropped', async () => {
   const { fetchImpl } = directories({
-    [COBALT_LIST]: [{ api: 'plain.example', protocol: 'http' }, { api: 'plain.example', protocol: 'http' }],
+    [COBALT_LIST]: [{ api: 'plain.example', protocol: 'http' }, { api: 'safe.example' }, { api: 'safe.example/' }],
     [PIPED_LIST]: [],
   });
-  const { detect, probed } = prober({ 'http://plain.example': { kind: 'cobalt', label: 'cobalt' } });
+  const { detect, probed } = prober({
+    'http://plain.example': { kind: 'cobalt', label: 'cobalt' },
+    'https://safe.example': { kind: 'cobalt', label: 'cobalt' },
+  });
 
   const found = await findInstance({ fetchImpl, detect });
-  assert.equal(found.endpoint, 'http://plain.example');
-  assert.equal(probed.filter((address) => address === 'http://plain.example').length, 1);
+  assert.equal(found.endpoint, 'https://safe.example');
+  assert.ok(!probed.includes('http://plain.example'), 'never even probed');
+  assert.equal(probed.filter((address) => address === 'https://safe.example').length, 1);
 });
 
 /* ---------------------------------------------- falling back to another one */
@@ -389,4 +393,12 @@ test('servesPages asks the video endpoint and reads the answer the way the downl
   assert.equal(await servesPages('https://cors.example', inv, { fetchImpl }), false, 'a refused fetch is a no');
   assert.equal(await servesPages('https://piped.example', { kind: 'piped' }, { fetchImpl }), true);
   assert.equal(await servesPages('https://c.example', { kind: 'cobalt' }, { fetchImpl }), true, 'cobalt has no such endpoint to ask; its own request is the test');
+});
+
+test("the cobalt directory is cobalt.directory's working-APIs list, read whatever shape it takes", () => {
+  assert.equal(DIRECTORIES[0].url, COBALT_DIRECTORY);
+  assert.match(COBALT_DIRECTORY, /^https:\/\/cobalt\.directory\//);
+  assert.deepEqual(DIRECTORIES[0].read({ data: { youtube: ['a.example', { api: 'b.example', online: false }] } }), ['https://a.example']);
+  assert.deepEqual(cobaltEntries([{ api: 'c.example', score: '7', services: { youtube: true } }]), [{ api: 'https://c.example', score: 7 }]);
+  assert.deepEqual(cobaltEntries({ data: 'nonsense' }), []);
 });

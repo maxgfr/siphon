@@ -29,6 +29,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { cobaltEntries, COBALT_DIRECTORY } from '../web/instances.js';
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const TARGET = join(HERE, '..', 'web', 'config.json');
 const INSTANCES = join(HERE, '..', 'web', 'instances.json');
@@ -129,16 +131,23 @@ export async function evaluate(relay, { fetchImpl = globalThis.fetch, instances 
  * directory lists them, and the only test that matters is the one the app
  * makes: POST a YouTube link, get a tunnel, read its first bytes.
  */
-export const COBALT_DIRECTORY = 'https://instances.cobalt.best/api/instances.json';
+/**
+ * Where the instances are listed: the app's directory (the APIs found working
+ * per service at the last test) first, the full test table behind it in case
+ * the first is ever empty or gone. instances.cobalt.best, the list before
+ * these, left DNS — the first measurement from a runner found no such host.
+ */
+export const COBALT_DIRECTORIES = [COBALT_DIRECTORY, 'https://cobalt.directory/api/tests'];
+export { COBALT_DIRECTORY };
 export const WATCH = `https://www.youtube.com/watch?v=${VIDEO_ID}`;
+/** Named, as the directory asks of anything that is not a browser. */
+export const USER_AGENT = 'siphon relay-config (+https://github.com/maxgfr/siphon)';
 
 /** The directory's entries → API addresses worth asking, most trusted first. */
 export function cobaltCandidates(body, { limit = 12 } = {}) {
-  return (Array.isArray(body) ? body : [])
-    .filter((e) => e && e.api && e.online !== false && e.api_online !== false && e.protocol !== 'http')
-    .filter((e) => !e.services || e.services.youtube !== false)
-    .sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0))
-    .map((e) => `https://${String(e.api).replace(/\/+$/, '')}`)
+  return cobaltEntries(body)
+    .sort((a, b) => b.score - a.score)
+    .map((e) => e.api)
     .filter((api, i, all) => all.indexOf(api) === i)
     .slice(0, limit);
 }
@@ -175,16 +184,37 @@ export async function evaluateCobalt(api, { fetchImpl = globalThis.fetch } = {})
 }
 
 /** The directory, then each instance until one delivers; say what every one said. */
-export async function chooseCobalt({ fetchImpl = globalThis.fetch, say = () => {}, limit = 12 } = {}) {
+export async function chooseCobalt({ fetchImpl = globalThis.fetch, say = () => {}, limit = 12, directories = COBALT_DIRECTORIES } = {}) {
   let listed = [];
-  try {
-    const r = await fetchImpl(COBALT_DIRECTORY, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20_000) });
-    listed = cobaltCandidates(await r.json(), { limit });
-  } catch (error) {
-    say(`no   cobalt directory: ${String(error?.message || error).slice(0, 80)}`);
-    return '';
+  for (const directory of directories) {
+    // Each directory is named with what it said, so a log reads on its own:
+    // unreachable (and why), answering but in a shape nothing here reads
+    // (its first bytes shown, so the reader can be taught), or a count.
+    try {
+      const r = await fetchImpl(directory, { headers: { Accept: 'application/json', 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(20_000) });
+      const text = await r.text();
+      let body;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = null;
+      }
+      const peek = text.replace(/\s+/g, ' ').slice(0, 160);
+      if (!r.ok) {
+        say(`no   directory ${directory}: HTTP ${r.status} — ${peek}`);
+        continue;
+      }
+      listed = cobaltCandidates(body, { limit });
+      if (listed.length === 0) {
+        say(`no   directory ${directory}: nothing listed as up for YouTube — ${peek}`);
+        continue;
+      }
+      say(`     directory ${directory}: ${listed.length} instance(s) to ask`);
+      break;
+    } catch (error) {
+      say(`no   directory ${directory}: ${String(error?.cause?.code || error?.cause?.message || error?.message || error).slice(0, 80)}`);
+    }
   }
-  if (listed.length === 0) say('no   cobalt directory: no instance listed as online for YouTube');
   for (const api of listed) {
     const report = await evaluateCobalt(api, { fetchImpl });
     say(`${report.ok ? 'ok  ' : 'no  '} ${api}\n       answer: ${report.answer}\n       media: ${report.media || '-'}`);
