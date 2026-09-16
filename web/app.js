@@ -934,6 +934,21 @@ async function probeDraft() {
     const helper = await detectEndpoint(draft.endpoint, draft.key);
     if (seq !== probeSeq) return null;
     reflectHelper(helper);
+    // Recognising an instance is its stats endpoint answering, which every
+    // public one still does. The endpoint a download needs is another door,
+    // shut to pages on most of them now — so it is asked here, once, and the
+    // answer is the sentence a person needs before they save the address.
+    if (helper.kind === 'invidious' || helper.kind === 'piped') {
+      setStatus('', `${describeEndpoint(helper)} Checking that it answers this page for a video…`);
+      const open = await servesPages(draft.endpoint, helper);
+      if (seq !== probeSeq) return null;
+      setStatus(
+        open ? 'ok' : 'warn',
+        open
+          ? `${describeEndpoint(helper)} It answers this page for a video.`
+          : `${describeEndpoint(helper)} But it does not answer this page for a video: its video endpoint is closed to other apps, so YouTube links will fail through it. Try another instance, a relay, or your own server.`,
+      );
+    }
     return helper;
   } catch (error) {
     if (seq !== probeSeq) return null;

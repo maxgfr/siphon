@@ -86,3 +86,29 @@ jobs:
       - run: npm run test:youtube
         env:
           SIPHON_PIPED_URL: https://pipedapi.kavin.rocks
+
+  # Informative, like `youtube`: the server half against the real site, from
+  # this checkout, on a runner — the README's first recommendation, measured.
+  # First plain, then with the community proof-of-origin provider beside it
+  # (the docker-compose.potoken.yml arrangement), because a datacentre IP is
+  # exactly the case that provider exists for. The log says what yt-dlp said,
+  # client by client, in both cases.
+  server-youtube:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r server/requirements.txt bgutil-ytdlp-pot-provider
+      - run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # The provider as the compose overlay runs it: the image, its port.
+      - run: docker run -d --name potoken -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider:latest
+      - run: npm run test:server
+        env:
+          POT_PROVIDER_URL: http://127.0.0.1:4416
