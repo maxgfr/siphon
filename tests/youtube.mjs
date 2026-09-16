@@ -184,18 +184,36 @@ await within(10_000, 'app.listen', new Promise((resolve, reject) => {
   // machine, before any browser is involved: a status is an answer, a
   // timeout is the instance (or a firewall in front of it) swallowing the
   // runner's traffic, and the two read very differently in the walk below.
-  say('\ninvidious instances, straight from this machine:');
-  for (const address of INVIDIOUS) {
+  //
+  // Two asks per instance, both with an Origin header as a page would send:
+  // the stats endpoint, which says whether the instance is up at all, and the
+  // videos endpoint the app actually uses. For each, the status and — the
+  // fact that decides everything for a page — whether the answer carries
+  // Access-Control-Allow-Origin. A 200 without it is a server that works
+  // and a browser that will refuse it; the browser reports that only as
+  // net::ERR_FAILED, which says nothing.
+  say('\ninvidious instances, straight from this machine (Origin: https://example.github.io):');
+  const id = /[?&]v=([\w-]{11})|youtu\.be\/([\w-]{11})/.exec(VIDEO);
+  const videoId = (id && (id[1] || id[2])) || 'jNQXAC9IVRw';
+  const ask = async (url) => {
     const started = Date.now();
-    let line;
     try {
-      const response = await fetch(`${address}/api/v1/stats`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
-      const body = (await response.text()).replace(/\s+/g, ' ').slice(0, 120);
-      line = `HTTP ${response.status} in ${Date.now() - started}ms — ${body}`;
+      const response = await fetch(url, {
+        headers: { Accept: 'application/json', Origin: 'https://example.github.io' },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(15_000),
+      });
+      const cors = response.headers.get('access-control-allow-origin');
+      const body = (await response.text()).replace(/\s+/g, ' ').slice(0, 110);
+      return `HTTP ${response.status} in ${Date.now() - started}ms, cors=${cors ? JSON.stringify(cors) : 'NONE'} — ${body}`;
     } catch (error) {
-      line = error?.name === 'TimeoutError' ? `no answer in 15s` : `${error?.cause?.code || error?.name || 'error'}: ${String(error?.cause?.message || error?.message || error).slice(0, 120)}`;
+      return error?.name === 'TimeoutError' ? 'no answer in 15s' : `${error?.cause?.code || error?.name || 'error'}: ${String(error?.cause?.message || error?.message || error).slice(0, 110)}`;
     }
-    say(`   ${new URL(address).host.padEnd(28)} ${line}`);
+  };
+  for (const address of INVIDIOUS) {
+    const host = new URL(address).host;
+    say(`   ${host.padEnd(28)} stats   ${await ask(`${address}/api/v1/stats`)}`);
+    say(`   ${''.padEnd(28)} videos  ${await ask(`${address}/api/v1/videos/${videoId}?local=true`)}`);
   }
 
   now('preflight: youtube.com through the relay');
@@ -335,7 +353,7 @@ async function attempt(preset, { piped = '', invidious = '' } = {}) {
     // instance.
     await page.waitForFunction(
       () => document.querySelector('.preview-meta:not(.skeleton)') || (document.getElementById('feedback')?.textContent || '').trim(),
-      null, { timeout: 60_000 });
+      null, { timeout: instance ? 20_000 : 60_000 });
     if (!(await page.$('.preview-meta:not(.skeleton)'))) throw new Error('no preview');
     client = ((await page.textContent('.preview-meta')) || '').split('·').pop().trim();
   } catch {
@@ -347,15 +365,20 @@ async function attempt(preset, { piped = '', invidious = '' } = {}) {
 
   now(`${label}: downloading`);
   const waiting = page.waitForEvent('download', { timeout: 150_000 });
+  // A row that has already failed is an answer; waiting the remaining two
+  // and a half minutes for a download that will not come is not.
+  const failed = page.waitForSelector('.q-error', { timeout: 150_000 }).then(() => 'failed').catch(() => 'failed');
   await page.click('#go');
 
   try {
-    const event = await waiting;
-    const saved = join(OUT, event.suggestedFilename());
-    await event.saveAs(saved);
+    const outcome = await Promise.race([waiting, failed]);
+    if (outcome === 'failed') throw new Error('the row failed');
+    const saved = join(OUT, outcome.suggestedFilename());
+    await outcome.saveAs(saved);
     return { saved, client };
   } catch {
-    const row = (await page.textContent('.q-msg').catch(() => '')) || '';
+    waiting.catch(() => {});
+    const row = (await page.textContent('.q-error .q-msg').catch(() => '')) || (await page.textContent('.q-msg').catch(() => '')) || '';
     return { error: row.trim() || 'no download and no message', client };
   }
 }

@@ -17,6 +17,7 @@
  *   node scripts/instances.mjs --check    # print what would be written
  */
 import { readFileSync, writeFileSync } from 'node:fs';
+import { promises as dns } from 'node:dns';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -121,8 +122,27 @@ async function fetchText(url, ms = 20_000) {
   return response.text();
 }
 
+/**
+ * Whether the name points at the internet at all.
+ *
+ * A clearnet-looking name can carry only a Yggdrasil address (200::/7) in
+ * public DNS — inv-ygg.nadeko.net does — and a browser fails to connect to
+ * it every time. A name that does not resolve is the same case. A resolver
+ * that itself errors is not the host's fault, so the host is kept then.
+ */
+export async function onTheInternet(url, resolve = dns) {
+  const { hostname } = new URL(url);
+  const [v4, v6] = await Promise.all([
+    resolve.resolve4(hostname).catch((error) => (error?.code === 'ENOTFOUND' || error?.code === 'ENODATA' ? [] : null)),
+    resolve.resolve6(hostname).catch((error) => (error?.code === 'ENOTFOUND' || error?.code === 'ENODATA' ? [] : null)),
+  ]);
+  if (v4 === null && v6 === null) return true; // the resolver failed, not the host
+  if ((v4 || []).length > 0) return true;
+  return (v6 || []).some((address) => !/^[23][0-9a-f]{2}:/i.test(address));
+}
+
 /** Ask the API, then the page; say which one answered; the seed behind either. */
-export async function refresh({ fetchImpl = fetchText } = {}) {
+export async function refresh({ fetchImpl = fetchText, resolve = dns } = {}) {
   let source = 'api.invidious.io';
   let list = [];
   try {
@@ -135,7 +155,9 @@ export async function refresh({ fetchImpl = fetchText } = {}) {
     list = fromDocsPage(await fetchImpl(DOCS_URL));
   }
   if (list.length === 0) throw new Error('neither the API nor the docs page listed a single instance');
-  return { source: `${source} + seed`, invidious: unique([...list, ...SEED]) };
+  const merged = unique([...list, ...SEED]);
+  const reachableOnes = await Promise.all(merged.map((url) => onTheInternet(url, resolve)));
+  return { source: `${source} + seed`, invidious: merged.filter((_, i) => reachableOnes[i]) };
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];

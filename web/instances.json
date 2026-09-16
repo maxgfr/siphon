@@ -3,7 +3,6 @@
   "source": "api.invidious.io + seed",
   "invidious": [
     "https://invidious.f5.si",
-    "https://inv-ygg.nadeko.net",
     "https://inv.nadeko.net",
     "https://yewtu.be",
     "https://invidious.nerdvpn.de",
