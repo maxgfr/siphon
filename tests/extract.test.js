@@ -473,6 +473,41 @@ test('the walk is capped, so a bad day for the whole network costs a few request
   assert.equal(asked.length, 4, 'the configured one plus three spares');
 });
 
+test('an instance that never answers is left behind within the bound, and the walk goes on', async () => {
+  // What a GitHub runner saw from three public instances: no refusal, no
+  // answer, nothing — the connection just hangs. Without a bound that is a
+  // minute per instance; with one it is the bound, then the next replica.
+  const asked = [];
+  const net = {
+    json: (url, { signal } = {}) => {
+      asked.push(url);
+      if (url.startsWith('https://answers.example/')) return Promise.resolve(answers('https://answers.example'));
+      return new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason)));
+    },
+  };
+  const resolver = invidiousResolver('https://hangs.example', { others: async () => ['https://answers.example'], timeout: 40 });
+  const started = Date.now();
+  const info = await resolver.resolve(WATCH, { net });
+  assert.equal(info.extractor, 'youtube (invidious: answers.example)');
+  assert.equal(asked.length, 2);
+  assert.ok(Date.now() - started < 1000, 'moved on within the bound, not the default fifteen seconds');
+});
+
+test('the timeout names the host and the seconds, so the row says who kept quiet', async () => {
+  const net = { json: (url, { signal } = {}) => new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason))) };
+  const resolver = invidiousResolver('https://hangs.example', { timeout: 30 });
+  await assert.rejects(() => resolver.resolve(WATCH, { net }), /hangs\.example did not answer within 0s/);
+});
+
+test('the person cancelling is not the instance failing', async () => {
+  const controller = new AbortController();
+  const net = { json: (url, { signal } = {}) => new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason))) };
+  const resolver = invidiousResolver('https://slow.example', { others: async () => ['https://other.example'], timeout: 5000 });
+  const pending = resolver.resolve(WATCH, { net, signal: controller.signal });
+  controller.abort();
+  await assert.rejects(pending, (error) => error?.name === 'AbortError' || /abort/i.test(String(error?.message || error?.name)));
+});
+
 test('with no list at all, the configured instance\'s own refusal is what comes back', async () => {
   const { net } = fakeNet({ 'https://home.example/': new Error('home.example answered 503') });
   const resolver = invidiousResolver('https://home.example');
