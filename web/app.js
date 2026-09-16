@@ -104,6 +104,66 @@ async function pickInitialHelper() {
 }
 
 const INSTANCE_OFFERED = 'siphon:instance-offered';
+const SITE_RELAY_TAKEN = 'siphon:site-relay';
+const TOUR_SEEN = 'siphon:tour-seen';
+
+/**
+ * What the site's owner configured, deployed beside the page.
+ *
+ * config.json carries the one thing that makes YouTube work for every
+ * visitor with nothing to set: the address of a relay the owner deployed.
+ * Same-origin, so a missing or unreadable file is simply "nothing set".
+ */
+let siteConfigPromise = null;
+function siteConfig() {
+  if (!siteConfigPromise) {
+    siteConfigPromise = fetch(new URL('./config.json', location.href).href, { credentials: 'omit', signal: AbortSignal.timeout(6000) })
+      .then((response) => (response.ok ? response.json() : {}))
+      .then((body) => ({ relay: String(body?.relay || '').trim().replace(/\/+$/, '') }))
+      .catch(() => ({ relay: '' }));
+  }
+  return siteConfigPromise;
+}
+
+/**
+ * Take the site's relay, once, when nothing else is set.
+ *
+ * The person still sees whose server their YouTube links will reach — the
+ * notice names it, and settings show it — and clearing it is one tap. Tried
+ * again on a later visit only if the relay could not be reached this time,
+ * never after the person cleared it.
+ */
+async function adoptSiteRelay() {
+  if (settings.helper.kind !== 'none' || settings.endpoint) return false;
+  try {
+    if (localStorage.getItem(SITE_RELAY_TAKEN) === '1') return false;
+  } catch { /* storage off: once per session is the harmless side */ }
+  const { relay } = await siteConfig();
+  if (!relay) return false;
+  let helper;
+  try {
+    helper = await detectEndpoint(relay);
+  } catch {
+    return false;
+  }
+  try {
+    localStorage.setItem(SITE_RELAY_TAKEN, '1');
+  } catch { /* nothing to do */ }
+  // A helper the person chose in the meantime wins; so does a relay that
+  // turned out to be something else.
+  if (helper.kind !== 'relay' || settings.helper.kind !== 'none' || settings.endpoint) return false;
+
+  settings = { ...settings, endpoint: relay, key: '', helper };
+  saveSettings();
+  applyBackend();
+  refreshBackendLabel();
+  renderFeedback(
+    '<div class="notice"><p><strong>This site has a relay.</strong> ' +
+      `YouTube links, and hosts that refuse a web page, go through <strong>${escapeHtml(hostOf(relay))}</strong>, ` +
+      'which this site runs; everything else stays on this device. Change or clear it in settings.</p></div>',
+  );
+  return true;
+}
 
 /**
  * Nothing behind the page, so go and find a public instance.
@@ -1162,10 +1222,80 @@ async function boot(firstVisit) {
   }
   await restoreQueue();
   refreshBackendLabel();
-  // Only on a genuine first visit, and never awaited: the screen is already
-  // usable, this talks to other people's servers, and someone who has used the
-  // app before with no helper chose that.
-  if (firstVisit && settings.helper.kind === 'none' && !settings.endpoint) offerPublicInstance();
+  setupTour();
+  // The site's own relay first — the owner set it up for exactly this — and
+  // only failing that, on a genuine first visit, a public instance. Neither
+  // holds up a paste: the screen is already usable. Someone who has used the
+  // app before with no helper chose that, and is not searched for again.
+  const adopted = await adoptSiteRelay();
+  if (!adopted && firstVisit && settings.helper.kind === 'none' && !settings.endpoint) offerPublicInstance();
+  fillTour();
 }
+
+/* --------------------------------------------------------------------- tour */
+
+/**
+ * The guide: three steps, and what YouTube needs.
+ *
+ * Shown once, on the first screen, and again from the ? in the header. The
+ * YouTube part is not a fixed text — it says what is set right now and what
+ * would make it work, so it is the one place a first visitor has to read.
+ */
+function setupTour() {
+  const tour = $('tour');
+  let seen = false;
+  try {
+    seen = localStorage.getItem(TOUR_SEEN) === '1';
+  } catch { /* storage off: showing it again is the harmless side */ }
+
+  $('openTour').addEventListener('click', () => {
+    fillTour();
+    tour.hidden = false;
+    tour.scrollIntoView?.({ block: 'nearest' });
+  });
+  $('tourDismiss').addEventListener('click', () => {
+    tour.hidden = true;
+    try {
+      localStorage.setItem(TOUR_SEEN, '1');
+    } catch { /* nothing to do */ }
+  });
+  $('copyDocker').addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText($('dockerCmd').textContent);
+      $('copyDocker').textContent = 'Copied';
+    } catch {
+      $('copyDocker').textContent = 'Select and copy';
+    }
+  });
+  if (!seen) tour.hidden = false;
+}
+
+async function fillTour() {
+  const kind = settings.helper.kind;
+  const host = escapeHtml(hostOf(settings.endpoint));
+  const status = $('tourYoutube');
+  const options = $('tourOptions');
+  let text;
+  let settled = false;
+  if (kind === 'siphon') {
+    text = `<strong>Ready.</strong> Your server at <strong>${host}</strong> handles YouTube, playlists and subtitles.`;
+    settled = true;
+  } else if (kind === 'relay') {
+    text = `<strong>Ready.</strong> YouTube goes through the relay at <strong>${host}</strong>; everything else stays on this device.`;
+    settled = true;
+  } else if (kind === 'cobalt' || kind === 'piped' || kind === 'invidious') {
+    text =
+      `A public instance is set (<strong>${host}</strong>) and YouTube is tried through it. Public instances are ` +
+      'closing their doors one by one, so if a link fails, one of these makes it work for good:';
+  } else {
+    const { relay } = await siteConfig();
+    text = relay
+      ? 'This site has a relay for YouTube. It is applied when nothing else is set; clear the helper in settings to use it.'
+      : 'YouTube refuses web pages, so it needs one thing that is yours. Each takes about a minute:';
+  }
+  status.innerHTML = text;
+  options.hidden = settled;
+}
+
 
 init();

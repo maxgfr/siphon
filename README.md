@@ -1,11 +1,41 @@
 # siphon
 
-Paste a link, pick a quality, get the file. A mobile-first downloader with
-nothing to install on the phone — and, for a lot of links, nothing to run
-anywhere at all.
+Paste a link, pick a quality, get the file. It runs in your browser: nothing to
+install on the phone, and for most links nothing to run anywhere.
 
-Open it, tap **Paste**, tap **Download**. On Android you can also share a link
-straight from YouTube into it, because it installs as a share target.
+## Use it
+
+1. **Open the page.** On a phone, add it to the home screen — it installs as
+   an app and as a share target.
+2. **Paste a link.** Tap **Paste**, or share a link straight into the app. A
+   video page, a direct file, an HLS stream.
+3. **Pick a quality, tap Download.** Fetching, merging, converting and tagging
+   happen on your device. Nothing is uploaded; no link leaves it.
+
+That is all of it for direct files, streams and most video pages. The **?** in
+the header opens a guide that says the same in the app, and what YouTube
+needs.
+
+## YouTube
+
+YouTube refuses web pages outright, and the public instances that used to
+answer for it are closing their doors one by one (measured, at the end of this
+file). So YouTube needs **one thing that is yours**, and each takes about a
+minute:
+
+| | what you do | what you get |
+|---|---|---|
+| **A free relay** | [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/maxgfr/siphon/tree/main/relay) one click, then paste the `*.workers.dev` address into settings | YouTube through a Worker that adds the missing header and nothing else; no yt-dlp, no state, nothing to maintain |
+| **The bridge** | install the userscript from [`bridge/`](bridge/) | everything stays on your device; no server anywhere |
+| **Your own server** | `docker run -d -p 8000:8000 -v siphon:/tmp/siphon ghcr.io/maxgfr/siphon` | the most capable: every site yt-dlp knows, playlists, subtitles, your cookies |
+
+**Running this site for others?** Deploy the relay once, then set the
+repository variable `SIPHON_RELAY_URL` to its address (Settings → Secrets and
+variables → Actions → Variables). The next Pages deploy writes it into
+`web/config.json`, and every visitor gets YouTube through it with nothing to
+set — the app names it on screen, and clearing it is one tap.
+
+The app always says which helper is in use, in the header and in the guide.
 
 ## One address, and it works out the rest
 
@@ -154,7 +184,9 @@ running at all:
   goes and *finds* one that answers today, and says which. When one is set it
   is tried first and a relay is the fallback.
 - **[A relay](relay/)** — one file that adds the missing header and forwards
-  nothing else. No yt-dlp, no ffmpeg, no state, and nothing to maintain when
+  nothing else. With a relay set, the bundled Invidious list is walked through
+  it first — the instances refuse a *page*, not a plain client, and the relay
+  is a plain client — and InnerTube through the relay is the fallback. No yt-dlp, no ffmpeg, no state, and nothing to maintain when
   YouTube changes, because the part that changes is running in your browser.
   One click puts it on a free Cloudflare Worker; `node relay/serve.mjs` runs
   the same file on your own machine with no account at all, on your home IP,
@@ -631,6 +663,11 @@ The app has three settings, all optional and all empty to begin with: the
 where **ffmpeg.wasm** is fetched from — blank means the copy deployed beside
 the app, so this is only for pointing at a different build.
 
+The site has one: `web/config.json`, written by the Pages deploy from the
+repository variable `SIPHON_RELAY_URL`. When it names a relay, a visitor with
+nothing set gets it as their helper, once, named on screen; clearing it in
+settings is respected from then on. Nothing else is decided for the visitor.
+
 The server has the rest. All server-side, all environment variables:
 
 | variable | default | what it does |
@@ -784,9 +821,9 @@ still unproven.
 | suite | what it is | result |
 |---|---|---|
 | `pytest server/tests` | the server, including two against real yt-dlp, and the converter vendoring | 124 pass |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh | 141 pass |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh, the relay-side walk | 144 pass |
 | `npm run test:e2e` | the device alone, real Chromium, two origins, a fake Invidious, the bundled converter | 34 pass |
-| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the suggested chips | 39 pass |
+| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips, the guide, the site's relay | 52 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
 | `npm run test:split` | a server that only resolves, a device that downloads | 24 pass |
 | `npm run test:youtube` | YouTube, for real, in CI — through the relay, Piped, and the bundled Invidious list | informative — see below |
@@ -859,6 +896,17 @@ origin and the media on another, so the CORS path under test is the real one:
   video. With **In the video** on, its caption is fetched and embedded as
   `mov_text` beside the untouched picture and sound. The page itself contacts
   neither googlevideo nor youtube.com at any point — checked on the wire.
+
+The guide and the site's relay are driven in the deployed suite, in a real
+browser over HTTPS: a first visit on a site whose owner set `SIPHON_RELAY_URL`
+takes the relay as its helper with nothing to do, is told whose it is, and the
+header says "relay for YouTube"; the guide is on the first screen, says
+YouTube is ready and names the relay, offers nothing more to set up, stays
+closed once closed, and comes back from the ? in the header; a visitor who
+clears the helper is not handed it again; and with no relay configured the
+guide says YouTube needs one thing that is yours and offers the relay deploy,
+the bridge and the docker command. Nothing is contacted off the machine in any
+of it.
 
 ### The split
 

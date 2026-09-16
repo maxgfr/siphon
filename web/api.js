@@ -16,7 +16,7 @@
 export { BackendError } from './errors.js';
 import { BackendError } from './errors.js';
 import { BrowserBackend } from './inbrowser.js';
-import { pipedResolver, invidiousResolver } from './extract.js';
+import { pipedResolver, invidiousResolver, invidiousWalk } from './extract.js';
 import { invidiousInstances } from './instances.js';
 import { relayEscape } from './net.js';
 export { detectEndpoint, privacyNote, describeEndpoint } from './endpoint.js';
@@ -303,6 +303,10 @@ export class Siphon {
         this.server ? serverResolver(this.server) : null,
         kind === 'piped' ? pipedResolver(endpoint) : null,
         kind === 'invidious' ? invidiousResolver(endpoint, { others: () => invidiousInstances() }) : null,
+        // A relay makes the public instances readable again (they refuse a
+        // page, not a plain client), so with one the bundled list is walked
+        // before InnerTube is tried through the same relay.
+        kind === 'relay' ? invidiousWalk({ others: () => invidiousInstances() }) : null,
       ],
     });
 
@@ -329,7 +333,7 @@ export class Siphon {
       cobalt: `${this.helper.label} for the rest`,
       piped: 'Piped for YouTube',
       invidious: 'Invidious for YouTube',
-      relay: 'relay for hosts that refuse',
+      relay: 'relay for YouTube',
       none: 'no helper',
     }[this.helper.kind] || 'no helper';
     return { ...info, label: `${info.label} · ${suffix}` };

@@ -31,7 +31,11 @@ copy of the server.
 
 One click, a free Cloudflare account, and a `*.workers.dev` address at the
 end. Set `ALLOWED_ORIGINS` to your frontend's URL in the Worker's settings once
-it exists. Or from a terminal:
+it exists. Then either paste the address into the app's settings, or — if you
+run the site — set the repository variable `SIPHON_RELAY_URL` to it, so every
+visitor gets it as their helper with nothing to configure (the Pages deploy
+writes it into `web/config.json`; the app names it on screen, and clearing it
+is one tap). Or from a terminal:
 
 ```sh
 cd relay

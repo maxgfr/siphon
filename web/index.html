@@ -34,6 +34,14 @@
         <span class="mark-sub" id="backendLabel">checking server…</span>
       </span>
     </div>
+    <button class="icon-btn" type="button" id="openTour" aria-label="How this works">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="9.5" />
+        <path d="M9.4 9.2a2.7 2.7 0 0 1 5.2 1c0 1.8-2.6 2.2-2.6 4" />
+        <circle cx="12" cy="17.4" r=".6" fill="currentColor" />
+      </svg>
+    </button>
     <button class="icon-btn" type="button" id="openSettings" aria-label="Settings">
       <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor"
            stroke-width="2" stroke-linecap="round" aria-hidden="true">
@@ -85,6 +93,33 @@
       <span class="section-label" id="queueLabel">Downloads</span>
       <ol id="queueList"></ol>
       <button class="chip-btn" type="button" id="queueClear" style="margin-top:10px">Clear finished</button>
+    </section>
+
+    <!-- The guide: shown on the first screen, and from the ? in the header. -->
+    <section class="tour" id="tour" hidden aria-labelledby="tourTitle">
+      <div class="tour-head">
+        <strong id="tourTitle">How this works</strong>
+        <button class="chip-btn" type="button" id="tourDismiss" aria-label="Close the guide">✕</button>
+      </div>
+      <ol class="tour-steps">
+        <li><strong>Paste a link.</strong> A video page, a direct file, a stream. Tap <em>Paste</em>, or share a link into this app.</li>
+        <li><strong>Pick a quality, tap Download.</strong> Fetching, merging and converting happen on this device. Nothing is uploaded.</li>
+        <li><strong>Save it.</strong> The file lands in your downloads, and the row stays here until you clear it.</li>
+      </ol>
+      <div class="tour-youtube">
+        <strong>YouTube</strong>
+        <p id="tourYoutube"></p>
+        <div id="tourOptions">
+          <p><strong>A free relay</strong> — one click on Cloudflare, then paste the address it gives you into settings.
+            <a href="https://deploy.workers.cloudflare.com/?url=https://github.com/maxgfr/siphon/tree/main/relay" target="_blank" rel="noopener">Deploy the relay</a></p>
+          <p><strong>The bridge</strong> — a userscript; nothing leaves this device.
+            <a href="https://github.com/maxgfr/siphon/tree/main/bridge" target="_blank" rel="noopener">Install the bridge</a></p>
+          <p><strong>Your own server</strong> — the most capable: playlists, subtitles, your cookies.
+            <code id="dockerCmd">docker run -d -p 8000:8000 -v siphon:/tmp/siphon ghcr.io/maxgfr/siphon</code>
+            <button class="chip-btn" type="button" id="copyDocker">Copy</button></p>
+          <p class="tour-owner">Running this site? Set the repository variable <code>SIPHON_RELAY_URL</code> to your relay once, and every visitor gets it by default.</p>
+        </div>
+      </div>
     </section>
 
     <section class="install-cta" id="installCta" hidden>
