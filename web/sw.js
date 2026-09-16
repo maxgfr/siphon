@@ -9,10 +9,10 @@
  * themselves. Caching a 400 MB video into the Cache API would fill the device's
  * storage quota and, on iOS, get the whole origin's storage evicted.
  */
-const CACHE = 'siphon-v2';
+const CACHE = 'siphon-v3';
 const SHELL = [
   './', './index.html', './styles.css', './manifest.webmanifest', './icon.svg',
-  './app.js', './api.js', './errors.js',
+  './app.js', './api.js', './errors.js', './config.json', './instances.json',
   // The in-browser extractor. Small enough to precache, and the reason the app
   // can do anything at all with no network to a server of ours.
   './inbrowser.js', './extract.js', './net.js', './m3u8.js', './media.js', './store.js', './ffmpeg-worker.js',

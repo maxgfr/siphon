@@ -13,6 +13,7 @@ import {
   invidiousFormats,
   invidiousSubtitles,
   invidiousResolver,
+  invidiousWalk,
   safeFilename,
   titleFromUrl,
   extensionOf,
@@ -506,6 +507,26 @@ test('the person cancelling is not the instance failing', async () => {
   const pending = resolver.resolve(WATCH, { net, signal: controller.signal });
   controller.abort();
   await assert.rejects(pending, (error) => error?.name === 'AbortError' || /abort/i.test(String(error?.message || error?.name)));
+});
+
+test('with a relay and no instance, the bundled list is walked from its first entry', async () => {
+  // The first is the base, the rest are the replicas: the same walk a
+  // configured instance gets, with the list itself as the starting point.
+  const { net, asked } = fakeNet({
+    'https://one.example/': { error: "Sign in to confirm you're not a bot" },
+    'https://two.example/': answers('https://two.example'),
+  });
+  const walk = invidiousWalk({ others: async () => ['https://one.example', 'https://two.example', 'https://three.example'] });
+  const info = await walk.resolve(WATCH, { net });
+  assert.equal(info.extractor, 'youtube (invidious: two.example)');
+  assert.deepEqual(asked.map((url) => new URL(url).host), ['one.example', 'two.example']);
+  assert.equal(walk.generic, false, 'YouTube only, like any instance');
+});
+
+test('an empty bundled list is an error that says so, not a crash', async () => {
+  const { net, asked } = fakeNet({});
+  await assert.rejects(() => invidiousWalk({ others: async () => [] }).resolve(WATCH, { net }), /No public Invidious instance/);
+  assert.equal(asked.length, 0);
 });
 
 test('with no list at all, the configured instance\'s own refusal is what comes back', async () => {

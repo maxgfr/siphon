@@ -938,6 +938,25 @@ export function invidiousResolver(base, { others = async () => [], spare = 3, ti
   };
 }
 
+/**
+ * The bundled list as one resolver, for when no instance is configured but
+ * a relay is. The first instance is the base and the rest are the replicas;
+ * every answer a page cannot read goes through the relay by the Fetcher's
+ * usual route discovery, which is what makes instances that close their
+ * video endpoint to pages — but not to a plain client — usable again.
+ */
+export function invidiousWalk({ others = async () => [], spare = 3, timeout = INSTANCE_TIMEOUT_MS } = {}) {
+  return {
+    name: 'invidious-walk',
+    generic: false,
+    resolve: async (url, context) => {
+      const list = (await others().catch(() => [])).filter(Boolean);
+      if (list.length === 0) throw new BackendError('No public Invidious instance to try.', { hint: 'The bundled list is empty.' });
+      return invidiousResolver(list[0], { others: async () => list, spare, timeout }).resolve(url, context);
+    },
+  };
+}
+
 async function extractInvidious(id, url, context) {
   const base = String(context.invidious || '').replace(/\/+$/, '');
   let body;

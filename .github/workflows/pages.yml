@@ -47,6 +47,14 @@ jobs:
       # The converter, beside the page: same-origin, nothing to configure.
       - run: python3 scripts/vendor_ffmpeg.py
 
+      # The site's own relay, if its owner set one: Settings → Secrets and
+      # variables → Actions → Variables → SIPHON_RELAY_URL. Every visitor then
+      # gets YouTube through it with nothing to configure. Unset, the file
+      # stays as committed and the app looks for a public instance instead.
+      - run: printf '{ "relay": "%s" }\n' "${SIPHON_RELAY_URL}" > web/config.json
+        env:
+          SIPHON_RELAY_URL: ${{ vars.SIPHON_RELAY_URL }}
+
       - uses: actions/upload-pages-artifact@v4
         with:
           path: web

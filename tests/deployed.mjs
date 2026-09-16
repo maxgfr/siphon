@@ -102,6 +102,13 @@ const server = createServer(
       return response.writeHead(200, { 'Content-Type': 'application/json' }).end(overrides.get(path));
     }
 
+    // A relay, as far as detection can tell one apart: it fetches what it is
+    // asked for. Only robots.txt is ever asked, and only its shape matters.
+    if (path === '/relay' || path.startsWith('/relay/')) {
+      if (!url.searchParams.get('url')) return response.writeHead(400, { 'Content-Type': 'application/json' }).end('{"error":"no url parameter"}');
+      return response.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' }).end('User-agent: *\nDisallow: /comment\n');
+    }
+
     // The one endpoint that tells a container apart from a static host.
     if (path === '/api/health') {
       if (!hasApi) return response.writeHead(404, { 'Content-Type': 'text/plain' }).end('not found');
@@ -351,7 +358,64 @@ for (const [old, expected] of [
   await context.close();
 }
 
-/* 5. A deploy landing under a returning visitor, worker and all. */
+/* 5. The guide, and the site's own relay. */
+{
+  // A first visit on a site whose owner set a relay: the visitor gets it with
+  // nothing to do, is told whose it is, and the guide says YouTube is ready.
+  overrides.set('/siphon/config.json', JSON.stringify({ relay: `${BASE}/relay` }));
+  const { context, page } = await fresh();
+  await setApi(false);
+  await page.goto(APP, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(2500);
+
+  const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:settings') || '{}'));
+  check("the site's relay is taken as the helper on a first visit", saved.helper?.kind === 'relay' && saved.endpoint === `${BASE}/relay`,
+    JSON.stringify({ helper: saved.helper?.kind, endpoint: saved.endpoint }));
+  const notice = (await page.textContent('#feedback')) || '';
+  check('and the visitor is told whose relay it is', /This site has a relay/.test(notice) && notice.includes('127.0.0.1:8443'), notice.replace(/\s+/g, ' ').slice(0, 80));
+  check('the header says so', /relay for YouTube/.test((await page.textContent('#backendLabel')) || ''), await page.textContent('#backendLabel'));
+
+  // The guide is on the first screen, and its YouTube part reflects what is set.
+  check('the guide is shown on a first visit', await page.isVisible('#tour'));
+  const youtube = (await page.textContent('#tourYoutube')) || '';
+  check('and it says YouTube is ready, naming the relay', /Ready/.test(youtube) && youtube.includes('127.0.0.1:8443'), youtube.slice(0, 80));
+  check('with nothing left to set up', await page.isHidden('#tourOptions'));
+
+  // Dismissed, it stays dismissed; the ? brings it back.
+  await page.click('#tourDismiss');
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForTimeout(800);
+  check('closed once, the guide stays closed', await page.isHidden('#tour'));
+  await page.click('#openTour');
+  await page.waitForTimeout(300);
+  check('and the ? in the header brings it back', await page.isVisible('#tour'));
+
+  // A visitor who clears the helper is not handed the relay again.
+  await page.evaluate(() => localStorage.setItem('siphon:settings', JSON.stringify({ endpoint: '', key: '', helper: { kind: 'none', label: 'this device only' }, preset: 'video_best', subs: 'off', autoInstance: false })));
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForTimeout(1500);
+  const again = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:settings') || '{}'));
+  check('a helper the visitor cleared is not put back', again.helper?.kind === 'none' && !again.endpoint, JSON.stringify(again.helper));
+  check('nothing was contacted off this machine', context.__offsite.length === 0, context.__offsite.slice(0, 3).join(', '));
+  await context.close();
+  overrides.delete('/siphon/config.json');
+}
+
+/* 6. With no relay configured, the guide says what would make YouTube work. */
+{
+  const { context, page } = await fresh();
+  await setApi(false);
+  await page.goto(APP, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(2000);
+  const youtube = (await page.textContent('#tourYoutube')) || '';
+  check('the guide says YouTube needs one thing that is yours', /needs one thing that is yours/.test(youtube), youtube.slice(0, 80));
+  const options = await page.$$eval('#tourOptions a', (links) => links.map((a) => a.href));
+  check('and offers the relay deploy and the bridge, with links', options.some((h) => h.includes('deploy.workers.cloudflare.com')) && options.some((h) => h.includes('/bridge')), options.join(' '));
+  check('and the docker command to copy', /docker run .*ghcr\.io\/maxgfr\/siphon/.test((await page.textContent('#dockerCmd')) || ''));
+  await context.close();
+}
+
+/* 7. A deploy landing under a returning visitor, worker and all. */
 {
   const { context, page } = await fresh();
   await setApi(false);
@@ -370,7 +434,7 @@ for (const [old, expected] of [
     caches: await caches.keys(),
     controlled: Boolean(navigator.serviceWorker.controller),
   }));
-  check('the new worker takes over', after.caches.includes('siphon-v2'), after.caches.join(','));
+  check('the new worker takes over', after.caches.includes('siphon-v3'), after.caches.join(','));
   check('the previous cache is swept, not left to rot', !after.caches.includes('siphon-v1'), after.caches.join(','));
   check('the new app is rendered, not the cached old one',
     (await page.locator('#endpoint').count()) === 1 && (await page.locator('#old-build').count()) === 0);

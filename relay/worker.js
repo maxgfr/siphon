@@ -37,6 +37,17 @@ const DEFAULT_HOSTS = [
   'ytimg.com',
   'ggpht.com',
   'youtubei.googleapis.com',
+  // Public Invidious instances. They close their video endpoint to web
+  // pages but not to a plain client, and this relay is a plain client — so
+  // through it the page can read what the instance answers, and the media
+  // the instance proxies. The list is the app's bundled one.
+  'invidious.f5.si',
+  'nadeko.net',
+  'yewtu.be',
+  'invidious.nerdvpn.de',
+  'yt.chocolatemoo53.com',
+  'invidious.tiekoetter.com',
+  'inv.thepixora.com',
 ];
 
 /** Headers that describe one hop and must not be copied to the next. */
