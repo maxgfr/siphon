@@ -194,6 +194,11 @@ The `server-youtube` job runs `server/app.py` against the same video on the
 same kind of runner, plain and then with the proof-of-origin provider beside
 it, and its log says what yt-dlp said client by client. That is the
 measurement for the README's first recommendation, made on every pull request.
+Its first runs (2026-09-16, quoted in [youtube.md](youtube.md)) found the
+runtime present, the provider answering, and YouTube refusing every client
+with *Sign in to confirm you're not a bot* — the datacentre-IP case, where
+cookies are the lever a runner does not have. Reading yt-dlp's own lines in
+that log is also what found the missing JavaScript runtime in the image.
 
 **So this is not verified:** a completed YouTube download from the browser
 mode on a datacentre IP. The code is correct up to the wall, checked request by

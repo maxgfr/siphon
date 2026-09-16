@@ -209,6 +209,32 @@ and the source with what it said. The third measurement reached that file
 the reader was taught its shape; the next log says what it lists.
 `cobalt.tools` itself is keyed, Turnstile-gated and blocked by YouTube.
 
+### The server itself: yt-dlp on a runner
+
+`npm run test:server`, the `server-youtube` job: `server/app.py` from the
+checkout, Deno beside yt-dlp, first plain and then with the proof-of-origin
+provider running as in `docker-compose.potoken.yml`.
+
+```
+=== server, plain
+   yt-dlp 2026.08.19, ffmpeg present, JS runtime present, provider off, cookies none
+   [pot] PO Token Providers: bgutil:http-2.0.0 (external), …
+   ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you're not a bot.
+          Use --cookies-from-browser or --cookies for the authentication.
+   client default → tv, 1 wall · web_safari, 2 · android_vr, 3 → failed
+   (resolve, audio_m4a and video_480 alike)
+=== server, with the proof-of-origin provider
+   http://127.0.0.1:4416/ping → HTTP 200 · provider configured
+   the same refusal, on every client
+0/6 checks passed
+```
+
+So from a datacentre IP, with the runtime and the provider both present,
+YouTube refuses every client until there is a session behind the request.
+yt-dlp's own advice on that machine is cookies, which is the second step of
+the README's three and the one a runner cannot take. On a home connection the
+same code is what the image is for; that measurement is yours to make.
+
 ## What follows
 
 The three shapes of "it works" are the three the project ships, in the order a

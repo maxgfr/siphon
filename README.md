@@ -187,8 +187,10 @@ image? yt-dlp has needed a JavaScript runtime for YouTube since late 2025
 (it solves the signature challenge with YouTube's own player script); the
 image ships [Deno](https://deno.com), and **Test** in settings says when a
 server has none. The `server-youtube` job measures
-this path on every pull request, from a runner, plain and with the provider
-([what it found](docs/verified.md#youtube-and-what-is-still-unproven)).
+this path on every pull request, from a runner, plain and with the provider;
+what it found on 2026-09-16 is that a datacentre IP with the runtime and the
+provider is still refused on every client until there is a session — the
+cookies of step 2 ([the log](docs/youtube.md#the-server-itself-yt-dlp-on-a-runner)).
 
 ### The server also resolves for the device
 
