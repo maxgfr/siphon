@@ -840,17 +840,59 @@ export function invidiousSubtitles(body, base = '') {
     }));
 }
 
-/** An Invidious instance as a resolver: YouTube only, nothing of ours in front. */
-export function invidiousResolver(base) {
+/** Sentences from an instance that are about the video, and so the same everywhere. */
+const ABOUT_THE_VIDEO = /\bprivate\b|\bunavailable\b|\bmembers|\bage[- ]?restrict|\bremoved\b|\bnot exist|\binvalid\b|\bpremiere|\blive ?stream/i;
+
+/**
+ * An Invidious instance as a resolver: YouTube only, nothing of ours in front.
+ *
+ * One instance is not the plan; the network is. Public instances get
+ * rate-limited and bot-walled by YouTube in waves, so when the configured
+ * one refuses in a way that is about *it* rather than the video, the next
+ * few from the bundled list are asked in turn, inside the same job — the
+ * person sees one download that works, not a failed row and a settings
+ * chore. A refusal about the video (private, gone) is final everywhere and
+ * is not repeated.
+ *
+ * @param {string} base  the configured instance
+ * @param {{ others?: () => Promise<string[]>, spare?: number }} [options]
+ *   `others` yields the bundled list; `spare` caps how many more are asked
+ */
+export function invidiousResolver(base, { others = async () => [], spare = 3 } = {}) {
   const root = String(base || '').trim().replace(/\/+$/, '');
   if (!root) return null;
   return {
     name: 'invidious',
     generic: false,
-    resolve: (url, context) => {
+    resolve: async (url, context) => {
       const id = youtubeId(url);
       if (!id) throw new BackendError('That YouTube link has no video in it.', { retryable: false });
-      return extractInvidious(id, url, { ...context, invidious: root });
+      let failure;
+      try {
+        return await extractInvidious(id, url, { ...context, invidious: root });
+      } catch (error) {
+        if (error instanceof BackendError && error.retryable === false) throw error;
+        failure = error;
+      }
+      const replicas = (await others().catch(() => []))
+        .map((address) => String(address || '').replace(/\/+$/, ''))
+        .filter((address) => address && address !== root)
+        .slice(0, spare);
+      for (const replica of replicas) {
+        if (context.signal?.aborted) throw failure;
+        try {
+          return await extractInvidious(id, url, { ...context, invidious: replica });
+        } catch (error) {
+          if (error instanceof BackendError && error.retryable === false) throw error;
+          failure = error;
+        }
+      }
+      if (replicas.length > 0) {
+        throw new BackendError(`Every Invidious instance tried refused that video (${replicas.length + 1} of them).`, {
+          hint: `Last answer: ${failure.message} YouTube blocks public instances in waves; try again later, or run your own server.`,
+        });
+      }
+      throw failure;
     },
   };
 }
@@ -868,8 +910,15 @@ async function extractInvidious(id, url, context) {
     });
   }
   if (body?.error) {
-    throw new BackendError(`The Invidious instance says: ${String(body.error).slice(0, 160)}`, {
-      hint: 'That is YouTube refusing the instance, not this app. Try another instance, a relay, or your own server.',
+    // "This video is private" is the same on every instance; "sign in to
+    // confirm you're not a bot" is YouTube talking to *this* instance, and
+    // the next one may not be hearing it.
+    const reason = String(body.error).slice(0, 160);
+    throw new BackendError(`The Invidious instance says: ${reason}`, {
+      hint: ABOUT_THE_VIDEO.test(reason)
+        ? 'That is about the video, and no instance will answer differently.'
+        : 'That is YouTube refusing the instance, not this app. Another instance, a relay, or your own server may not be refused.',
+      retryable: !ABOUT_THE_VIDEO.test(reason),
     });
   }
   const formats = invidiousFormats(body, base);
@@ -888,7 +937,7 @@ async function extractInvidious(id, url, context) {
     uploader: body.author || null,
     duration: body.lengthSeconds || null,
     thumbnail,
-    extractor: 'youtube (invidious)',
+    extractor: `youtube (invidious: ${new URL(base).host})`,
     isLive: Boolean(body.liveNow),
     playlist: null,
     formats,

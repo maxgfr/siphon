@@ -59,7 +59,44 @@ export const DIRECTORIES = Object.freeze([
 ]);
 
 /**
- * A short fallback, for when the directories themselves cannot be reached.
+ * The list published beside the app.
+ *
+ * web/instances.json is the Invidious project's own instance list, refreshed
+ * by a daily workflow (scripts/instances.mjs) and deployed with the page. It
+ * is same-origin, so it needs no directory to be reachable and no CORS from
+ * anyone — which makes it the first thing tried, and the only thing the
+ * YouTube resolver walks when its instance goes quiet.
+ */
+const BUNDLED_URL = new URL('./instances.json', import.meta.url).href;
+let bundledPromise = null;
+let bundledBy = null;
+
+/**
+ * @returns {Promise<string[]>} the bundled Invidious addresses, [] when the file is missing
+ *
+ * Read once per fetch implementation: the app always passes the same one, so
+ * the file is fetched once; a test with a stubbed fetch gets its own read.
+ */
+export function invidiousInstances({ fetchImpl = globalThis.fetch, timeout = 6000, fresh = false } = {}) {
+  if (!bundledPromise || fresh || bundledBy !== fetchImpl) {
+    bundledBy = fetchImpl;
+    bundledPromise = (async () => {
+      try {
+        const response = await fetchImpl(BUNDLED_URL, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(timeout) });
+        if (!response.ok) return [];
+        const body = await response.json();
+        return (Array.isArray(body?.invidious) ? body.invidious : []).map(trimSlash).filter(Boolean);
+      } catch {
+        return [];
+      }
+    })();
+  }
+  return bundledPromise;
+}
+
+/**
+ * A short fallback, for when neither the bundled list nor the directories
+ * can be reached.
  *
  * Deliberately short and deliberately unverified: these are long-standing
  * addresses, not a promise that any of them answers today. Every one is
@@ -72,16 +109,15 @@ export const SEED = Object.freeze([
   'https://pipedapi.kavin.rocks',
   'https://pipedapi.adminforge.de',
   'https://api.piped.private.coffee',
-  'https://pipedapi.reallyaweso.me',
-  'https://pipedapi.darkness.services',
 ]);
 
 /**
- * cobalt reaches many sites; Invidious and Piped reach YouTube. The broader
- * one first, and of the two YouTube-only ones Invidious, because far more of
- * its public instances are still standing.
+ * Invidious is the plan for YouTube: its public network is the one still
+ * standing, and its API answers a page directly. cobalt reaches more sites
+ * but its public instances mostly want a key or a Turnstile pass today;
+ * Piped's network has largely gone dark. So: Invidious, then the others.
  */
-const RANK = { cobalt: 0, invidious: 1, piped: 2 };
+const RANK = { invidious: 0, cobalt: 1, piped: 2 };
 /** The kinds a public list is searched for; a mirror or a relay in one is not. */
 const PUBLIC = new Set(Object.keys(RANK));
 
@@ -121,42 +157,46 @@ function interleave(lists) {
  * @returns {Promise<{ endpoint: string, helper: object }|null>}
  */
 export async function findInstance({ fetchImpl = globalThis.fetch, detect, candidates = 8, timeout = 6000, exclude = [] } = {}) {
-  // Round-robin across the directories rather than one list after another,
-  // so the cap on strangers spans every kind: a long cobalt list must not
-  // crowd the YouTube-only ones out of a first visit's budget.
-  const listed = interleave(await Promise.all(DIRECTORIES.map((d) => askDirectory(d, fetchImpl, timeout))));
-
-  // Directory entries first, seed behind them, duplicates dropped, and
-  // anything already known not to work left out — which is what makes this
-  // usable as a fallback when the instance in use dies rather than only as a
-  // first-visit search.
   const seen = new Set(exclude.map(trimSlash));
-  const addresses = [...listed, ...SEED.map(trimSlash)].filter((address) => {
-    if (!address || seen.has(address)) return false;
-    seen.add(address);
-    return true;
-  }).slice(0, candidates);
+  const fresh = (addresses) =>
+    addresses.filter((address) => {
+      if (!address || seen.has(address)) return false;
+      seen.add(address);
+      return true;
+    });
+  const probe = async (addresses) => {
+    const found = (
+      await Promise.all(
+        addresses.slice(0, candidates).map(async (endpoint) => {
+          try {
+            const helper = await detect(endpoint);
+            // A siphon server or a relay in a public instance list is not what
+            // was asked for; only the kinds that answer for a video count.
+            return helper && PUBLIC.has(helper.kind) ? { endpoint, helper } : null;
+          } catch {
+            return null;
+          }
+        }),
+      )
+    ).filter(Boolean);
+    found.sort((a, b) => RANK[a.helper.kind] - RANK[b.helper.kind]);
+    return found[0] || null;
+  };
 
-  const found = (
-    await Promise.all(
-      addresses.map(async (endpoint) => {
-        try {
-          const helper = await detect(endpoint);
-          // A siphon server or a relay in a public instance list is not what
-          // was asked for; only the kinds that answer for a video count.
-          return helper && PUBLIC.has(helper.kind) ? { endpoint, helper } : null;
-        } catch {
-          return null;
-        }
-      }),
-    )
-  ).filter(Boolean);
+  // Round one: the list published beside the app. It is the plan, so it gets
+  // the whole budget to itself before a single directory is contacted.
+  const bundled = await probe(fresh(await invidiousInstances({ fetchImpl, timeout })));
+  if (bundled) return bundled;
 
-  if (found.length === 0) return null;
-  found.sort((a, b) => RANK[a.helper.kind] - RANK[b.helper.kind]);
-  return found[0];
+  // Round two: the projects' live directories, round-robin across them
+  // rather than one list after another, so the cap on strangers spans every
+  // kind — a long cobalt list must not crowd the others out — and the seed
+  // behind them. Anything already known not to work is left out, which is
+  // what makes this usable when the instance in use dies, not only on a
+  // first visit.
+  const listed = interleave(await Promise.all(DIRECTORIES.map((d) => askDirectory(d, fetchImpl, timeout))));
+  return probe(fresh([...listed, ...SEED.map(trimSlash)]));
 }
-
 
 /**
  * Whether a failure reads like the helper being gone rather than the video.
@@ -165,10 +205,12 @@ export async function findInstance({ fetchImpl = globalThis.fetch, detect, candi
  * all. A private video is private on every instance in the world, and
  * switching would waste the person's time and someone else's bandwidth to
  * arrive at the same answer. An instance that has stopped answering, started
- * refusing, or been blocked is exactly what the next one might not be.
+ * refusing, or been blocked by YouTube — "sign in to confirm you're not a
+ * bot" is that, said to the instance — is exactly what the next one might
+ * not be.
  */
 export function looksUnreachable(message) {
   const text = String(message || '');
-  if (/private|members-only|age-restricted|unavailable|no formats|not recognise/i.test(text)) return false;
-  return /could not reach|did not answer|does not let a web page|answered 5\d\d|answered 4(0[38]|29)|rate.?limit|kept breaking|timed out|refused/i.test(text);
+  if (/private|members-only|age-restricted|unavailable|no formats|not recognise|has no video/i.test(text)) return false;
+  return /could not reach|did not answer|does not let a web page|answered 5\d\d|answered 4(0[38]|29)|rate.?limit|kept breaking|timed out|refused|sign in to confirm|not a bot|no streams|every instance/i.test(text);
 }

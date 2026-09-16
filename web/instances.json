@@ -1,0 +1,11 @@
+{
+  "updated": null,
+  "source": "seed — the instances workflow replaces this with the list docs.invidious.io publishes",
+  "invidious": [
+    "https://inv.nadeko.net",
+    "https://yewtu.be",
+    "https://invidious.nerdvpn.de",
+    "https://iv.nboeck.de",
+    "https://invidious.privacyredirect.com"
+  ]
+}

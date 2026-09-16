@@ -9,7 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { findInstance, looksUnreachable, DIRECTORIES, SEED } from '../web/instances.js';
+import { findInstance, invidiousInstances, looksUnreachable, DIRECTORIES, SEED } from '../web/instances.js';
 
 /** A fetch that answers the directories from a table, and records the asks. */
 function directories(table) {
@@ -18,6 +18,10 @@ function directories(table) {
     asked,
     fetchImpl: async (url) => {
       asked.push(url);
+      if (isBundled(url)) {
+        if (!('bundled' in table)) throw new TypeError('Failed to fetch');
+        return new Response(JSON.stringify({ invidious: table.bundled }), { status: 200 });
+      }
       if (!(url in table)) throw new TypeError('Failed to fetch');
       const answer = table[url];
       return new Response(JSON.stringify(answer.body ?? answer), { status: answer.status ?? 200 });
@@ -38,6 +42,13 @@ function prober(table) {
     },
   };
 }
+
+/**
+ * The bundled list's URL is derived from the module's own, so under Node it
+ * is a file: URL — which is what tells it apart from the directories, two of
+ * which are also called instances.json.
+ */
+const isBundled = (url) => /^file:.*\/web\/instances\.json$/.test(String(url));
 
 const COBALT_LIST = DIRECTORIES[0].url;
 const PIPED_LIST = DIRECTORIES[1].url;
@@ -102,6 +113,20 @@ test('the Invidious directory is read in its own pair shape, and the unreachable
   assert.deepEqual(probed, ['https://inv.example'], 'the first candidate was the one clearnet entry with an API');
 });
 
+test('Invidious is preferred over cobalt: it is the plan for YouTube, and it answers a page', async () => {
+  const { fetchImpl } = directories({
+    [COBALT_LIST]: [{ api: 'c.example' }],
+    [PIPED_LIST]: [],
+    [INVIDIOUS_LIST]: [['inv.example', { type: 'https', uri: 'https://inv.example', api: true }]],
+  });
+  const { detect } = prober({
+    'https://c.example': { kind: 'cobalt', label: 'cobalt' },
+    'https://inv.example': { kind: 'invidious', label: 'Invidious instance' },
+  });
+
+  assert.equal((await findInstance({ fetchImpl, detect })).helper.kind, 'invidious');
+});
+
 test('Invidious is preferred over Piped, both reaching only YouTube', async () => {
   const { fetchImpl } = directories({
     [COBALT_LIST]: [],
@@ -116,13 +141,81 @@ test('Invidious is preferred over Piped, both reaching only YouTube', async () =
   assert.equal((await findInstance({ fetchImpl, detect })).helper.kind, 'invidious');
 });
 
+/* ------------------------------------------------- the list beside the app */
+
+test('the bundled list is tried first, and alone when one of it answers', async () => {
+  // web/instances.json is same-origin and the plan; the directories are
+  // strangers and the fallback. When the bundled list delivers, no directory
+  // is contacted at all.
+  const { fetchImpl, asked } = directories({
+    bundled: ['https://one.example', 'https://two.example'],
+    [COBALT_LIST]: [{ api: 'c.example' }],
+    [PIPED_LIST]: [],
+    [INVIDIOUS_LIST]: [],
+  });
+  const { detect, probed } = prober({ 'https://two.example': { kind: 'invidious', label: 'Invidious instance' } });
+
+  const found = await findInstance({ fetchImpl, detect });
+  assert.equal(found.endpoint, 'https://two.example');
+  assert.deepEqual(probed.sort(), ['https://one.example', 'https://two.example']);
+  assert.ok(!asked.includes(COBALT_LIST), 'no directory was asked');
+});
+
+test('when nothing on the bundled list answers, the directories are asked', async () => {
+  const { fetchImpl, asked } = directories({
+    bundled: ['https://dead.example'],
+    [COBALT_LIST]: [{ api: 'c.example' }],
+    [PIPED_LIST]: [],
+    [INVIDIOUS_LIST]: [],
+  });
+  const { detect, probed } = prober({ 'https://c.example': { kind: 'cobalt', label: 'cobalt' } });
+
+  const found = await findInstance({ fetchImpl, detect });
+  assert.equal(found.endpoint, 'https://c.example');
+  assert.ok(probed.includes('https://dead.example'), 'the bundled one was tried first');
+  assert.ok(asked.includes(COBALT_LIST));
+});
+
+test('an excluded address on the bundled list is skipped, so a dead one is not offered again', async () => {
+  const { fetchImpl } = directories({
+    bundled: ['https://dead.example', 'https://alive.example'],
+    [COBALT_LIST]: [],
+    [PIPED_LIST]: [],
+    [INVIDIOUS_LIST]: [],
+  });
+  const { detect, probed } = prober({
+    'https://dead.example': { kind: 'invidious', label: 'Invidious instance' },
+    'https://alive.example': { kind: 'invidious', label: 'Invidious instance' },
+  });
+
+  const found = await findInstance({ fetchImpl, detect, exclude: ['https://dead.example/'] });
+  assert.equal(found.endpoint, 'https://alive.example');
+  assert.ok(!probed.includes('https://dead.example'));
+});
+
+test('the bundled list is read once and shared', async () => {
+  let reads = 0;
+  const fetchImpl = async (url) => {
+    if (isBundled(url)) {
+      reads += 1;
+      return new Response(JSON.stringify({ invidious: ['https://x.example'] }));
+    }
+    throw new TypeError('Failed to fetch');
+  };
+  const first = await invidiousInstances({ fetchImpl, fresh: true });
+  const second = await invidiousInstances({ fetchImpl });
+  assert.deepEqual(first, ['https://x.example']);
+  assert.deepEqual(second, first);
+  assert.equal(reads, 1);
+});
+
 test('a directory that is down falls back to the seed rather than failing', async () => {
   const { fetchImpl, asked } = directories({});
   const { detect, probed } = prober({ [SEED[1]]: { kind: 'piped', label: 'Piped instance' } });
 
   const found = await findInstance({ fetchImpl, detect });
   assert.equal(found.endpoint, SEED[1]);
-  assert.equal(asked.length, DIRECTORIES.length, 'both directories were asked');
+  assert.equal(asked.filter((url) => !isBundled(url)).length, DIRECTORIES.length, 'every directory was asked');
   assert.ok(probed.length > 1, 'the seed was walked, not just its first entry');
 });
 
@@ -229,6 +322,9 @@ test('a failure about the helper is worth another instance', () => {
     'Could not reach the server.',
     'The Piped instance did not answer for that video.',
     'The Invidious instance did not answer for that video.',
+    "The Invidious instance says: Sign in to confirm you're not a bot",
+    'The Invidious instance returned no streams for that video.',
+    'Every Invidious instance tried refused that video (4 of them).',
     'pipedapi.example does not let a web page read its files.',
     'api.example answered 502.',
     'This instance is rate-limiting you. Wait a bit.',
@@ -249,6 +345,8 @@ test('a failure about the video is not', () => {
     'That video is age-restricted.',
     'yt-dlp does not recognise that link.',
     'That link offered no formats.',
+    'The Invidious instance says: This video is private.',
+    'That YouTube link has no video in it.',
   ]) {
     assert.equal(looksUnreachable(message), false, message);
   }

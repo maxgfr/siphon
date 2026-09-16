@@ -12,6 +12,7 @@ import {
   pipedSubtitles,
   invidiousFormats,
   invidiousSubtitles,
+  invidiousResolver,
   safeFilename,
   titleFromUrl,
   extensionOf,
@@ -405,6 +406,77 @@ test('Invidious captions become subtitle tracks, machine ones told apart by thei
   ]);
   assert.equal(pickSubtitle(tracks, 'en').auto, false);
   assert.equal(invidiousSubtitles({}).length, 0);
+});
+
+/** A `net` whose json() answers from a table of URL prefix → body, and records the asks. */
+function fakeNet(table) {
+  const asked = [];
+  return {
+    asked,
+    net: {
+      json: async (url) => {
+        asked.push(url);
+        const hit = Object.entries(table).find(([prefix]) => url.startsWith(prefix));
+        if (!hit) throw new Error(`could not reach ${url}`);
+        const body = hit[1];
+        if (body instanceof Error) throw body;
+        return body;
+      },
+    },
+  };
+}
+
+const WATCH = 'https://www.youtube.com/watch?v=jNQXAC9IVRw';
+const answers = (base) => ({ ...INVIDIOUS, formatStreams: [{ ...INVIDIOUS.formatStreams[0], url: `${base}/videoplayback?itag=18` }], adaptiveFormats: [] });
+
+test('the resolver walks the bundled replicas when its instance is bot-walled, and names the one that answered', async () => {
+  const { net, asked } = fakeNet({
+    'https://first.example/': { error: "Sign in to confirm you're not a bot" },
+    'https://second.example/': new Error('second.example answered 502'),
+    'https://third.example/': answers('https://third.example'),
+  });
+  const resolver = invidiousResolver('https://first.example', {
+    others: async () => ['https://first.example', 'https://second.example', 'https://third.example', 'https://fourth.example'],
+  });
+  const info = await resolver.resolve(WATCH, { net });
+  assert.equal(info.extractor, 'youtube (invidious: third.example)');
+  assert.ok(info.formats[0].url.startsWith('https://third.example/'), 'the formats point at the instance that answered');
+  assert.equal(asked.length, 3, 'stopped at the first that delivered');
+  assert.ok(asked.every((url) => url.includes('local=true')));
+});
+
+test('a refusal about the video is final, and no replica is bothered', async () => {
+  const { net, asked } = fakeNet({ 'https://first.example/': { error: 'This video is private.' } });
+  const resolver = invidiousResolver('https://first.example', { others: async () => ['https://second.example'] });
+  await assert.rejects(() => resolver.resolve(WATCH, { net }), /private/);
+  assert.equal(asked.length, 1);
+});
+
+test('when every replica refuses, the error says how many were tried and what the last one said', async () => {
+  const { net } = fakeNet({
+    'https://first.example/': new Error('first.example answered 429'),
+    'https://second.example/': { error: "Sign in to confirm you're not a bot" },
+  });
+  const resolver = invidiousResolver('https://first.example', { others: async () => ['https://second.example'], spare: 3 });
+  await assert.rejects(() => resolver.resolve(WATCH, { net }), (error) => {
+    assert.match(error.message, /Every Invidious instance tried refused that video \(2 of them\)/);
+    assert.match(error.hint, /not a bot/);
+    return true;
+  });
+});
+
+test('the walk is capped, so a bad day for the whole network costs a few requests, not forty', async () => {
+  const { net, asked } = fakeNet({});
+  const many = Array.from({ length: 40 }, (_, i) => `https://i${i}.example`);
+  const resolver = invidiousResolver('https://home.example', { others: async () => many, spare: 3 });
+  await assert.rejects(() => resolver.resolve(WATCH, { net }));
+  assert.equal(asked.length, 4, 'the configured one plus three spares');
+});
+
+test('with no list at all, the configured instance\'s own refusal is what comes back', async () => {
+  const { net } = fakeNet({ 'https://home.example/': new Error('home.example answered 503') });
+  const resolver = invidiousResolver('https://home.example');
+  await assert.rejects(() => resolver.resolve(WATCH, { net }), /did not answer/);
 });
 
 /* ------------------------------------------------------------ youtubei.js */

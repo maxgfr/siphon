@@ -40,18 +40,31 @@ way the first screen works rather than opening on an instruction.
 
 When nothing is behind the page, a YouTube link would fail on arrival —
 correctly, but nobody pastes a link in order to read about CORS. So on that
-first visit, *after* the screen is usable, siphon asks the cobalt, Invidious
-and Piped projects for their own published instance lists, probes what comes
-back, and fills in the first address that actually answers. **Find a public instance** in
-settings does the same on demand.
+first visit, *after* the screen is usable, siphon looks for a public instance,
+probes what it finds, and fills in the first address that actually answers.
+**Find a public instance** in settings does the same on demand.
+
+Where it looks, in order:
+
+1. **The list published beside the app.** `web/instances.json` is the
+   Invidious project's own list — the one at
+   [docs.invidious.io/instances](https://docs.invidious.io/instances/) — kept
+   current by a daily workflow (`.github/workflows/instances.yml` running
+   `scripts/instances.mjs`, which reads `api.invidious.io` and falls back to
+   parsing the page itself) and deployed with the page. It is same-origin, so
+   nothing has to be reachable and nobody has to send CORS for it to load:
+   the GitHub Pages deploy starts from today's list every time.
+2. **The projects' live directories** — cobalt's, Invidious's, Piped's —
+   only when nothing on that list answers, round-robin across them so a long
+   cobalt list cannot spend the whole budget, and a short seed behind them.
 
 The directory is a hint; the probe is the truth. A list can be stale, a host
 can be down, an instance can be blocked by YouTube this week, and none of that
 is visible in a JSON file — so nothing is used until it has answered for
-itself, through the same detection a typed-in address goes through. cobalt is
-preferred, because it reaches more than one site; of the two that reach only
-YouTube, Invidious comes before Piped, because far more of its public
-instances are still standing.
+itself, through the same detection a typed-in address goes through. Invidious
+ranks first: it is the plan for YouTube, and its API answers a page directly.
+cobalt reaches more sites, but its public instances mostly want a key or a
+Turnstile pass today; Piped's network has largely gone dark.
 
 Two rules make this safe to do automatically, and they hold everywhere:
 whichever instance is chosen is **named on screen** the moment it is, and
@@ -630,6 +643,16 @@ and the instance never sees more than the video id. Their subtitle tracks come
 along, so **In the video** works with an instance too. cobalt is asked for the
 finished file instead, since that is the shape of its API.
 
+**One instance is not the plan; the network is.** YouTube rate-limits and
+bot-walls public instances in waves, so when the Invidious instance in use
+refuses a link in a way that is about *it* — "sign in to confirm you're not a
+bot", a 429, a 502, no streams — the next three from the bundled list are
+asked in turn, inside the same download. You see one row that works, not a
+failed row and a settings chore; the row names the instance that answered. A
+refusal about the video — private, removed, members-only — is final on every
+instance in the world and is not repeated. If the whole walk fails, the app
+switches instance for good (at most twice a session) and says so.
+
 It is worth being plain about what that means. Shared instances rate-limit,
 require captchas or API keys, and come and go, and **every link that reaches one
 is seen by whoever runs it**. No instance is hard-coded as a default: the seed
@@ -719,17 +742,19 @@ still unproven.
 | suite | what it is | result |
 |---|---|---|
 | `pytest server/tests` | the server, including two against real yt-dlp | 119 pass |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding | 118 pass |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh | 136 pass |
 | `npm run test:e2e` | the device alone, real Chromium, two origins, a fake Invidious | 33 pass |
 | `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker | 36 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
 | `npm run test:split` | a server that only resolves, a device that downloads | 24 pass |
-| `npm run test:youtube` | YouTube, for real, in CI | informative — see below |
+| `npm run test:youtube` | YouTube, for real, in CI — through the relay, Piped, and the bundled Invidious list | informative — see below |
 
 ### The device alone
 
-Finding a public instance is covered with both the directories and the probe
-stubbed: that a listed address is only used once it has answered for itself,
+Finding a public instance is covered with the bundled list, the directories
+and the probe all stubbed: that the bundled list is tried first and alone when
+one of it answers, that the directories are asked only when it does not, that
+a listed address is only used once it has answered for itself,
 that an instance listed as offline is never even contacted, that a directory
 which changed shape is ignored rather than thrown on, that a siphon server or a
 relay appearing in such a list is not mistaken for an instance, that the
@@ -738,7 +763,14 @@ and CORS-less entries left out, and that the number of strangers contacted on
 a first visit is capped — and spread across the directories, so a long cobalt
 list cannot crowd the YouTube-only kinds out of that budget. Detection is covered for every kind, including an
 Invidious instance whose stats endpoint is switched off — the default — which
-is then known by the one sentence it refuses with.
+is then known by the one sentence it refuses with. The replica walk is pinned
+with a stubbed network: a bot-walled instance leads to the next ones and the
+answer names the one that delivered, a private video stops at the first, the
+walk is capped, and the error after a full walk says how many were tried. The
+refresh script is covered against a fixture of the API's pairs and one of the
+docs page's markup: the API first, the page when the API is down, an empty API
+answer not trusted over the page, and nothing from either being an error
+rather than an empty file.
 
 The unit tests cover what needs no network: HLS attribute and playlist parsing,
 byte-range continuation, IV derivation, YouTube URL shapes, page-scraping
@@ -866,6 +898,11 @@ answer is **"Sign in to confirm you're not a bot"** — from hand-built requests
 from youtubei.js driven in Node, and from the browser through the relay alike.
 `npm run test:innertube` asks that question directly from whatever machine you
 run it on, which is the baseline a red is read against.
+
+The same job then walks the bundled Invidious list from the runner — the path
+a fresh visitor to the Pages deploy takes — and its verdict names the instance
+that delivered the video to the browser mode, or every refusal if none did.
+That is the measurement for the plan as shipped, made on every pull request.
 
 **So this is not verified:** a completed YouTube download from the browser
 mode. The code is correct up to the wall, checked request by request, but no
