@@ -997,6 +997,45 @@ def format_kind(fmt: dict[str, Any]) -> str:
     return "muxed" if video and audio else "video" if video else "audio"
 
 
+# What a page can actually use. WebVTT first: browsers read it natively and
+# ffmpeg.wasm turns it into a muxed track without a second conversion.
+SUBTITLE_EXTS = ("vtt", "srt", "ass")
+
+# automatic_captions can run to a hundred languages. The page shows a handful
+# and embeds one; sending the rest is payload nobody reads.
+SUBTITLE_LIMIT = 25
+
+
+def subtitle_tracks(info: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    The subtitle tracks a page could fetch for itself.
+
+    Written ones first, then the machine ones, and never both for the same
+    language: an auto-caption where a real subtitle exists is strictly worse.
+    """
+    tracks: list[dict[str, Any]] = []
+    written = set()
+    for source, auto in ((info.get("subtitles") or {}, False), (info.get("automatic_captions") or {}, True)):
+        for lang, options in (source or {}).items():
+            if auto and lang in written:
+                continue
+            best = next(
+                (
+                    option
+                    for ext in SUBTITLE_EXTS
+                    for option in (options or [])
+                    if option.get("ext") == ext and option.get("url")
+                ),
+                None,
+            )
+            if not best:
+                continue
+            if not auto:
+                written.add(lang)
+            tracks.append({"lang": lang, "ext": best["ext"], "url": best["url"], "auto": auto})
+    return tracks[:SUBTITLE_LIMIT]
+
+
 def format_label(fmt: dict[str, Any]) -> str:
     """What to call a format when the site gave it no name of its own."""
     if fmt.get("height"):
@@ -1056,7 +1095,13 @@ def resolve_url(url: str) -> dict[str, Any]:
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
+            # A link that is a video *inside* a playlist stays one video; a link
+            # that is only a playlist comes back as one, and is answered as a
+            # list rather than by silently picking its first track.
             "noplaylist": True,
+            # Without this a fifty-track album means fifty extractions before
+            # the page can show anything.
+            "extract_flat": "in_playlist",
         }
         if have_cookies():
             options["cookiefile"] = str(COOKIES_PATH)
@@ -1070,7 +1115,26 @@ def resolve_url(url: str) -> dict[str, Any]:
                 entries = [e for e in info.get("entries", []) if e]
                 if not entries:
                     raise yt_dlp.utils.DownloadError("That playlist is empty.")
-                info = entries[0]
+                # Hand back the list. The page takes it one video at a time,
+                # which on a phone is better than the zip a full job builds:
+                # separate files, separate progress, and each one resumable.
+                kept = [
+                    {"url": entry.get("url") or entry.get("webpage_url"), "title": entry.get("title")}
+                    for entry in entries[:PLAYLIST_LIMIT]
+                    if entry.get("url") or entry.get("webpage_url")
+                ]
+                return {
+                    "id": str(info.get("id") or url),
+                    "url": info.get("webpage_url") or url,
+                    "title": info.get("title") or entries[0].get("title"),
+                    "uploader": info.get("uploader") or info.get("channel"),
+                    "duration": None,
+                    "thumbnail": entries[0].get("thumbnail"),
+                    "extractor": f"{info.get('extractor_key') or 'yt-dlp'} (server, {client or 'default'})",
+                    "isLive": False,
+                    "formats": [],
+                    "playlist": {"count": len(entries), "limit": PLAYLIST_LIMIT, "entries": kept},
+                }
             pairs = [(resolved_format(raw), raw) for raw in info.get("formats") or []]
             pairs = [(fmt, raw) for fmt, raw in pairs if fmt]
             if not pairs and info.get("url"):
@@ -1085,6 +1149,9 @@ def resolve_url(url: str) -> dict[str, Any]:
             formats = [fmt for fmt, _ in pairs]
             if info.get("thumbnail"):
                 _grant_host(info["thumbnail"], None)
+            subtitles = subtitle_tracks(info)
+            for track in subtitles:
+                _grant_host(track["url"], info.get("http_headers"))
             return {
                 "id": str(info.get("id") or url),
                 "url": info.get("webpage_url") or url,
@@ -1095,6 +1162,8 @@ def resolve_url(url: str) -> dict[str, Any]:
                 "extractor": f"{info.get('extractor_key') or 'yt-dlp'} (server, {client or 'default'})",
                 "isLive": bool(info.get("is_live")),
                 "formats": formats,
+                "subtitles": subtitles,
+                "playlist": None,
             }
         except Exception as exc:  # noqa: BLE001 — surfaced to the user, humanized
             last_error = exc

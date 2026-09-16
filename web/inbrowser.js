@@ -86,6 +86,7 @@ export class BrowserBackend {
 
   async probe(url) {
     const info = await this.identify(url);
+    const playlist = info.playlist || null;
     return {
       title: info.title,
       uploader: info.uploader,
@@ -93,13 +94,17 @@ export class BrowserBackend {
       thumbnail: info.thumbnail,
       extractor: info.extractor,
       isLive: info.isLive,
-      isPlaylist: false,
-      count: 1,
-      limit: 1,
+      isPlaylist: Boolean(playlist),
+      count: playlist?.count ?? 1,
+      limit: playlist?.limit ?? 1,
+      // The addresses themselves, because a tab takes a playlist one video at
+      // a time rather than as the zip a full server builds.
+      entries: playlist?.entries || [],
+      subtitles: info.subtitles || [],
     };
   }
 
-  async start(url, preset, { subs = 'off' } = {}) {
+  async start(url, preset, { subs = 'off', subLangs = 'en' } = {}) {
     const id = `b-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const controller = new AbortController();
     const job = {
@@ -115,7 +120,9 @@ export class BrowserBackend {
       title: null,
       filename: null,
       error: null,
-      note: subs !== 'off' ? 'Subtitles need your own server.' : null,
+      subs,
+      subLangs,
+      note: subs === 'files' ? 'Subtitles as a separate file need your own server; this embeds them instead.' : null,
       controller,
       objectUrl: null,
       startedAt: Date.now(),
@@ -183,6 +190,7 @@ function snapshot(job) {
     totalBytes: job.totalBytes,
     filename: job.filename,
     title: job.title,
+    note: job.note,
     error: job.error,
     client: job.client,
     attempts: 0,
@@ -205,6 +213,16 @@ async function runJob(backend, job) {
   const plan = planDownload(info, job.preset);
   const resolve = info.resolve || ((format) => format.url);
 
+  // Subtitles are a video concern, and embedding one means a remux — so a
+  // download that would otherwise have needed no conversion now does. That is
+  // the cost of asking for them, and it is only paid when a track was actually
+  // found.
+  const subtitle = job.subs !== 'off' && plan.video ? pickSubtitle(info.subtitles, job.subLangs) : null;
+  if (subtitle && plan.op === 'raw') plan.op = 'copy';
+  if (job.subs !== 'off' && plan.video && !subtitle) {
+    job.note = 'No subtitles were offered for this video.';
+  }
+
   // Two tracks share one bar. Weighting by stated size is right when the sizes
   // are known and a 50/50 split is the least-wrong guess when they are not.
   const tracks = [plan.video, plan.audio].filter(Boolean);
@@ -216,6 +234,16 @@ async function runJob(backend, job) {
 
   job.stage = 'downloading';
   job.totalBytes = known ? sizes.reduce((a, b) => a + b, 0) : null;
+
+  // The common case — a file that needs no conversion — goes straight to disk
+  // as it arrives, so a two-hour video never exists in the tab's heap. Anything
+  // ffmpeg has to touch must be handed to it whole, and there the size is worth
+  // warning about rather than pretending away.
+  if (plan.op === 'raw') return await runRaw(backend, job, info, plan, resolve);
+
+  if (job.totalBytes > HEAVY_CONVERSION_BYTES) {
+    job.note = 'Large file: converting it here needs it in memory, which a phone may not have. Your own server does this on disk.';
+  }
 
   const started = nowSeconds();
   let doneWeight = 0;
@@ -273,39 +301,41 @@ async function runJob(backend, job) {
     comment: info.url || job.url,
   };
 
-  let output;
-  if (plan.op === 'raw') {
-    output = fetched[0].data;
-  } else {
-    job.stage = 'processing';
-    job.progress = 0;
-    job.speed = null;
-    job.eta = null;
-    await ensureFfmpeg();
-    const onProgress = (ratio) => {
-      job.progress = ratio;
-    };
+  // Everything that reaches here needs ffmpeg; the raw path returned above.
+  job.stage = 'processing';
+  job.progress = 0;
+  job.speed = null;
+  job.eta = null;
+  await ensureFfmpeg();
+  const onProgress = (ratio) => {
+    job.progress = ratio;
+  };
 
-    if (plan.op === 'copy') {
-      output = await mux({
-        video: fetched.find((item) => item.track === plan.video),
-        audio: fetched.find((item) => item.track === plan.audio),
-        ext: plan.ext,
-        tags,
-        onProgress,
-      });
-    } else {
-      const source = fetched[0];
-      const cover = await coverArt(net, info, signal);
-      output = await toAudio({
-        source,
-        ext: plan.ext,
-        copy: plan.op === 'audio-copy',
-        tags,
-        cover,
-        onProgress,
-      });
-    }
+  let output;
+  if (plan.op === 'copy') {
+    // Fetched before the muxer is handed anything: a subtitle that could not
+    // be downloaded must leave the video alone, not take it down with it.
+    const subtitleBytes = subtitle ? await subtitleData(net, subtitle, signal) : null;
+    if (subtitle && !subtitleBytes) job.note = 'The subtitles could not be fetched, so the video has none.';
+    output = await mux({
+      video: fetched.find((item) => item.track === plan.video),
+      audio: fetched.find((item) => item.track === plan.audio),
+      subtitle: subtitleBytes ? { ...subtitle, data: subtitleBytes } : null,
+      ext: plan.ext,
+      tags,
+      onProgress,
+    });
+  } else {
+    const source = fetched[0];
+    const cover = await coverArt(net, info, signal);
+    output = await toAudio({
+      source,
+      ext: plan.ext,
+      copy: plan.op === 'audio-copy',
+      tags,
+      cover,
+      onProgress,
+    });
   }
 
   if (signal.aborted) return;
@@ -321,7 +351,89 @@ async function runJob(backend, job) {
   job.state = 'done';
 }
 
+/**
+ * Above this, a conversion is worth a warning: ffmpeg.wasm needs the whole
+ * input and the whole output in memory at once, and a phone will not have it.
+ * Not a refusal — it is the user's device and their call — but not a surprise
+ * either.
+ */
+const HEAVY_CONVERSION_BYTES = 500 * 1024 * 1024;
+
+/**
+ * A download that needs nothing done to it.
+ *
+ * Bytes off the socket go to disk and nowhere else: no array of chunks, no
+ * concatenated copy, no Blob built from either. What the heap holds at any
+ * moment is one chunk. This is the path a plain MP4 takes, which is most of
+ * them.
+ */
+async function runRaw(backend, job, info, plan, resolve) {
+  const signal = job.controller.signal;
+  const sink = await store.writer(job.id);
+  const started = nowSeconds();
+
+  try {
+    const url = await resolve(plan.video || plan.audio);
+    await backend.net.stream(url, {
+      signal,
+      onChunk: (chunk) => sink.write(chunk),
+      onReset: () => sink.reset(),
+      onProgress: (received, total) => {
+        const elapsed = nowSeconds() - started;
+        if (elapsed > 0.6) {
+          job.speed = received / elapsed;
+          if (total && job.speed > 0) job.eta = Math.max(0, (total - received) / job.speed);
+        }
+        if (total) {
+          job.totalBytes = total;
+          job.progress = Math.min(0.99, received / total);
+        }
+      },
+    });
+  } catch (error) {
+    await sink.abort();
+    throw error;
+  }
+
+  if (signal.aborted) {
+    await sink.abort();
+    return;
+  }
+
+  const blob = await sink.done(plan.mime || MIME_FOR[plan.ext] || 'application/octet-stream');
+  job.filename = safeFilename(info.title, plan.ext);
+  job.totalBytes = blob.size;
+  job.objectUrl = URL.createObjectURL(blob);
+  job.progress = 1;
+  job.stage = 'ready';
+  job.state = 'done';
+}
+
 const sourceExt = (track) => (track.protocol === 'hls' ? 'ts' : track.container || 'mp4');
+
+/**
+ * Which subtitle track to embed, given what was asked for.
+ *
+ * The languages are a preference list, not a filter: someone who asked for
+ * "fr,en" and is offered only English gets English rather than nothing, and a
+ * written track always beats a machine one.
+ */
+export function pickSubtitle(tracks, langs = 'en') {
+  const offered = (tracks || []).filter((track) => track?.url);
+  if (offered.length === 0) return null;
+  const wanted = String(langs || '')
+    .split(',')
+    .map((lang) => lang.trim().toLowerCase())
+    .filter(Boolean);
+
+  for (const lang of wanted) {
+    // "en" should match "en-GB" and "en-orig" too; a site's spelling is its own.
+    const matches = offered.filter((track) => String(track.lang || '').toLowerCase().startsWith(lang));
+    const best = matches.find((track) => !track.auto) || matches[0];
+    if (best) return best;
+  }
+  return offered.find((track) => !track.auto) || offered[0];
+}
 
 /**
  * Cover art, if the thumbnail host will give it to us.
@@ -330,6 +442,21 @@ const sourceExt = (track) => (track.protocol === 'hls' ? 'ts' : track.container 
  * square, and worth giving up on silently because a missing picture is not a
  * reason to fail a download that otherwise worked.
  */
+/**
+ * A subtitle file, or nothing.
+ *
+ * A missing subtitle must not fail a download that otherwise worked — the
+ * video is what was asked for — so this swallows its own failure the way the
+ * cover art does, and says so in the row.
+ */
+async function subtitleData(net, subtitle, signal) {
+  try {
+    return await net.bytes(subtitle.url, { signal });
+  } catch {
+    return null;
+  }
+}
+
 async function coverArt(net, info, signal) {
   if (!info.thumbnail) return null;
   try {

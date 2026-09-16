@@ -14,6 +14,7 @@ import {
   extensionOf,
   innertubeFetch,
 } from '../web/extract.js';
+import { pickSubtitle } from '../web/inbrowser.js';
 
 /* ------------------------------------------------------------------ sniffing */
 
@@ -339,4 +340,38 @@ test('the InnerTube fetch wrapper still works when the library passes a plain UR
   assert.equal(seen[0].url, 'https://www.youtube.com/sw.js_data');
   assert.equal(seen[0].method, 'GET');
   assert.equal(seen[0].body, undefined);
+});
+
+/* --------------------------------------------------------------- subtitles */
+
+test('the subtitle asked for wins, and a written track beats a machine one', () => {
+  const tracks = [
+    { lang: 'en', ext: 'vtt', url: 'a', auto: true },
+    { lang: 'en', ext: 'vtt', url: 'b', auto: false },
+    { lang: 'fr', ext: 'vtt', url: 'c', auto: false },
+  ];
+  assert.equal(pickSubtitle(tracks, 'en').url, 'b');
+  assert.equal(pickSubtitle(tracks, 'fr').url, 'c');
+  assert.equal(pickSubtitle(tracks, 'fr,en').url, 'c', 'the order asked for is the order tried');
+});
+
+test('a regional spelling still matches the language asked for', () => {
+  const tracks = [{ lang: 'en-GB', ext: 'vtt', url: 'a', auto: false }];
+  assert.equal(pickSubtitle(tracks, 'en').url, 'a');
+});
+
+test('asking for a language nobody offers takes the best on offer, not nothing', () => {
+  // A video with only Japanese subtitles and a request for French: handing
+  // back a subtitle-less file would be worse than handing back Japanese.
+  const tracks = [
+    { lang: 'ja', ext: 'vtt', url: 'auto', auto: true },
+    { lang: 'ja', ext: 'vtt', url: 'written', auto: false },
+  ];
+  assert.equal(pickSubtitle(tracks, 'fr').url, 'written');
+});
+
+test('no tracks at all is null, and nothing downstream has to guess', () => {
+  assert.equal(pickSubtitle([], 'en'), null);
+  assert.equal(pickSubtitle(undefined, 'en'), null);
+  assert.equal(pickSubtitle([{ lang: 'en' }], 'en'), null, 'a track with no url is not a track');
 });

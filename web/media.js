@@ -131,22 +131,50 @@ const metadataArgs = (tags = {}) =>
  * `+faststart` moves the index to the front, which is what lets a phone's
  * player start the file without reading all of it first.
  */
-export async function mux({ video, audio, ext = 'mp4', tags = {}, onProgress }) {
+export async function mux({ video, audio, subtitle = null, ext = 'mp4', tags = {}, onProgress }) {
   const inputs = [];
   const args = [];
+  const index = { video: -1, audio: -1, subtitle: -1 };
   if (video) {
+    index.video = inputs.length;
     inputs.push({ name: `video.${video.ext || 'mp4'}`, data: video.data });
     args.push('-i', `video.${video.ext || 'mp4'}`);
   }
   if (audio) {
+    index.audio = inputs.length;
     inputs.push({ name: `audio.${audio.ext || 'm4a'}`, data: audio.data });
     args.push('-i', `audio.${audio.ext || 'm4a'}`);
+  }
+  if (subtitle) {
+    index.subtitle = inputs.length;
+    inputs.push({ name: `subs.${subtitle.ext || 'vtt'}`, data: subtitle.data });
+    args.push('-i', `subs.${subtitle.ext || 'vtt'}`);
   }
   if (inputs.length === 0) throw new BackendError('Nothing to convert.');
 
   const output = `out.${ext}`;
   args.push('-c', 'copy');
-  if (video && audio) args.push('-map', '0:v:0', '-map', '1:a:0');
+  // With one input and nothing else, ffmpeg's own choice is right and saying
+  // nothing is safest. Beyond that every wanted stream has to be named, or the
+  // default picks one of each and silently drops the rest.
+  if (video && audio) {
+    args.push('-map', `${index.video}:v:0`, '-map', `${index.audio}:a:0`);
+  } else if (inputs.length > 1) {
+    // One media input carrying who-knows-what — a muxed MP4, a pile of HLS
+    // segments — beside a subtitle. The trailing `?` means "if it is there",
+    // which keeps an audio-less video and a video-less audio both working
+    // without naming streams that do not exist.
+    const media = video ? index.video : index.audio;
+    args.push('-map', `${media}:v:0?`, '-map', `${media}:a:0?`);
+  }
+  if (subtitle) args.push('-map', `${index.subtitle}:s:0`);
+  if (subtitle) {
+    // MP4 carries text subtitles as mov_text and nothing else; WebVTT goes in
+    // as-is elsewhere. The language tag is what makes a player's subtitle menu
+    // say "English" instead of "Track 1".
+    args.push('-c:s', ext === 'mp4' ? 'mov_text' : 'webvtt');
+    if (subtitle.lang) args.push('-metadata:s:s:0', `language=${subtitle.lang.slice(0, 12)}`);
+  }
   if (ext === 'mp4') args.push('-movflags', '+faststart');
   args.push(...metadataArgs(tags), '-y', output);
 

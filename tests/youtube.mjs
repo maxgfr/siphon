@@ -205,6 +205,9 @@ await page.addInitScript(
     if (!localStorage.getItem('siphon:settings')) {
       localStorage.setItem('siphon:settings', JSON.stringify({
         endpoint: relayUrl, key: '', helper: { kind: 'relay', label: 'relay' },
+        // What this job measures is the helper it was given, so it must not
+        // wander off to a different instance when that one refuses.
+        autoInstance: false,
         coreUrl: coreUrl || '', preset: 'video_480', subs: 'off',
       }));
     }

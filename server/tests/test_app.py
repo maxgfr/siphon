@@ -925,3 +925,99 @@ class TestAgainstRealYtDlp:
         assert response.status_code == 200
         assert response.content == body
         assert response.headers["content-type"] == "video/mp4"
+
+
+# ------------------------------------------------ subtitles and playlists
+
+
+class TestSubtitleTracks:
+    """What a page is offered to embed."""
+
+    def test_written_subtitles_beat_machine_ones_for_the_same_language(self) -> None:
+        tracks = server_app.subtitle_tracks({
+            "subtitles": {"en": [{"ext": "vtt", "url": "https://s.example/en.vtt"}]},
+            "automatic_captions": {
+                "en": [{"ext": "vtt", "url": "https://s.example/en.auto.vtt"}],
+                "fr": [{"ext": "vtt", "url": "https://s.example/fr.auto.vtt"}],
+            },
+        })
+        assert [(t["lang"], t["auto"]) for t in tracks] == [("en", False), ("fr", True)]
+        assert tracks[0]["url"] == "https://s.example/en.vtt"
+
+    def test_the_format_a_browser_can_read_is_preferred(self) -> None:
+        tracks = server_app.subtitle_tracks({
+            "subtitles": {"en": [
+                {"ext": "ttml", "url": "https://s.example/en.ttml"},
+                {"ext": "srt", "url": "https://s.example/en.srt"},
+                {"ext": "vtt", "url": "https://s.example/en.vtt"},
+            ]},
+        })
+        assert tracks[0]["ext"] == "vtt"
+
+    def test_a_language_with_nothing_usable_is_dropped(self) -> None:
+        assert server_app.subtitle_tracks({"subtitles": {"en": [{"ext": "ttml", "url": "u"}]}}) == []
+
+    def test_a_hundred_auto_languages_are_capped(self) -> None:
+        many = {f"l{i}": [{"ext": "vtt", "url": f"https://s.example/{i}.vtt"}] for i in range(100)}
+        assert len(server_app.subtitle_tracks({"automatic_captions": many})) == server_app.SUBTITLE_LIMIT
+
+    def test_nothing_offered_is_an_empty_list_not_a_failure(self) -> None:
+        assert server_app.subtitle_tracks({}) == []
+
+
+class TestPlaylistResolve:
+    @pytest.fixture(autouse=True)
+    def _isolate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _public_dns(monkeypatch)
+        monkeypatch.setattr(server_app.yt_dlp, "YoutubeDL", _FakeYdl)
+        monkeypatch.setattr(server_app, "TUNNEL_HOSTS", {})
+        _FakeYdl.seen_options = []
+        _FakeYdl.info = {
+            "_type": "playlist",
+            "id": "PL1",
+            "title": "An album",
+            "uploader": "A band",
+            "extractor_key": "Site",
+            "entries": [
+                {"url": "https://site.example/watch?v=one", "title": "One", "thumbnail": "https://img.example/1.jpg"},
+                {"url": "https://site.example/watch?v=two", "title": "Two"},
+                {"webpage_url": "https://site.example/watch?v=three", "title": "Three"},
+                None,
+            ],
+        }
+
+    def test_a_playlist_comes_back_as_a_list_not_as_its_first_track(self, client: TestClient) -> None:
+        body = client.post("/api/resolve", json={"url": "https://site.example/playlist?list=PL1"}).json()
+        assert body["title"] == "An album"
+        assert body["formats"] == []
+        assert body["playlist"]["count"] == 3
+        assert [e["title"] for e in body["playlist"]["entries"]] == ["One", "Two", "Three"]
+        # Either spelling of the entry's address is understood.
+        assert body["playlist"]["entries"][2]["url"] == "https://site.example/watch?v=three"
+
+    def test_the_cap_is_reported_so_the_page_can_say_what_it_will_do(self, client: TestClient) -> None:
+        body = client.post("/api/resolve", json={"url": "https://site.example/playlist?list=PL1"}).json()
+        assert body["playlist"]["limit"] == server_app.PLAYLIST_LIMIT
+
+    def test_entries_are_not_extracted_one_by_one_to_answer(self, client: TestClient) -> None:
+        client.post("/api/resolve", json={"url": "https://site.example/playlist?list=PL1"})
+        assert _FakeYdl.seen_options[0]["extract_flat"] == "in_playlist"
+        assert _FakeYdl.seen_options[0]["noplaylist"] is True
+
+
+def test_a_single_video_reports_its_subtitles_and_no_playlist(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    _public_dns(monkeypatch)
+    monkeypatch.setattr(server_app.yt_dlp, "YoutubeDL", _FakeYdl)
+    monkeypatch.setattr(server_app, "TUNNEL_HOSTS", {})
+    _FakeYdl.info = {
+        "id": "abc",
+        "title": "A video",
+        "extractor_key": "Site",
+        "formats": [{"format_id": "m", "url": "https://cdn.example/v.mp4", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}],
+        "subtitles": {"en": [{"ext": "vtt", "url": "https://subs.example/en.vtt"}]},
+    }
+    body = client.post("/api/resolve", json={"url": "https://site.example/watch?v=abc"}).json()
+    assert body["playlist"] is None
+    assert body["subtitles"] == [{"lang": "en", "ext": "vtt", "url": "https://subs.example/en.vtt", "auto": False}]
+    # And the page can actually fetch it: the subtitle host is tunnelable too.
+    assert "subs.example" in server_app.TUNNEL_HOSTS

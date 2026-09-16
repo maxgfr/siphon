@@ -121,6 +121,9 @@ const TYPES = {
 };
 
 /** A static server that allows cross-origin reads, which is what the media host must do. */
+/** How many times the flaky route has been asked for, and with what. */
+const flaky = { asks: [], cut: false };
+
 function serve(root, port, prefix) {
   const server = createServer((request, response) => {
     const cors = {
@@ -131,7 +134,50 @@ function serve(root, port, prefix) {
     };
     if (request.method === 'OPTIONS') return response.writeHead(204, cors).end();
 
-    const path = decodeURIComponent(new URL(request.url, 'http://x').pathname).replace(prefix, '');
+    let path = decodeURIComponent(new URL(request.url, 'http://x').pathname).replace(prefix, '');
+
+    // A host that drops the connection halfway through, once, then serves
+    // ranges properly — which is what a phone changing cells looks like.
+    if (path.endsWith('/flaky.mp4')) {
+      const source = join(root, '/media/clip.mp4');
+      const size = statSync(source).size;
+      const range = /^bytes=(\d+)-/.exec(request.headers.range || '');
+      const from = range ? Number(range[1]) : 0;
+
+      // The app probes with HEAD before downloading. Answering that with a cut
+      // would spend the one break on the probe, and the download that follows
+      // would sail through — proving nothing.
+      if (request.method === 'HEAD') {
+        return response.writeHead(200, { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': size }).end();
+      }
+      flaky.asks.push({ range: request.headers.range || null });
+
+      if (!flaky.cut) {
+        // First time: promise the whole file, send a third of it, hang up.
+        // The pause matters — destroying the socket in the same tick as the
+        // write throws the bytes away with it, and then the client has nothing
+        // to resume *from*, which is a different test entirely.
+        flaky.cut = true;
+        response.writeHead(200, { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': size });
+        const third = Math.floor(size / 3);
+        response.write(readFileSync(source).subarray(0, third), () => {
+          setTimeout(() => response.destroy(), 200);
+        });
+        return undefined;
+      }
+      if (from > 0) {
+        response.writeHead(206, {
+          ...cors,
+          'Content-Type': 'video/mp4',
+          'Content-Length': size - from,
+          'Content-Range': `bytes ${from}-${size - 1}/${size}`,
+        });
+      } else {
+        response.writeHead(200, { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': size });
+      }
+      return createReadStream(source, { start: from }).pipe(response);
+    }
+
     const file = join(root, path);
     if (!file.startsWith(root)) return response.writeHead(403, cors).end();
     let stats;
@@ -171,7 +217,14 @@ const context = await browser.newContext({ acceptDownloads: true });
 const page = await context.newPage();
 
 const consoleErrors = [];
-page.on('console', (message) => message.type() === 'error' && consoleErrors.push(message.text()));
+page.on('console', (message) => {
+  if (message.type() !== 'error') return;
+  // The cut-connection case deliberately breaks one response, and the browser
+  // says so. That one resource is excused by URL; every other console error,
+  // including any other failed load, still counts.
+  if ((message.location()?.url || '').includes('/flaky.mp4')) return;
+  consoleErrors.push(message.text());
+});
 page.on('pageerror', (error) => consoleErrors.push(`pageerror: ${error.message}`));
 
 // Whether the 32 MB converter was fetched is what the "costs nothing extra"
@@ -221,6 +274,16 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   check('direct mp4 arrives byte-identical', Buffer.compare(source, readFileSync(file)) === 0, `${source.length} bytes`);
   check('direct mp4 keeps its name', file.endsWith('.mp4'));
   check('direct mp4 never loads the converter', coreRequests === 0, `${coreRequests} core requests`);
+}
+
+/* A connection that dies mid-download is resumed, not restarted. */
+{
+  const file = await download(`${MEDIA}/media/flaky.mp4`, 'video_best');
+  check('a cut connection still produces the whole file', Buffer.compare(source, readFileSync(file)) === 0,
+    `${readFileSync(file).length} of ${source.length} bytes`);
+  const resumed = flaky.asks.filter((ask) => /^bytes=\d+-/.test(ask.range || ''));
+  check('and it asked for the rest rather than starting over',
+    resumed.length > 0 && resumed[0].range !== 'bytes=0-', JSON.stringify(flaky.asks.map((a) => a.range)));
 }
 
 /* An HLS ladder: pick a rendition, fetch its segments, remux to MP4. */

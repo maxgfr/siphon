@@ -160,38 +160,106 @@ export class Fetcher {
   }
 
   /**
-   * Download a whole resource, reporting bytes as they land.
+   * Read a whole resource, handing over each chunk as it lands.
    *
-   * Read through the stream rather than awaiting `arrayBuffer()`: the point of
-   * the browser mode is a progress bar that means something, and `arrayBuffer`
-   * gives one number at the end.
+   * Two things this does that a plain `fetch().arrayBuffer()` does not.
+   *
+   * It **resumes**. A connection that dies at 80% used to mean starting again
+   * from zero, which on a phone changing cells is the difference between a
+   * download that finishes and one that never does. Every host that serves
+   * media supports byte ranges, so a cut stream is picked up with
+   * `Range: bytes=<what we have>-` and the rest appended. A host that ignores
+   * the range and sends the whole file again is handled too: what was held is
+   * thrown away and the caller told to start over.
+   *
+   * And it **never has to hold the file**. The caller decides what a chunk
+   * means — pile them up in memory, or write them straight to disk — which is
+   * what lets a two-hour video land in OPFS without ever being in the heap.
+   *
+   * @returns {Promise<number>} how many bytes were handed over
    */
-  async bytes(url, { onProgress, signal, range, prefer } = {}) {
-    const headers = range ? { Range: `bytes=${range.offset}-${range.offset + range.length - 1}` } : undefined;
-    const response = await this.request(url, { signal, headers, prefer });
-    if (!response.ok && response.status !== 206) throw httpError(response, url);
-
-    const stated = Number(response.headers.get('content-length')) || 0;
-    if (!response.body) {
-      const buffer = new Uint8Array(await response.arrayBuffer());
-      onProgress?.(buffer.length, buffer.length);
-      return buffer;
-    }
-
-    const reader = response.body.getReader();
-    const chunks = [];
+  async stream(url, { onChunk, onReset, onProgress, signal, range, prefer, attempts = 4 } = {}) {
     let received = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      received += value.length;
-      onProgress?.(received, stated);
-    }
+    // For a ranged read the span is the total; for a whole file the host says.
+    let stated = range ? range.length : 0;
 
-    const out = new Uint8Array(received);
+    for (let attempt = 1; ; attempt += 1) {
+      const resuming = received > 0;
+      const from = (range?.offset ?? 0) + received;
+      const to = range ? range.offset + range.length - 1 : '';
+      const headers = range || resuming ? { Range: `bytes=${from}-${to}` } : undefined;
+
+      try {
+        const response = await this.request(url, { signal, headers, prefer });
+        if (!response.ok && response.status !== 206) throw httpError(response, url);
+
+        // Asked to carry on, handed the whole file instead: this host does not
+        // do ranges, so everything held so far is worthless.
+        if (resuming && response.status !== 206) {
+          received = 0;
+          await onReset?.();
+        }
+        if (!range && received === 0) stated = totalOf(response) || stated;
+
+        if (!response.body) {
+          const whole = new Uint8Array(await response.arrayBuffer());
+          await onChunk(whole);
+          received += whole.length;
+          onProgress?.(received, stated || received);
+          return received;
+        }
+
+        const reader = response.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          await onChunk(value);
+          received += value.length;
+          onProgress?.(received, stated);
+        }
+
+        // A stream that stops short is a cut connection, not a short file —
+        // and it arrives as a clean end-of-stream, so without this check a
+        // truncated download would be handed over as if it were complete.
+        if (stated && received < stated) {
+          throw new Error(`the connection closed after ${received} of ${stated} bytes`);
+        }
+        return received;
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        // A refusal is not worth repeating; only a broken pipe is.
+        if (error instanceof BackendError && error.retryable === false) throw error;
+        if (attempt >= attempts) throw cutShort(url, error, received, stated);
+        await pause(Math.min(400 * 2 ** (attempt - 1), 4000), signal);
+      }
+    }
+  }
+
+  /**
+   * The same, collected into one array.
+   *
+   * For everything small enough to hold: HLS segments, cover art, a playlist.
+   * A whole video that needs no conversion should use `stream` and write it
+   * to disk instead.
+   */
+  async bytes(url, options = {}) {
+    const parts = [];
+    let total = 0;
+    await this.stream(url, {
+      ...options,
+      onChunk: (chunk) => {
+        parts.push(chunk);
+        total += chunk.length;
+      },
+      onReset: () => {
+        parts.length = 0;
+        total = 0;
+      },
+    });
+
+    const out = new Uint8Array(total);
     let offset = 0;
-    for (const chunk of chunks) {
+    for (const chunk of parts) {
       out.set(chunk, offset);
       offset += chunk.length;
     }
@@ -296,6 +364,31 @@ function filenameFrom(disposition) {
   }
   const plain = /filename="?([^";]+)"?/i.exec(disposition);
   return plain ? plain[1] : null;
+}
+
+/** How big the thing being read is, whichever header says so. */
+function totalOf(response) {
+  const range = String(response.headers.get('content-range') || '').split('/')[1];
+  return Number(range) || Number(response.headers.get('content-length')) || 0;
+}
+
+/** A sleep that gives up when the download does. */
+function pause(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    }, { once: true });
+  });
+}
+
+/** Retries are spent and the file is still incomplete. Say how far it got. */
+function cutShort(url, error, received, stated) {
+  const far = stated ? ` after ${Math.round((received / stated) * 100)}%` : '';
+  return new BackendError(`The download from ${hostOf(url)} kept breaking${far}.`, {
+    hint: `Last attempt: ${error?.message || error}. Try again — a download resumes rather than starting over.`,
+  });
 }
 
 function httpError(response, url) {

@@ -239,19 +239,20 @@ whole project is built on — for that one site.
 
 Worth knowing before you rely on it with no helper set:
 
-- **No subtitles yet.** The app says so rather than handing back a file that
-  quietly has none.
-- **One video at a time.** A playlist is offered whole by a full server,
-  because it can build a zip; a tab cannot, so the device takes the video you
-  linked.
+- **Subtitles only where a link offers them.** A direct file or a scraped page
+  has none to offer, so there is nothing to embed; when a helper resolves a
+  link that does have them, one is muxed into the video. A separate `.srt`
+  beside the file still needs your own server.
 - **No cookies.** There is nowhere safe to put them and nothing that would use
   them.
 - **Sites that build their player in JavaScript** hide the file from a markup
   scrape. yt-dlp has a hand-written extractor for each of those; this has four
   general ones.
-- **Big files live in memory during conversion.** Remuxing a two-hour video in
-  wasm on a phone is not a good idea. Finished files go to the origin private
-  file system, not the heap, so a row still survives a reload.
+- **Converting a big file still needs it in memory.** ffmpeg.wasm wants the
+  whole input and the whole output at once, and a phone may not have it — the
+  row says so above half a gigabyte rather than letting the tab die quietly.
+  Downloads that need *no* conversion, which is most of them, never touch the
+  heap at all: they stream straight to disk.
 
 ## The shortest setup: you are the client
 
@@ -432,6 +433,21 @@ your Pages URL so it stops accepting requests from anywhere:
 ALLOWED_ORIGINS=https://maxgfr.github.io docker compose up -d
 ```
 
+## A download that breaks does not start again
+
+Every host that serves media supports byte ranges, so a connection that dies at
+80% is picked up from 80%: the next attempt asks for the rest and appends it.
+Four attempts with a widening pause between them, and if the host turns out to
+ignore ranges and send the whole file again, what was held is thrown away
+rather than prepended to itself. A refusal — a 404, a private video — is not
+retried at all, because repeating it would only make the same answer arrive
+later.
+
+The same applies to the helper. If the public instance in use stops answering,
+siphon takes the next one off the list it found the first from, says which, and
+retries. It does that only for failures that are about the helper rather than
+the video: a private video is private on every instance in the world.
+
 ## A queue, not one download at a time
 
 Paste a link, tap Download, and the box clears straight away so the next link can
@@ -446,6 +462,15 @@ offers to try again rather than leaving you to retype the link.
 ## Subtitles
 
 Off, burned into the container, or as separate `.srt` files beside the video.
+On the device the first two apply: a subtitle track the link offers is fetched
+and muxed into the video as `mov_text`, with its language tag set so a player's
+menu says "English" rather than "Track 1". Asking for subtitles on a file that
+would otherwise have needed no conversion means it now gets one — that is the
+cost of asking, and it is only paid when a track was actually found. The
+languages are a preference list, not a filter: ask for `fr,en`, be offered only
+Japanese, and you get Japanese rather than nothing.
+
+
 Auto-generated captions are always included in the request: most of YouTube has
 no human subtitles, and asking only for those returns a file with none at all
 and no explanation. Audio presets ignore the setting, since an MP3 has nowhere
@@ -457,11 +482,16 @@ Paste a playlist, a channel or an album and siphon offers to take the lot. It is
 offered, never assumed: a `watch?v=…&list=…` link is a video that happens to sit
 in a playlist, so **This one** stays the default and **All 40** is one tap away.
 
-Everything arrives as a single `.zip`, because a browser can only be handed one
-file. Inside, tracks are numbered in playlist order — that ordering exists
-nowhere else once the files are on your disk. The archive is stored rather than
-deflated: media is already compressed, so deflating it would burn CPU over a
-whole playlist to save nothing.
+**With a full server**, everything arrives as a single `.zip`, because one job
+can only hand back one file. Inside, tracks are numbered in playlist order —
+that ordering exists nowhere else once the files are on your disk. The archive
+is stored rather than deflated: media is already compressed, so deflating it
+would burn CPU over a whole playlist to save nothing.
+
+**On the device**, a playlist becomes a row per video instead. A tab cannot
+build an archive without holding all of it, and one row each is the better
+shape anyway: every file arrives on its own, with its own progress, and a
+failure halfway through costs one video rather than fifty.
 
 A dead video in the middle does not abandon the other thirty-nine, and
 `PLAYLIST_LIMIT` (50 by default) stops one paste turning into hours of disk.
@@ -675,12 +705,12 @@ still unproven.
 
 | suite | what it is | result |
 |---|---|---|
-| `pytest server/tests` | the server, including two against real yt-dlp | 110 pass |
-| `npm test` | the extractor, the relay, endpoint detection, instance finding | 90 pass |
-| `npm run test:e2e` | the device alone, real Chromium, two origins | 21 pass |
+| `pytest server/tests` | the server, including two against real yt-dlp | 119 pass |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding | 107 pass |
+| `npm run test:e2e` | the device alone, real Chromium, two origins | 23 pass |
 | `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker | 36 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
-| `npm run test:split` | a server that only resolves, a device that downloads | 17 pass |
+| `npm run test:split` | a server that only resolves, a device that downloads | 24 pass |
 | `npm run test:youtube` | YouTube, for real, in CI | informative — see below |
 
 ### The device alone
@@ -716,6 +746,12 @@ origin and the media on another, so the CORS path under test is the real one:
 - A plain HTML page's `og:video` is found, fetched, and named after the page,
   and its `og:image` arrives in the MP3 as an attached cover.
 - A YouTube link with no helper fails with a sentence naming the reason.
+- **A host that drops the connection a third of the way through** is resumed:
+  the next request asks for `bytes=<what arrived>-`, and the file that lands is
+  byte-identical to the source. Ten more cases cover the same logic with the
+  network stubbed — a host that ignores the range, a stream that ends early
+  while claiming more, a refusal that must not be retried, and the error that
+  names how far it got when the attempts run out.
 - A finished row survives a reload with its Save button intact, because the file
   is in OPFS.
 
@@ -733,6 +769,11 @@ with an access key on both. It proves the client half of the arrangement:
   device by ffmpeg.wasm; an HLS ladder the server found is fetched segment by
   segment and remuxed.
 - Audio extraction and tagging happen on the device too.
+- A **subtitle track the server names is fetched and muxed in** as `mov_text`,
+  with the video and audio intact beside it.
+- A **playlist becomes a row per video**: three entries, three rows, three
+  finished files, and the interface says it will take them one at a time rather
+  than promising an archive it cannot build.
 - The server is never asked to run a job, the tunnel refuses a request with no
   key, and it refuses a host no resolve ever named.
 

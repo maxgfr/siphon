@@ -317,6 +317,7 @@ async function extractDirect(url, context, shape, head = null) {
     extractor: 'direct',
     isLive: false,
     playlist: null,
+    subtitles: [],
     formats: [
       {
         id: 'source',

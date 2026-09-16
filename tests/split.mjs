@@ -57,6 +57,14 @@ ffmpeg(['-i', at('muxed.mp4'), '-an', '-c:v', 'copy', at('video.mp4')]);
 ffmpeg(['-i', at('muxed.mp4'), '-vn', '-c:a', 'copy', at('audio.m4a')]);
 ffmpeg(['-i', at('muxed.mp4'), '-c', 'copy', '-f', 'hls', '-hls_time', '2', '-hls_playlist_type', 'vod',
   '-hls_segment_filename', at('seg%d.ts'), at('index.m3u8')]);
+writeFileSync(at('subs.vtt'), `WEBVTT
+
+00:00:00.000 --> 00:00:02.000
+A line the server found
+
+00:00:02.000 --> 00:00:04.000
+and the device embedded
+`);
 writeFileSync(at('cover.jpg'), execFileSync(FFMPEG, ['-y', '-loglevel', 'error', '-i', at('muxed.mp4'), '-frames:v', '1', '-f', 'mjpeg', '-'], { maxBuffer: 1 << 24 }));
 
 /* ----------------------------------------------------------------- servers */
@@ -64,7 +72,7 @@ writeFileSync(at('cover.jpg'), execFileSync(FFMPEG, ['-y', '-loglevel', 'error',
 const TYPES = {
   '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.webmanifest': 'application/manifest+json',
   '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.mp4': 'video/mp4', '.m4a': 'audio/mp4',
-  '.ts': 'video/mp2t', '.m3u8': 'application/vnd.apple.mpegurl',
+  '.ts': 'video/mp2t', '.m3u8': 'application/vnd.apple.mpegurl', '.vtt': 'text/vtt',
 };
 
 /** Every request the media host answered, and whether it came from a browser. */
@@ -124,6 +132,26 @@ const resolved = {
     title: 'A ladder the server found',
     formats: [{ id: 'h', url: `${MEDIA}/index.m3u8`, protocol: 'hls', kind: 'muxed', container: 'ts', height: 360, label: '360p' }],
   },
+  '/watch/subs': {
+    title: 'A video with subtitles',
+    formats: [{ id: 'm', url: `${MEDIA}/muxed.mp4`, protocol: 'progressive', kind: 'muxed', container: 'mp4', height: 360, label: '360p' }],
+    subtitles: [
+      { lang: 'fr', ext: 'vtt', url: `${MEDIA}/subs.vtt`, auto: true },
+      { lang: 'en', ext: 'vtt', url: `${MEDIA}/subs.vtt`, auto: false },
+    ],
+  },
+  '/list/three': {
+    title: 'Three of them',
+    playlist: {
+      count: 3,
+      limit: 50,
+      entries: [
+        { url: `${MEDIA}/watch/muxed`, title: 'The first' },
+        { url: `${MEDIA}/watch/muxed`, title: 'The second' },
+        { url: `${MEDIA}/watch/muxed`, title: 'The third' },
+      ],
+    },
+  },
 };
 
 const serverHits = { resolve: 0, tunnel: 0, jobs: 0 };
@@ -169,7 +197,10 @@ function api() {
         if (!found) return deny(400, 'yt-dlp does not recognise that link.');
         return response.writeHead(200, { ...cors, 'Content-Type': 'application/json' }).end(JSON.stringify({
           id: path, url: body.url, title: found.title, uploader: 'The server', duration: 4,
-          thumbnail: `${MEDIA}/cover.jpg`, extractor: 'Fake (server, default)', isLive: false, formats: found.formats,
+          thumbnail: `${MEDIA}/cover.jpg`, extractor: 'Fake (server, default)', isLive: false,
+          formats: found.formats || [],
+          subtitles: found.subtitles || [],
+          playlist: found.playlist || null,
         }));
       }
 
@@ -229,15 +260,29 @@ page.on('pageerror', (error) => errors.push(error.message));
 
 await page.addInitScript(
   ([endpoint, key, coreUrl]) => {
-    localStorage.setItem('siphon:settings', JSON.stringify({
-      endpoint, key,
-      helper: { kind: 'siphon', label: 'yt-dlp 2026.09.01', ffmpeg: false, capabilities: ['resolve', 'tunnel'] },
-      preset: 'video_best', subs: 'off', coreUrl,
-    }));
+    // Seed once. This runs on every navigation, so writing unconditionally
+    // would undo anything a case changes between downloads — which is how a
+    // subtitle setting silently reverted to "off" and proved nothing.
+    if (!localStorage.getItem('siphon:settings')) {
+      localStorage.setItem('siphon:settings', JSON.stringify({
+        endpoint, key,
+        helper: { kind: 'siphon', label: 'yt-dlp 2026.09.01', ffmpeg: false, capabilities: ['resolve', 'tunnel'] },
+        preset: 'video_best', subs: 'off', autoInstance: false, coreUrl,
+      }));
+    }
     localStorage.setItem('siphon:install-dismissed', '1');
   },
   [SERVER, KEY, process.env.SIPHON_CORE_URL || ''],
 );
+
+/** Change one saved setting between downloads, the way the sheet would. */
+async function setSetting(patch) {
+  await page.goto(`http://127.0.0.1:${APP_PORT}/`, { waitUntil: 'networkidle' });
+  await page.evaluate((change) => {
+    const settings = JSON.parse(localStorage.getItem('siphon:settings') || '{}');
+    localStorage.setItem('siphon:settings', JSON.stringify({ ...settings, ...change }));
+  }, patch);
+}
 
 async function download(url, preset) {
   await page.goto(`http://127.0.0.1:${APP_PORT}/`, { waitUntil: 'networkidle' });
@@ -312,6 +357,50 @@ async function download(url, preset) {
   const report = r.saved ? inspect(r.saved) : '';
   check('audio is extracted and converted on this device', /Audio: mp3/.test(report), r.error || r.saved?.split('/').pop());
   check('with the title the server reported', /One file, already merged/.test(report), (/title\s*:\s*(.+)/i.exec(report) || [])[1] || '');
+}
+
+/* Subtitles the server found, embedded here. */
+{
+  await setSetting({ subs: 'embed', subLangs: 'en' });
+  const before = mediaHits.length;
+  const r = await download(`${MEDIA}/watch/subs`, 'video_best');
+  const report = r.saved ? inspect(r.saved) : '';
+  const asked = mediaHits.slice(before).filter((hit) => hit.path.endsWith('.vtt'));
+  const note = (await page.textContent('.q-msg').catch(() => '')) || '';
+  check('the subtitle file is actually fetched', asked.length > 0,
+    `${asked.length} asks; row said: ${note.replace(/\s+/g, ' ').slice(0, 80)}`);
+  check('a subtitle track the server found is embedded in the video',
+    /Subtitle: mov_text/.test(report), r.error || (/Stream #0:\d+.*Subtitle.*/.exec(report) || [])[0] || report.slice(0, 90));
+  check('and the video and its audio survived the extra track',
+    /Video: h264/.test(report) && /Audio: aac/.test(report));
+  await setSetting({ subs: 'off' });
+}
+
+/* A playlist: one row per video, because a tab cannot build a zip. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.fill('#url', `${MEDIA}/list/three`);
+  await page.waitForSelector('.playlist-choice', { timeout: 30_000 }).catch(() => {});
+  const offered = await page.locator('.playlist-choice input[name="scope"]').count();
+  check('a playlist link offers the whole list', offered === 2, String(offered));
+
+  await page.check('input[name="scope"][value="all"]');
+  const note = (await page.textContent('#playlistNote')) || '';
+  check('and says it will take them one at a time rather than promising a zip',
+    /one after another/i.test(note), note);
+
+  await page.click('#go');
+  await page.waitForFunction(() => document.querySelectorAll('#queueList li').length >= 3, { timeout: 30_000 })
+    .catch(() => {});
+  const rows = await page.locator('#queueList li').count();
+  check('every video in the list becomes its own row', rows === 3, String(rows));
+
+  await page.waitForFunction(() => document.querySelectorAll('#queueList li a.q-act').length >= 3, { timeout: 120_000 })
+    .catch(() => {});
+  const finished = await page.locator('#queueList li a.q-act').count();
+  check('and every one of them finishes on its own', finished === 3, `${finished} of 3 ready`);
 }
 
 /* No media byte was ever handed to the page directly. */
