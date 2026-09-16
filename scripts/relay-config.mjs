@@ -118,6 +118,81 @@ export async function evaluate(relay, { fetchImpl = globalThis.fetch, instances 
   return report;
 }
 
+/* ------------------------------------------------------------- cobalt */
+
+/**
+ * cobalt is the other shape of "it just works in a browser": the instance
+ * does the whole download and streams the file back, so the page needs no
+ * CORS on the media at all — the file is a navigation, not a fetch. The
+ * public cobalt.tools instance is keyed and Turnstile-gated and blocked by
+ * YouTube; community instances come and go, some open, some keyed. The
+ * directory lists them, and the only test that matters is the one the app
+ * makes: POST a YouTube link, get a tunnel, read its first bytes.
+ */
+export const COBALT_DIRECTORY = 'https://instances.cobalt.best/api/instances.json';
+export const WATCH = `https://www.youtube.com/watch?v=${VIDEO_ID}`;
+
+/** The directory's entries → API addresses worth asking, most trusted first. */
+export function cobaltCandidates(body, { limit = 12 } = {}) {
+  return (Array.isArray(body) ? body : [])
+    .filter((e) => e && e.api && e.online !== false && e.api_online !== false && e.protocol !== 'http')
+    .filter((e) => !e.services || e.services.youtube !== false)
+    .sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0))
+    .map((e) => `https://${String(e.api).replace(/\/+$/, '')}`)
+    .filter((api, i, all) => all.indexOf(api) === i)
+    .slice(0, limit);
+}
+
+/** Ask one cobalt instance for the sample video, the way the app does. */
+export async function evaluateCobalt(api, { fetchImpl = globalThis.fetch } = {}) {
+  const report = { api, answer: '', media: '', ok: false };
+  let body;
+  try {
+    const r = await fetchImpl(`${api}/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', Origin: ORIGIN },
+      body: JSON.stringify({ url: WATCH, downloadMode: 'auto', videoQuality: '480' }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    body = await r.json().catch(() => ({}));
+    if (body?.status === 'error' || !r.ok) return { ...report, answer: `HTTP ${r.status} ${body?.error?.code || ''}`.trim() };
+    if (!['tunnel', 'redirect'].includes(body?.status) || !body?.url) return { ...report, answer: `status ${body?.status || '?'}` };
+    report.answer = `${body.status}`;
+  } catch (error) {
+    return { ...report, answer: error?.name === 'TimeoutError' ? 'no answer in 30s' : String(error?.cause?.code || error?.message || error).slice(0, 80) };
+  }
+  try {
+    const r = await fetchImpl(body.url, { headers: { Range: 'bytes=0-65535', Origin: ORIGIN }, redirect: 'follow', signal: AbortSignal.timeout(30_000) });
+    const type = r.headers.get('content-type') || '';
+    const bytes = (await r.arrayBuffer()).byteLength;
+    if ((r.status === 200 || r.status === 206) && bytes > 0 && !/^text\//.test(type)) {
+      return { ...report, media: `${r.status} ${type || '(no type)'} ${bytes} bytes`, ok: true };
+    }
+    return { ...report, media: `HTTP ${r.status} ${type || '(no type)'} ${bytes} bytes` };
+  } catch (error) {
+    return { ...report, media: error?.name === 'TimeoutError' ? 'no answer in 30s' : String(error?.message || error).slice(0, 80) };
+  }
+}
+
+/** The directory, then each instance until one delivers; say what every one said. */
+export async function chooseCobalt({ fetchImpl = globalThis.fetch, say = () => {}, limit = 12 } = {}) {
+  let listed = [];
+  try {
+    const r = await fetchImpl(COBALT_DIRECTORY, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20_000) });
+    listed = cobaltCandidates(await r.json(), { limit });
+  } catch (error) {
+    say(`no   cobalt directory: ${String(error?.message || error).slice(0, 80)}`);
+    return '';
+  }
+  if (listed.length === 0) say('no   cobalt directory: no instance listed as online for YouTube');
+  for (const api of listed) {
+    const report = await evaluateCobalt(api, { fetchImpl });
+    say(`${report.ok ? 'ok  ' : 'no  '} ${api}\n       answer: ${report.answer}\n       media: ${report.media || '-'}`);
+    if (report.ok) return api;
+  }
+  return '';
+}
+
 /** The candidates in order: the owner's relay, then the public ones. */
 export function candidates(own = '') {
   const mine = String(own || '').trim();
@@ -137,16 +212,27 @@ export async function choose({ own = '', fetchImpl = globalThis.fetch, instances
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
   const instances = JSON.parse(readFileSync(INSTANCES, 'utf8')).invidious || [];
-  const found = await choose({ own: process.env.SIPHON_RELAY_URL || '', instances, say: (line) => console.log(line) });
-  const next = { relay: found.relay, relayKind: found.relayKind, instance: found.instance, checked: new Date().toISOString().slice(0, 10) };
+  const say = (line) => console.log(line);
+  console.log('relays:');
+  const found = await choose({ own: process.env.SIPHON_RELAY_URL || '', instances, say });
+  console.log('\ncobalt instances:');
+  const cobalt = await chooseCobalt({ say });
+  const next = {
+    relay: found.relay,
+    relayKind: found.relayKind,
+    instance: found.instance,
+    cobalt,
+    checked: new Date().toISOString().slice(0, 10),
+  };
   let before = {};
   try {
     before = JSON.parse(readFileSync(TARGET, 'utf8'));
   } catch {
     /* first run */
   }
-  const same = before.relay === next.relay && before.instance === next.instance;
+  const same = before.relay === next.relay && before.instance === next.instance && (before.cobalt || '') === next.cobalt;
   console.log(found.relay ? `\nrelay: ${found.relay} (${found.relayKind}), instance ${found.instance}${same ? ' — unchanged' : ''}` : '\nno relay passed; the site keeps none');
+  console.log(cobalt ? `cobalt: ${cobalt}${same ? ' — unchanged' : ''}` : 'no cobalt instance delivered; the site keeps none');
   // The date only moves with the answer, so a daily run leaves no churn.
   if (same) process.exit(0);
   writeFileSync(TARGET, `${JSON.stringify(next, null, 2)}\n`);

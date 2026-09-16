@@ -10,7 +10,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { through, evaluate, choose, candidates, PUBLIC_RELAYS, ROBOTS, VIDEO_ID } from '../scripts/relay-config.mjs';
+import { through, evaluate, choose, candidates, cobaltCandidates, evaluateCobalt, chooseCobalt, PUBLIC_RELAYS, COBALT_DIRECTORY, ROBOTS, VIDEO_ID, WATCH } from '../scripts/relay-config.mjs';
 
 const STREAMS = { formatStreams: [{ url: '/videoplayback?itag=18', type: 'video/mp4' }] };
 
@@ -98,4 +98,75 @@ test('nothing passing is no relay, never a dead one', async () => {
   const { fetchImpl } = world({ robotsCors: '' });
   const found = await choose({ fetchImpl, instances: ['https://inv.example'] });
   assert.deepEqual(found, { relay: '', relayKind: '', instance: '' });
+});
+
+/* ------------------------------------------------------------------ cobalt */
+
+const DIRECTORY = [
+  { api: 'keyed.example', protocol: 'https', online: true, api_online: true, score: 100, services: { youtube: true } },
+  { api: 'open.example', protocol: 'https', online: true, api_online: true, score: 90, services: { youtube: true } },
+  { api: 'noyt.example', protocol: 'https', online: true, api_online: true, score: 80, services: { youtube: false } },
+  { api: 'down.example', protocol: 'https', online: false, api_online: false, score: 70 },
+  { api: 'plain.example', protocol: 'http', online: true, api_online: true, score: 60 },
+  { api: 'open.example/', protocol: 'https', online: true, api_online: true, score: 50 },
+];
+
+/** A cobalt world: every instance answers the sample link its own way; the tunnel streams bytes. */
+function cobaltWorld({ answers, media = 'video/mp4' } = {}) {
+  const asked = [];
+  const fetchImpl = async (url, init = {}) => {
+    asked.push({ url, method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : null });
+    if (url === COBALT_DIRECTORY) return new Response(JSON.stringify(DIRECTORY), { status: 200 });
+    if (url.endsWith('/tunnel')) {
+      if (!media) return new Response('<html>nope</html>', { status: 200, headers: { 'content-type': 'text/html' } });
+      return new Response(new Uint8Array(2048), { status: 200, headers: { 'content-type': media } });
+    }
+    const host = new URL(url).host;
+    const answer = answers[host];
+    if (!answer) return new Response(JSON.stringify({ status: 'error', error: { code: 'error.api.auth.key.missing' } }), { status: 401 });
+    return new Response(JSON.stringify(answer), { status: 200 });
+  };
+  return { asked, fetchImpl };
+}
+
+test('the directory is read for online, https, YouTube-capable instances, best score first, deduplicated', () => {
+  assert.deepEqual(cobaltCandidates(DIRECTORY), ['https://keyed.example', 'https://open.example']);
+  assert.deepEqual(cobaltCandidates('nonsense'), []);
+});
+
+test('an instance passes when it answers a tunnel for the sample link and the tunnel streams bytes', async () => {
+  const { asked, fetchImpl } = cobaltWorld({ answers: { 'open.example': { status: 'tunnel', url: 'https://open.example/tunnel', filename: 'x.mp4' } } });
+  const report = await evaluateCobalt('https://open.example', { fetchImpl });
+  assert.equal(report.ok, true);
+  assert.equal(report.answer, 'tunnel');
+  assert.match(report.media, /200 video\/mp4 2048 bytes/);
+  const post = asked.find((a) => a.method === 'POST');
+  assert.equal(post.body.url, WATCH, 'the same link the app would send');
+  assert.equal(post.body.downloadMode, 'auto');
+});
+
+test('a keyed instance is a no, with its error code kept', async () => {
+  const { fetchImpl } = cobaltWorld({ answers: {} });
+  const report = await evaluateCobalt('https://keyed.example', { fetchImpl });
+  assert.equal(report.ok, false);
+  assert.match(report.answer, /error\.api\.auth\.key\.missing/);
+});
+
+test('a tunnel that streams a web page rather than a file is a no', async () => {
+  const { fetchImpl } = cobaltWorld({ answers: { 'open.example': { status: 'tunnel', url: 'https://open.example/tunnel' } }, media: '' });
+  const report = await evaluateCobalt('https://open.example', { fetchImpl });
+  assert.equal(report.ok, false);
+  assert.match(report.media, /text\/html/);
+});
+
+test('the walk skips the keyed instance and takes the first that delivers', async () => {
+  const { fetchImpl } = cobaltWorld({ answers: { 'open.example': { status: 'redirect', url: 'https://open.example/tunnel' } } });
+  const lines = [];
+  assert.equal(await chooseCobalt({ fetchImpl, say: (l) => lines.push(l) }), 'https://open.example');
+  assert.ok(lines[0].startsWith('no   https://keyed.example'));
+  assert.ok(lines[1].startsWith('ok   https://open.example'));
+});
+
+test('a directory that cannot be read is no instance, not a crash', async () => {
+  assert.equal(await chooseCobalt({ fetchImpl: async () => { throw new TypeError('fetch failed'); } }), '');
 });

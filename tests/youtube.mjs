@@ -54,7 +54,7 @@ const SITE = (() => {
 })();
 const INVIDIOUS = process.env.SIPHON_INVIDIOUS_URL
   ? [process.env.SIPHON_INVIDIOUS_URL.replace(/\/+$/, '')]
-  : JSON.parse(readFileSync(join(WEB, 'instances.json'), 'utf8')).invidious.slice(0, Number(process.env.SIPHON_INVIDIOUS_TRIES || 4));
+  : JSON.parse(readFileSync(join(WEB, 'instances.json'), 'utf8')).invidious.slice(0, Number(process.env.SIPHON_INVIDIOUS_TRIES || 99));
 
 rmSync(OUT, { recursive: true, force: true });
 mkdirSync(OUT, { recursive: true });
@@ -326,9 +326,9 @@ const verdict = (ok, label, detail = '') => {
   say(`${ok ? 'ok  ' : 'FAIL'} ${label}${detail ? ` — ${detail}` : ''}`);
 };
 
-async function attempt(preset, { piped = '', invidious = '', relay = '' } = {}) {
-  const instance = piped || invidious;
-  const label = piped ? `${preset} via piped` : invidious ? `${preset} via ${new URL(invidious).host}` : relay ? `${preset} via the site's relay` : preset;
+async function attempt(preset, { piped = '', invidious = '', relay = '', cobalt = '' } = {}) {
+  const instance = piped || invidious || cobalt;
+  const label = piped ? `${preset} via piped` : invidious ? `${preset} via ${new URL(invidious).host}` : cobalt ? `${preset} via cobalt ${new URL(cobalt).host}` : relay ? `${preset} via the site's relay` : preset;
   now(`${label}: loading the app`);
   await page.goto(`http://127.0.0.1:${APP_PORT}/`, { waitUntil: 'networkidle' });
   // One helper at a time, which is the app's model: the relay for the relay
@@ -342,11 +342,12 @@ async function attempt(preset, { piped = '', invidious = '', relay = '' } = {}) 
       settings.siteInstance = siteInstance || '';
       settings.helper = kind === 'piped' ? { kind: 'piped', label: 'Piped instance' }
         : kind === 'invidious' ? { kind: 'invidious', label: 'Invidious instance' }
-          : { kind: 'relay', label: 'relay' };
+          : kind === 'cobalt' ? { kind: 'cobalt', label: 'cobalt', ffmpeg: true }
+            : { kind: 'relay', label: 'relay' };
       settings.autoInstance = false;
       localStorage.setItem('siphon:settings', JSON.stringify(settings));
     },
-    [instance, piped ? 'piped' : invidious ? 'invidious' : 'relay', relay || `http://127.0.0.1:${RELAY_PORT}`, relay ? SITE.instance || '' : ''],
+    [instance, piped ? 'piped' : invidious ? 'invidious' : cobalt ? 'cobalt' : 'relay', relay || `http://127.0.0.1:${RELAY_PORT}`, relay ? SITE.instance || '' : ''],
   );
   await page.reload({ waitUntil: 'networkidle' });
   await page.check(`input[name="quality"][value="${preset}"]`);
@@ -478,6 +479,20 @@ if (SITE.relay) {
   }
 } else {
   say('\nsite relay: none in web/config.json, skipped');
+}
+
+/* The site's cobalt instance, if the measurement found one that delivers. */
+if (SITE.cobalt) {
+  say(`\nsite cobalt: ${SITE.cobalt}`);
+  const r = await attempt('video_480', { cobalt: SITE.cobalt });
+  if (r.saved) {
+    const report = inspect(r.saved);
+    verdict(/Video: (h264|vp9|av1)/.test(report), `site cobalt: video_480 produced real video via ${new URL(SITE.cobalt).host}`, (/\d{3,4}x\d{3,4}/.exec(report) || [])[0] || r.saved);
+  } else {
+    verdict(false, `site cobalt: no file`, r.error);
+  }
+} else {
+  say('\nsite cobalt: none in web/config.json, skipped');
 }
 
 verdict(pageErrors.length === 0, 'no uncaught errors in the page', pageErrors.slice(0, 2).join(' ; '));
