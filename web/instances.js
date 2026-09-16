@@ -85,14 +85,17 @@ async function askDirectory(directory, fetchImpl, ms) {
  * @param {(address: string) => Promise<object>} options.detect  the same probe the settings sheet runs
  * @param {number} [options.candidates]  how many addresses to probe at most
  * @param {number} [options.timeout]  per-request budget, milliseconds
+ * @param {string[]} [options.exclude]  addresses already known not to work
  * @returns {Promise<{ endpoint: string, helper: object }|null>}
  */
-export async function findInstance({ fetchImpl = globalThis.fetch, detect, candidates = 8, timeout = 6000 } = {}) {
+export async function findInstance({ fetchImpl = globalThis.fetch, detect, candidates = 8, timeout = 6000, exclude = [] } = {}) {
   const listed = (await Promise.all(DIRECTORIES.map((d) => askDirectory(d, fetchImpl, timeout)))).flat();
 
-  // Directory entries first, seed behind them, duplicates dropped. The cap is
-  // what keeps a first visit from firing forty requests at strangers.
-  const seen = new Set();
+  // Directory entries first, seed behind them, duplicates dropped, and
+  // anything already known not to work left out — which is what makes this
+  // usable as a fallback when the instance in use dies rather than only as a
+  // first-visit search.
+  const seen = new Set(exclude.map(trimSlash));
   const addresses = [...listed, ...SEED.map(trimSlash)].filter((address) => {
     if (!address || seen.has(address)) return false;
     seen.add(address);
@@ -117,4 +120,20 @@ export async function findInstance({ fetchImpl = globalThis.fetch, detect, candi
   if (found.length === 0) return null;
   found.sort((a, b) => RANK[a.helper.kind] - RANK[b.helper.kind]);
   return found[0];
+}
+
+
+/**
+ * Whether a failure reads like the helper being gone rather than the video.
+ *
+ * The distinction decides whether looking for another instance would help at
+ * all. A private video is private on every instance in the world, and
+ * switching would waste the person's time and someone else's bandwidth to
+ * arrive at the same answer. An instance that has stopped answering, started
+ * refusing, or been blocked is exactly what the next one might not be.
+ */
+export function looksUnreachable(message) {
+  const text = String(message || '');
+  if (/private|members-only|age-restricted|unavailable|no formats|not recognise/i.test(text)) return false;
+  return /could not reach|did not answer|does not let a web page|answered 5\d\d|answered 4(0[38]|29)|rate.?limit|kept breaking|timed out|refused/i.test(text);
 }

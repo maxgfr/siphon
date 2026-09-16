@@ -11,7 +11,7 @@
  * primary action pinned within thumb reach, and no interaction that needs a
  * hover or a precise tap.
  */
-import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, privacyNote, describeEndpoint } from './api.js';
+import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, looksUnreachable, privacyNote, describeEndpoint } from './api.js';
 
 const SETTINGS_KEY = 'siphon:settings';
 const POLL_MS = 700;
@@ -25,6 +25,11 @@ const DEFAULT_SETTINGS = Object.freeze({
   endpoint: '',
   key: '',
   helper: NO_HELPER,
+  // Whether siphon may go looking for a public instance on its own — to fill
+  // in a first visit, or to replace one that has died. Someone who clears the
+  // address is saying they would rather it did not, so clearing turns this off
+  // and it stays off.
+  autoInstance: true,
   coreUrl: '',
   preset: 'video_best',
   subs: 'off',
@@ -112,6 +117,7 @@ const INSTANCE_OFFERED = 'siphon:instance-offered';
  * address afterwards, it is not tried again behind their back.
  */
 async function offerPublicInstance() {
+  if (!settings.autoInstance) return;
   try {
     if (localStorage.getItem(INSTANCE_OFFERED) === '1') return;
   } catch {
@@ -138,7 +144,7 @@ async function offerPublicInstance() {
   );
   $('instanceSettings')?.addEventListener('click', openSettings);
   $('instanceClear')?.addEventListener('click', () => {
-    settings = { ...settings, endpoint: '', key: '', helper: NO_HELPER };
+    settings = { ...settings, endpoint: '', key: '', helper: NO_HELPER, autoInstance: false };
     saveSettings();
     applyBackend();
     refreshBackendLabel();
@@ -305,10 +311,13 @@ function renderPlaylistNote(info) {
     note.textContent = 'Only the video this link points at.';
     return;
   }
-  note.textContent =
-    info.count > info.limit
-      ? `Capped at ${info.limit} of ${info.count} — arrives as one .zip`
-      : `${info.count} files, arriving as one .zip`;
+  const count = Math.min(info.count, info.limit);
+  const capped = info.count > info.limit ? ` (capped from ${info.count})` : '';
+  // A server builds one archive; a tab cannot, so it takes them one at a time
+  // — which is better anyway: separate files, each with its own progress.
+  note.textContent = backend?.supportsPlaylist
+    ? `${count} files${capped}, arriving as one .zip`
+    : `${count} downloads${capped}, one after another`;
 }
 
 function renderFeedback(html = '') {
@@ -414,6 +423,7 @@ function renderQueue() {
         ? `<div class="q-bar"><div class="q-fill${determinate ? '' : ' indeterminate'}" style="${determinate ? `width:${percent}%` : ''}"></div></div>`
         : '') +
       `<p class="q-msg">${escapeHtml(rowLabel(entry))}</p>` +
+      (entry.note ? `<p class="q-msg">${escapeHtml(entry.note)}</p>` : '') +
       '<div class="q-foot">' +
       `<span>${escapeHtml(bits.join(' · '))}</span>` +
       '<span class="spacer"></span>' +
@@ -447,15 +457,89 @@ function cancelEntry(key) {
   renderQueue();
 }
 
+/**
+ * An instance that has stopped answering is replaced, once, and the download
+ * retried.
+ *
+ * Instances come and go — that is the deal with using someone else's server —
+ * and the list that found this one has others on it. Doing nothing with that
+ * list means a dead instance looks like a dead app.
+ *
+ * Bounded on purpose: at most a couple of switches in a session, never for a
+ * failure that is about the video rather than the helper, and never silently.
+ */
+const SWITCH_LIMIT = 2;
+let switches = 0;
+const spentInstances = new Set();
+
+async function switchInstance(entry) {
+  if (!settings.autoInstance) return false;
+  if (settings.helper.kind !== 'cobalt' && settings.helper.kind !== 'piped') return false;
+  if (switches >= SWITCH_LIMIT || !looksUnreachable(entry.error || '')) return false;
+
+  switches += 1;
+  spentInstances.add(settings.endpoint);
+  const dead = hostOf(settings.endpoint);
+  const found = await findInstance({
+    detect: (address) => detectEndpoint(address),
+    exclude: [...spentInstances],
+  }).catch(() => null);
+  if (!found) {
+    renderFeedback(
+      '<div class="notice error" role="alert"><p><strong>' + escapeHtml(dead) + ' stopped answering,</strong> ' +
+        'and no other public instance answered either. Try again later, or run your own server.</p></div>',
+    );
+    return false;
+  }
+
+  settings = { ...settings, endpoint: found.endpoint, key: '', helper: found.helper };
+  saveSettings();
+  applyBackend();
+  refreshBackendLabel();
+  renderFeedback(
+    '<div class="notice"><p><strong>Switched instance.</strong> ' +
+      `${escapeHtml(dead)} stopped answering, so this is now going through ` +
+      `<strong>${escapeHtml(hostOf(found.endpoint))}</strong>. Change or clear it in settings.</p></div>`,
+  );
+  return true;
+}
+
+/** An entry has just failed: switch instance and try again, or leave it failed. */
+async function afterFailure(entry) {
+  if (await switchInstance(entry)) retryEntry(entry.key);
+}
+
 function retryEntry(key) {
   const entry = findEntry(key);
   if (!entry) return;
   queue = queue.filter((item) => item !== entry);
   renderQueue();
-  enqueue(entry.url, { preset: entry.preset });
+  // A row is one video, even when it came from a playlist, so a retry is one
+  // video too — not the whole list again.
+  enqueueOne(entry.url, { preset: entry.preset, title: entry.title });
 }
 
 /* ----------------------------------------------------------------- running */
+
+/**
+ * Take a link, or a whole playlist.
+ *
+ * A server can hand back a playlist as one archive. A tab cannot build one, so
+ * there a playlist becomes a row per video — which is the better shape anyway:
+ * each file arrives on its own, with its own progress, and a failure loses one
+ * video rather than fifty.
+ */
+async function enqueue(url, { preset = settings.preset, playlist = wantPlaylist } = {}) {
+  const entries = lastProbe?.entries || [];
+  if (playlist && !backend?.supportsPlaylist && entries.length > 0) {
+    for (const entry of entries.slice(0, lastProbe.limit || entries.length)) {
+      // eslint-disable-next-line no-await-in-loop -- the queue is the point
+      await enqueueOne(entry.url, { preset, playlist: false, title: entry.title });
+    }
+    return;
+  }
+  await enqueueOne(url, { preset, playlist });
+}
 
 /**
  * Add one download and return immediately.
@@ -464,11 +548,11 @@ function retryEntry(key) {
  * point of a queue is that you can paste the next link while the first is still
  * going. Nothing here waits.
  */
-async function enqueue(url, { preset = settings.preset, playlist = wantPlaylist } = {}) {
+async function enqueueOne(url, { preset = settings.preset, playlist = false, title = null } = {}) {
   const entry = {
-    key: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    key: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${queue.length}`,
     url,
-    title: lastProbe?.title || url,
+    title: title || lastProbe?.title || url,
     preset,
     state: 'starting',
     stage: 'starting',
@@ -500,6 +584,7 @@ async function enqueue(url, { preset = settings.preset, playlist = wantPlaylist 
     entry.state = 'error';
     entry.error = error instanceof BackendError ? error.message : String(error?.message || error);
     if (error instanceof BackendError && error.hint) entry.error += ` ${error.hint}`;
+    afterFailure(entry);
   }
   saveQueue();
   renderQueue();
@@ -530,6 +615,7 @@ async function pollAll() {
           totalBytes: job.totalBytes,
           client: job.client,
           attempts: job.attempts,
+          note: job.note,
           itemsDone: job.itemsDone,
           itemsTotal: job.itemsTotal,
           title: job.title || entry.title,
@@ -542,6 +628,7 @@ async function pollAll() {
         } else if (job.state === 'error') {
           entry.state = 'error';
           entry.error = job.error || 'The download failed.';
+          afterFailure(entry);
         }
       } catch (error) {
         // A 404 means the server swept it; anything else is a real failure.
@@ -847,8 +934,9 @@ function setupInstall() {
 function syncSubFields() {
   const wanted = settings.subs !== 'off';
   $('subLangsField').hidden = !wanted;
-  // Better to say the setting will be ignored than to hand back a file that
-  // quietly has no subtitles in it.
+  // The device can embed a subtitle a resolver found, but it cannot write a
+  // separate file and it cannot invent one for a link that offers none. Saying
+  // so beats handing back a video that quietly has no subtitles in it.
   $('subsUnsupported').hidden = !(wanted && !backend?.full);
 }
 
@@ -988,7 +1076,9 @@ function init() {
     // reached is not saved, and the reason stays on screen.
     const helper = await probeDraft();
     if (!helper) return;
-    settings = { ...draftSettings(), helper };
+    // An address typed in by hand is a decision. Nothing should quietly
+    // replace it afterwards, so saving one turns the automatic search off.
+    settings = { ...draftSettings(), helper, autoInstance: !draftSettings().endpoint };
     saveSettings();
     applyBackend();
     $('settings').close();

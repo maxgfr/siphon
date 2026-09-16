@@ -9,7 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { findInstance, DIRECTORIES, SEED } from '../web/instances.js';
+import { findInstance, looksUnreachable, DIRECTORIES, SEED } from '../web/instances.js';
 
 /** A fetch that answers the directories from a table, and records the asks. */
 function directories(table) {
@@ -151,4 +151,51 @@ test('http-only instances are addressed as http, and duplicates are dropped', as
   const found = await findInstance({ fetchImpl, detect });
   assert.equal(found.endpoint, 'http://plain.example');
   assert.equal(probed.filter((address) => address === 'http://plain.example').length, 1);
+});
+
+/* ---------------------------------------------- falling back to another one */
+
+test('an address already known not to work is not offered again', async () => {
+  const { fetchImpl } = directories({
+    [COBALT_LIST]: [{ api: 'dead.example' }, { api: 'alive.example' }],
+    [PIPED_LIST]: [],
+  });
+  const { detect, probed } = prober({
+    'https://dead.example': { kind: 'cobalt', label: 'cobalt' },
+    'https://alive.example': { kind: 'cobalt', label: 'cobalt' },
+  });
+
+  // Both answer a probe; one is excluded because it failed a real download.
+  const found = await findInstance({ fetchImpl, detect, exclude: ['https://dead.example/'] });
+  assert.equal(found.endpoint, 'https://alive.example');
+  assert.ok(!probed.includes('https://dead.example'), 'and it was not even contacted again');
+});
+
+test('a failure about the helper is worth another instance', () => {
+  for (const message of [
+    'Could not reach the server.',
+    'The Piped instance did not answer for that video.',
+    'pipedapi.example does not let a web page read its files.',
+    'api.example answered 502.',
+    'This instance is rate-limiting you. Wait a bit.',
+    'The download from cdn.example kept breaking after 40%.',
+    'That instance answered 403.',
+  ]) {
+    assert.equal(looksUnreachable(message), true, message);
+  }
+});
+
+test('a failure about the video is not', () => {
+  // Switching would waste the person's time and someone else's bandwidth to
+  // arrive at exactly the same answer.
+  for (const message of [
+    'That video is private.',
+    'That video is unavailable.',
+    'That video is members-only.',
+    'That video is age-restricted.',
+    'yt-dlp does not recognise that link.',
+    'That link offered no formats.',
+  ]) {
+    assert.equal(looksUnreachable(message), false, message);
+  }
 });
