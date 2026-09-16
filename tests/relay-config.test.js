@@ -10,7 +10,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { through, evaluate, choose, candidates, cobaltCandidates, evaluateCobalt, chooseCobalt, PUBLIC_RELAYS, COBALT_DIRECTORY, COBALT_DIRECTORIES, USER_AGENT, ROBOTS, VIDEO_ID, WATCH } from '../scripts/relay-config.mjs';
+import { through, evaluate, choose, candidates, cobaltCandidates, evaluateCobalt, chooseCobalt, fromSource, sourceEntry, PUBLIC_RELAYS, COBALT_DIRECTORY, COBALT_DIRECTORIES, COBALT_SOURCE, USER_AGENT, ROBOTS, VIDEO_ID, WATCH } from '../scripts/relay-config.mjs';
 
 const STREAMS = { formatStreams: [{ url: '/videoplayback?itag=18', type: 'video/mp4' }] };
 
@@ -172,8 +172,9 @@ test('a directory answering a web page is named with its first bytes, so the rea
   const { fetchImpl } = cobaltWorld({ answers: {}, directory: '<html><body>moved</body></html>' });
   const lines = [];
   assert.equal(await chooseCobalt({ fetchImpl, say: (l) => lines.push(l) }), '');
-  assert.equal(lines.length, COBALT_DIRECTORIES.length);
+  assert.equal(lines.length, COBALT_DIRECTORIES.length + 1, 'each directory, then the source behind them');
   assert.match(lines[0], /nothing listed as up for YouTube — <html><body>moved/);
+  assert.match(lines.at(-1), /^no {3}source .*codeberg/);
 });
 
 test('an instance passes when it answers a tunnel for the sample link and the tunnel streams bytes', async () => {
@@ -208,6 +209,59 @@ test('the walk skips the keyed instance and takes the first that delivers', asyn
   assert.ok(lines[0].startsWith(`     directory ${COBALT_DIRECTORY}: 2 instance(s)`), lines[0]);
   assert.ok(lines[1].startsWith('no   https://keyed.example'));
   assert.ok(lines[2].startsWith('ok   https://open.example'));
+});
+
+test("a file of the source is read as JSON, or by its api line when it is not", () => {
+  assert.deepEqual(sourceEntry('{"api":"one.example","frontend":"one.example"}'), { api: 'one.example', frontend: 'one.example' });
+  assert.deepEqual(sourceEntry('# two\napi = "https://two.example"\nfrontend = "two.example"\n'), { api: 'https://two.example' });
+  assert.deepEqual(sourceEntry('api: api.three.example:9000\n'), { api: 'api.three.example:9000' });
+  assert.equal(sourceEntry('nothing of the kind'), null);
+  assert.equal(sourceEntry(''), null);
+});
+
+test('with both directories behind a challenge page, the source repository is read, file by file, and walked', async () => {
+  const challenge = '<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title></head></html>';
+  const files = [
+    { type: 'file', name: 'one.json', download_url: 'https://raw.example/one.json' },
+    { type: 'dir', name: 'ignored' },
+    { type: 'file', name: 'two.toml', download_url: 'https://raw.example/two.toml' },
+    { type: 'file', name: 'down.json', download_url: 'https://raw.example/down.json' },
+  ];
+  const asked = [];
+  const fetchImpl = async (url, init = {}) => {
+    asked.push(url);
+    if (COBALT_DIRECTORIES.includes(url)) return new Response(challenge, { status: 403, headers: { 'content-type': 'text/html' } });
+    if (url === COBALT_SOURCE) return new Response(JSON.stringify(files), { status: 200 });
+    if (url === 'https://raw.example/one.json') return new Response('{"api":"one.example","score":1}', { status: 200 });
+    if (url === 'https://raw.example/two.toml') return new Response('api = "two.example"\n', { status: 200 });
+    if (url === 'https://raw.example/down.json') return new Response('{"api":"down.example","online":false}', { status: 200 });
+    if (url.endsWith('/tunnel')) return new Response(new Uint8Array(64), { status: 200, headers: { 'content-type': 'video/mp4' } });
+    if (url === 'https://one.example/') return new Response(JSON.stringify({ status: 'error', error: { code: 'error.api.auth.key.missing' } }), { status: 401 });
+    if (url === 'https://two.example/') return new Response(JSON.stringify({ status: 'tunnel', url: 'https://two.example/tunnel' }), { status: 200 });
+    return new Response('{}', { status: 404 });
+  };
+  const lines = [];
+  assert.equal(await chooseCobalt({ fetchImpl, say: (l) => lines.push(l) }), 'https://two.example');
+  assert.match(lines[0], /^no {3}directory .*: HTTP 403 — <!DOCTYPE html>.*Just a moment/);
+  assert.match(lines[1], /^no {3}directory .*api\/tests: HTTP 403/);
+  assert.equal(lines[2], `     source ${COBALT_SOURCE}: 3 file(s), 2 instance(s) to ask`);
+  assert.ok(lines[3].startsWith('no   https://one.example'));
+  assert.ok(lines[4].startsWith('ok   https://two.example'));
+  assert.ok(!asked.includes('https://down.example/'), 'an instance that says it is down is not asked');
+});
+
+test('a source that lists files nothing reads is named with the first file, and is no instance', async () => {
+  const fetchImpl = async (url) => {
+    if (url === COBALT_SOURCE) return new Response(JSON.stringify([{ type: 'file', name: 'x.yml', download_url: 'https://raw.example/x.yml' }]), { status: 200 });
+    if (url === 'https://raw.example/x.yml') return new Response('frontend: only.example\n', { status: 200 });
+    return new Response('', { status: 404 });
+  };
+  const lines = [];
+  assert.deepEqual(await fromSource({ fetchImpl, say: (l) => lines.push(l) }), []);
+  assert.equal(lines[0], `     source ${COBALT_SOURCE}: 1 file(s), 0 instance(s) to ask — frontend: only.example`);
+  const unreachable = [];
+  assert.deepEqual(await fromSource({ fetchImpl: async () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } }); }, say: (l) => unreachable.push(l) }), []);
+  assert.equal(unreachable[0], `no   source ${COBALT_SOURCE}: ECONNRESET`);
 });
 
 test('a directory that cannot be read is no instance, not a crash', async () => {

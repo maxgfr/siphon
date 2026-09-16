@@ -139,6 +139,14 @@ export async function evaluate(relay, { fetchImpl = globalThis.fetch, instances 
  */
 export const COBALT_DIRECTORIES = [COBALT_DIRECTORY, 'https://cobalt.directory/api/tests'];
 export { COBALT_DIRECTORY };
+/**
+ * The directory's own source, behind it: the instances that asked to be
+ * listed, one file each under backend/instances in its repository on
+ * Codeberg. The site answers anything that is not a browser with a
+ * challenge page (measured: HTTP 403 "Just a moment..."); the repository
+ * answers plainly, and it is the same opt-in list the site tests.
+ */
+export const COBALT_SOURCE = 'https://codeberg.org/api/v1/repos/hyperdefined/cobalt.directory/contents/backend/instances';
 export const WATCH = `https://www.youtube.com/watch?v=${VIDEO_ID}`;
 /** Named, as the directory asks of anything that is not a browser. */
 export const USER_AGENT = 'siphon relay-config (+https://github.com/maxgfr/siphon)';
@@ -150,6 +158,54 @@ export function cobaltCandidates(body, { limit = 12 } = {}) {
     .map((e) => e.api)
     .filter((api, i, all) => all.indexOf(api) === i)
     .slice(0, limit);
+}
+
+/**
+ * One file of the source → something cobaltEntries can read: the JSON when
+ * it parses, otherwise the `api` line of whatever text format it is in.
+ */
+export function sourceEntry(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    /* not JSON: TOML, YAML, .env — the api line is enough */
+  }
+  const match = String(text || '').match(/\bapi(?:_url|Url)?\b["']?\s*[:=]\s*["']?((?:https?:\/\/)?[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?(?:\/[^\s"']*)?)/i);
+  return match ? { api: match[1] } : null;
+}
+
+/** The source repository's listing, then every file in it, read as entries. */
+export async function fromSource({ fetchImpl = globalThis.fetch, say = () => {}, source = COBALT_SOURCE, limit = 12, files = 40 } = {}) {
+  const ask = (url) => fetchImpl(url, { headers: { Accept: 'application/json', 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(20_000) });
+  let listing;
+  try {
+    const r = await ask(source);
+    const text = await r.text();
+    const peek = text.replace(/\s+/g, ' ').trim().slice(0, 160);
+    if (!r.ok) {
+      say(`no   source ${source}: HTTP ${r.status} — ${peek}`);
+      return [];
+    }
+    let body;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = null;
+    }
+    listing = (Array.isArray(body) ? body : []).filter((f) => f && f.type === 'file' && typeof f.download_url === 'string').slice(0, files);
+    if (listing.length === 0) {
+      say(`no   source ${source}: no files listed — ${peek}`);
+      return [];
+    }
+  } catch (error) {
+    say(`no   source ${source}: ${String(error?.cause?.code || error?.cause?.message || error?.message || error).slice(0, 80)}`);
+    return [];
+  }
+  const texts = await Promise.all(listing.map((f) => ask(f.download_url).then((r) => (r.ok ? r.text() : '')).catch(() => '')));
+  const candidates = cobaltCandidates(texts.map(sourceEntry).filter(Boolean), { limit });
+  const first = texts.find(Boolean) || '';
+  say(`     source ${source}: ${listing.length} file(s), ${candidates.length} instance(s) to ask${candidates.length ? '' : ` — ${first.replace(/\s+/g, ' ').trim().slice(0, 160)}`}`);
+  return candidates;
 }
 
 /** Ask one cobalt instance for the sample video, the way the app does. */
@@ -184,7 +240,7 @@ export async function evaluateCobalt(api, { fetchImpl = globalThis.fetch } = {})
 }
 
 /** The directory, then each instance until one delivers; say what every one said. */
-export async function chooseCobalt({ fetchImpl = globalThis.fetch, say = () => {}, limit = 12, directories = COBALT_DIRECTORIES } = {}) {
+export async function chooseCobalt({ fetchImpl = globalThis.fetch, say = () => {}, limit = 12, directories = COBALT_DIRECTORIES, source = COBALT_SOURCE } = {}) {
   let listed = [];
   for (const directory of directories) {
     // Each directory is named with what it said, so a log reads on its own:
@@ -199,7 +255,7 @@ export async function chooseCobalt({ fetchImpl = globalThis.fetch, say = () => {
       } catch {
         body = null;
       }
-      const peek = text.replace(/\s+/g, ' ').slice(0, 160);
+      const peek = text.replace(/\s+/g, ' ').trim().slice(0, 160);
       if (!r.ok) {
         say(`no   directory ${directory}: HTTP ${r.status} — ${peek}`);
         continue;
@@ -215,6 +271,8 @@ export async function chooseCobalt({ fetchImpl = globalThis.fetch, say = () => {
       say(`no   directory ${directory}: ${String(error?.cause?.code || error?.cause?.message || error?.message || error).slice(0, 80)}`);
     }
   }
+  // The directories shut, the list behind them: the source they are built from.
+  if (listed.length === 0 && source) listed = await fromSource({ fetchImpl, say, source, limit });
   for (const api of listed) {
     const report = await evaluateCobalt(api, { fetchImpl });
     say(`${report.ok ? 'ok  ' : 'no  '} ${api}\n       answer: ${report.answer}\n       media: ${report.media || '-'}`);
