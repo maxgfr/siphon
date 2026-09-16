@@ -930,7 +930,7 @@ export function invidiousResolver(base, { others = async () => [], spare = 3, ti
       }
       if (replicas.length > 0) {
         throw new BackendError(`Every Invidious instance tried refused that video (${replicas.length + 1} of them).`, {
-          hint: `Last answer: ${failure.message} YouTube blocks public instances in waves; try again later, or run your own server.`,
+          hint: `Last answer: ${failure.message} Most public instances now keep their video API closed to other apps; a relay or your own server is not refused.`,
         });
       }
       throw failure;
@@ -967,7 +967,7 @@ async function extractInvidious(id, url, context) {
     throw new BackendError(`The Invidious instance says: ${reason}`, {
       hint: ABOUT_THE_VIDEO.test(reason)
         ? 'That is about the video, and no instance will answer differently.'
-        : 'That is YouTube refusing the instance, not this app. Another instance, a relay, or your own server may not be refused.',
+        : 'That is the instance being refused or refusing, not this app. Another instance, a relay, or your own server may not be.',
       retryable: !ABOUT_THE_VIDEO.test(reason),
     });
   }

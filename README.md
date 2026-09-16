@@ -65,9 +65,12 @@ The directory is a hint; the probe is the truth. A list can be stale, a host
 can be down, an instance can be blocked by YouTube this week, and none of that
 is visible in a JSON file — so nothing is used until it has answered for
 itself, through the same detection a typed-in address goes through. Invidious
-ranks first: it is the plan for YouTube, and its API answers a page directly.
-cobalt reaches more sites, but its public instances mostly want a key or a
-Turnstile pass today; Piped's network has largely gone dark.
+ranks first among the public kinds because it is the only one with a real
+chance of answering a page at all; cobalt's public instances mostly want a key
+or a Turnstile pass today, and Piped's network has largely gone dark. Read
+**What was verified** before counting on any of them: the probe an instance
+answers is its stats endpoint, and the video endpoint behind it is closed on
+most public instances now.
 
 Two rules make this safe to do automatically, and they hold everywhere:
 whichever instance is chosen is **named on screen** the moment it is, and
@@ -209,15 +212,19 @@ those servers are run in public, and answer a page?** Read the same way:
 
 | project | public instances? | usable from a page? | here |
 |---|---|---|---|
-| [Invidious](https://github.com/iv-org/invidious) | yes — the project publishes [its own list](https://docs.invidious.io/instances/), dozens of them | yes: `/api/v1/*` sends CORS, and `local=true` proxies the media through the instance | **the plan**: bundled list, refreshed daily, walked until one delivers |
+| [Invidious](https://github.com/iv-org/invidious) | yes — the project publishes [its own list](https://docs.invidious.io/instances/) | **less and less.** The stats endpoint sends CORS everywhere; the *videos* endpoint a page needs is being closed to other apps: measured 2026-09-16, `inv.nadeko.net` answers `403 Endpoint disabled`, `yewtu.be` a nginx `403`, `invidious.nerdvpn.de` times out, `invidious.f5.si` answers a bare client but not a browser | bundled list, refreshed daily, walked in seconds — a chance, not a plan |
 | [Piped](https://github.com/TeamPiped/Piped) | a [list](https://piped-instances.kavin.rocks/), mostly dark since YouTube's 2024–25 blocks | yes, the same way | supported; ranked after Invidious |
 | [cobalt](https://github.com/imputnet/cobalt) | a [list](https://instances.cobalt.best/), but most now want an API key or a Turnstile pass | yes, when one lets you in | supported; asked for the finished file |
 | [Materialious](https://github.com/Materialious/Materialious), [Yattee](https://github.com/yattee/yattee), [Clipious](https://github.com/lamarios/clipious) | — | — | clients of Invidious's API: any instance that serves them serves this app |
 | [NewPipe](https://github.com/TeamNewPipe/NewPipe), [LibreTube](https://github.com/libre-tube/LibreTube), [FreeTube](https://github.com/FreeTubeApp/FreeTube) | — | no: native apps, the extractor runs in the app | — |
 | yt-dlp behind an HTTP API (dozens of small projects) | no public ones worth naming — a public yt-dlp box is abuse bait and dies fast | — | that is what `server/` is, for you to run |
 
-Invidious is the one network that is public, plural, and page-friendly, which
-is why it carries YouTube here by default. The transferable idea
+Invidious is the one network that is public and plural, and it *was*
+page-friendly, which is why the app still tries it first for YouTube. What the
+measurement says is that its operators are closing the video API to
+third-party clients to survive YouTube's blocking — so the walk is a chance
+worth a few seconds, and the dependable paths are the ones that are yours:
+the relay (a free Cloudflare Worker, one click), the bridge, or your server. The transferable idea
 is the last one, and its general form is not "run on youtube.com" but **run
 with a userscript manager's privileges**: a script granted `GM_xmlhttpRequest`
 with `@connect *` fetches any URL with no cross-origin rule at all, because the
@@ -671,15 +678,20 @@ and the instance never sees more than the video id. Their subtitle tracks come
 along, so **In the video** works with an instance too. cobalt is asked for the
 finished file instead, since that is the shape of its API.
 
-**One instance is not the plan; the network is.** YouTube rate-limits and
-bot-walls public instances in waves, so when the Invidious instance in use
-refuses a link in a way that is about *it* — "sign in to confirm you're not a
-bot", a 429, a 502, no streams — the next three from the bundled list are
-asked in turn, inside the same download. You see one row that works, not a
-failed row and a settings chore; the row names the instance that answered. A
-refusal about the video — private, removed, members-only — is final on every
-instance in the world and is not repeated. If the whole walk fails, the app
-switches instance for good (at most twice a session) and says so.
+**One instance is not the plan; the network is.** When the Invidious instance
+in use refuses a link in a way that is about *it* — a closed endpoint, a bot
+wall, a 429, a 502, no answer within fifteen seconds — the next three from the
+bundled list are asked in turn, inside the same download. You see one row
+that works, not a failed row and a settings chore; the row names the instance
+that answered. A refusal about the video — private, removed, members-only — is
+final on every instance in the world and is not repeated. If the whole walk
+fails, the app switches instance for good (at most twice a session) and says
+so — and the whole walk costs seconds, not minutes.
+
+Be clear-eyed about the odds, though. The measurement below found the video
+API closed on most public instances. The walk is cheap and it is tried, but
+YouTube from a page with nothing of yours running is not something to plan
+on any more; the relay is one click and costs nothing.
 
 It is worth being plain about what that means. Shared instances rate-limit,
 require captchas or API keys, and come and go, and **every link that reaches one
@@ -937,18 +949,42 @@ a fresh visitor to the Pages deploy takes — and its verdict names the instance
 that delivered the video to the browser mode, or every refusal if none did.
 That is the measurement for the plan as shipped, made on every pull request.
 
-The first such walk (2026-09-16) was instructive in a way a green would not
-have been: three public instances answered the runner with **nothing** — not
-a 403, not a 429, no response at all — and each silently ate the full probe
-and download budget before the next was tried. Two things changed because of
-it. Every call to an instance is now bounded to fifteen seconds, so a replica
-that swallows the connection costs fifteen seconds and the walk moves on,
-with the row naming who kept quiet. And the job now says *why*: a bare
-request to each instance from the runner before any browser opens, and the
-browser's own reason for a request that never completed. Whether those
-instances drop datacentre traffic on purpose or were simply down that hour is
-what the next walks will show; from a phone on a home connection they are
-not the same question at all.
+Three walks on 2026-09-16 told the whole story, each one sharper than the
+last. The first saw three public instances give the page **nothing** — no
+status, no answer — and each ate the full probe and download budget before
+the next was tried; every call to an instance is bounded to fifteen seconds
+since. The second added a bare request from the runner to each instance and
+found them **all up**: `HTTP 200` from `invidious.f5.si`, `inv.nadeko.net` and
+`yewtu.be` in under two seconds, while the browser's own requests to
+`/api/v1/videos/…` died in half a second with `net::ERR_FAILED` — an answer
+the browser refused, not a host that was down. The third asked each instance
+exactly what a page asks, with an `Origin` header, and printed the answer:
+
+```
+invidious.f5.si        stats   HTTP 200, cors="*"
+                       videos  HTTP 200 in 259ms, cors="*" — (empty body)
+inv.nadeko.net         stats   HTTP 200, cors="*"
+                       videos  HTTP 403 in 142ms, cors=NONE — Endpoint disabled
+yewtu.be               stats   HTTP 200, cors="*"
+                       videos  HTTP 403 in 55ms,  cors=NONE — 403 Forbidden (nginx)
+invidious.nerdvpn.de   stats   ETIMEDOUT
+```
+
+So it is neither YouTube nor a firewall: **the operators have closed the video
+endpoint** — one by config ("Endpoint disabled"), one at the reverse proxy,
+one to browsers specifically — to survive YouTube's blocking of instances
+that serve third-party clients. The probe that recognises an instance is its
+stats endpoint, which still answers everyone; the endpoint a download needs
+is a different door, and it is shut on most public instances now. The page's
+own request is a plain GET with `credentials: omit` and no custom header, so
+nothing on this side is what they are refusing.
+
+What follows from it: the walk stays, because it costs seconds and one
+instance in four still answered something; but YouTube from a page with
+nothing of yours running is no longer a plan, and the README says so wherever
+it used to say otherwise. The paths that are not refused are the ones that
+are yours — the relay (one click, free), the bridge, your own server — and
+they were built first for exactly this reason.
 
 **So this is not verified:** a completed YouTube download from the browser
 mode. The code is correct up to the wall, checked request by request, but no
