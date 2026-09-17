@@ -125,10 +125,23 @@ export class ServerBackend {
     return { name: 'tunnel', via: (url) => `${this.base}/api/tunnel?url=${encodeURIComponent(url)}`, headers };
   }
 
-  async start(url, preset, { playlist = false, subs = 'off', subLangs = 'en' } = {}) {
+  async start(url, preset, { playlist = false, subs = 'off', subLangs = 'en', ytdlp = {} } = {}) {
     const job = await this.#json('/api/jobs', {
       method: 'POST',
-      body: JSON.stringify({ url, preset, playlist, subs, sub_langs: subLangs }),
+      body: JSON.stringify({
+        url,
+        preset,
+        playlist,
+        subs,
+        sub_langs: subLangs,
+        // The Advanced section's asks, in the server's vocabulary. The server
+        // validates each one and refuses the job with the reason if one is off.
+        sponsorblock: ytdlp.sponsorblock === true,
+        clip_start: String(ytdlp.clipStart || ''),
+        clip_end: String(ytdlp.clipEnd || ''),
+        rate_limit: String(ytdlp.rateLimit || ''),
+        yt_client: String(ytdlp.client || ''),
+      }),
     });
     return { kind: 'job', id: job.id };
   }

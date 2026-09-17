@@ -30,7 +30,13 @@ const DEFAULT_SETTINGS = Object.freeze({
   // address is saying they would rather it did not, so clearing turns this off
   // and it stays off.
   autoInstance: true,
+  // Where ffmpeg.wasm is fetched from. Blank is the copy deployed beside the
+  // app, and there is no field for it: it is here for tests and for anyone
+  // who edits storage by hand.
   coreUrl: '',
+  // What the Advanced section asks yt-dlp for, per job. Applied by your own
+  // server; kept, greyed, with any other helper.
+  ytdlp: { sponsorblock: false, clipStart: '', clipEnd: '', rateLimit: '', client: '' },
   preset: 'video_best',
   subs: 'off',
   subLangs: 'en',
@@ -659,6 +665,7 @@ async function enqueueOne(url, { preset = settings.preset, playlist = false, tit
       playlist,
       subs: settings.subs,
       subLangs: settings.subLangs,
+      ytdlp: { ...DEFAULT_SETTINGS.ytdlp, ...(settings.ytdlp || {}) },
     });
     if (started.kind === 'direct') {
       // A public instance streams the file itself; there is no job to follow.
@@ -858,10 +865,38 @@ async function runProbe(url) {
 function openSettings() {
   $('endpoint').value = settings.endpoint;
   $('endpointKey').value = settings.key;
-  $('coreUrl').value = settings.coreUrl;
-  reflectHelper(settings.helper);
+  const options = { ...DEFAULT_SETTINGS.ytdlp, ...(settings.ytdlp || {}) };
+  $('optSponsor').checked = options.sponsorblock === true;
+  $('optClipStart').value = options.clipStart;
+  $('optClipEnd').value = options.clipEnd;
+  $('optRate').value = options.rateLimit;
+  $('optClient').value = options.client;
+  reflectHelper(settings.helper, hostOf(settings.endpoint));
   renderSuggested();
   $('settings').showModal();
+}
+
+/** The yt-dlp options from the sheet, as the settings keep them. */
+function readYtdlp() {
+  return {
+    sponsorblock: $('optSponsor').checked,
+    clipStart: $('optClipStart').value.trim(),
+    clipEnd: $('optClipEnd').value.trim(),
+    rateLimit: $('optRate').value.trim(),
+    client: $('optClient').value,
+  };
+}
+
+/**
+ * Say what the yt-dlp options apply to. They are your own server's — yt-dlp
+ * runs there — so with any other helper they wait, greyed but kept.
+ */
+function scopeYtdlp(helper) {
+  const yours = helper?.kind === 'siphon';
+  $('ytdlpBlock').classList.toggle('off', !yours);
+  $('ytdlpScope').textContent = yours
+    ? 'Applied by your server, which runs yt-dlp, to every download it makes.'
+    : 'These apply when the helper is your own siphon server, which runs yt-dlp. They are kept until then.';
 }
 
 /** How many instances to offer as chips; the rest are one "Find" away. */
@@ -891,14 +926,23 @@ async function renderSuggested() {
   }
 }
 
-/** Show, in the sheet, what a helper is and what follows from it. */
-function reflectHelper(helper) {
-  setStatus(helper.kind === 'none' ? '' : 'ok', describeEndpoint(helper));
+/**
+ * Show, in the sheet, what a helper is and what follows from it.
+ *
+ * The sentence names the address it is about. Two Invidious instances get
+ * the same description otherwise, and switching from one to the other then
+ * reads as the sheet not having noticed.
+ */
+function reflectHelper(helper, host = '') {
+  setStatus(helper.kind === 'none' ? '' : 'ok', named(host, describeEndpoint(helper)));
   // Only our own server has a cookie store to write to.
   $('cookiesBlock').hidden = helper.kind !== 'siphon';
   if (helper.kind === 'siphon') setCookieState(helper.hasCookies === true);
   showPhoneHint(helper.lanUrls || []);
+  scopeYtdlp(helper);
 }
+
+const named = (host, text) => (host ? `${host} — ${text}` : text);
 
 function setStatus(kind, text) {
   $('statusDot').className = `dot${kind ? ` ${kind}` : ''}`;
@@ -910,7 +954,7 @@ function draftSettings() {
     ...settings,
     endpoint: $('endpoint').value.trim().replace(/\/+$/, ''),
     key: $('endpointKey').value.trim(),
-    coreUrl: $('coreUrl').value.trim(),
+    ytdlp: readYtdlp(),
   };
 }
 
@@ -928,33 +972,38 @@ let probeSeq = 0;
 
 async function probeDraft() {
   const seq = ++probeSeq;
-  setStatus('', 'Checking…');
   const draft = draftSettings();
+  const host = draft.endpoint ? hostOf(draft.endpoint) : '';
+  setStatus('', host ? `Checking ${host}…` : 'Checking…');
   try {
     const helper = await detectEndpoint(draft.endpoint, draft.key);
     if (seq !== probeSeq) return null;
-    reflectHelper(helper);
+    reflectHelper(helper, host);
     // Recognising an instance is its stats endpoint answering, which every
     // public one still does. The endpoint a download needs is another door,
     // shut to pages on most of them now — so it is asked here, once, and the
     // answer is the sentence a person needs before they save the address.
     if (helper.kind === 'invidious' || helper.kind === 'piped') {
-      setStatus('', `${describeEndpoint(helper)} Checking that it answers this page for a video…`);
+      setStatus('', named(host, `${describeEndpoint(helper)} Checking that it answers this page for a video…`));
       const open = await servesPages(draft.endpoint, helper);
       if (seq !== probeSeq) return null;
       setStatus(
         open ? 'ok' : 'warn',
-        open
-          ? `${describeEndpoint(helper)} It answers this page for a video.`
-          : `${describeEndpoint(helper)} But it does not answer this page for a video: its video endpoint is closed to other apps, so YouTube links will fail through it. Try another instance, a relay, or your own server.`,
+        named(
+          host,
+          open
+            ? `${describeEndpoint(helper)} It answers this page for a video.`
+            : `${describeEndpoint(helper)} But it does not answer this page for a video: its video endpoint is closed to other apps, so YouTube links will fail through it. Try another instance, a relay, or your own server.`,
+        ),
       );
     }
     return helper;
   } catch (error) {
     if (seq !== probeSeq) return null;
-    setStatus('bad', error?.message || 'Could not reach it.');
+    setStatus('bad', named(host, error?.message || 'Could not reach it.'));
     $('cookiesBlock').hidden = true;
     showPhoneHint([]);
+    scopeYtdlp(null);
     return null;
   }
 }

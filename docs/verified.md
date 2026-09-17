@@ -5,10 +5,10 @@ still unproven.
 
 | suite | what it is | result |
 |---|---|---|
-| `pytest server/tests` | the server, including two against real yt-dlp on loopback, and the converter vendoring | 125 pass |
+| `pytest server/tests` | the server, including two against real yt-dlp on loopback, the per-job yt-dlp options, and the converter vendoring | 158 pass |
 | `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them | 171 pass |
 | `npm run test:e2e` | the device alone, real Chromium, two origins; a fake Invidious, a fake Piped and a fake cobalt each carrying a YouTube link; the bundled converter | 48 pass |
-| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips, an instance whose video endpoint is shut, the guide, the site's relay or cobalt instance | 57 pass |
+| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips, an instance whose video endpoint is shut, the yt-dlp options riding with a job, the guide, the site's relay or cobalt instance | 65 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
 | `npm run test:split` | a server that only resolves, a device that downloads | 24 pass |
 | `npm run test:youtube` | YouTube, for real, from the browser mode in CI — through the relay, Piped, and the bundled Invidious list | informative — see [youtube.md](youtube.md) |
@@ -105,8 +105,13 @@ three-mode version are migrated; the bundled list becomes chips and tapping
 one fills the address in and tests it; an unreachable address is refused with
 its reason and the sheet left open; **an Invidious instance whose video
 endpoint is shut is recognised and then said to be shut, with an amber light,
-before anyone saves it**; a siphon server is recognised from its address with
-the cookie jar appearing beside it; a first visit on a site whose owner set
+before anyone saves it**, and every status names the address it is about, so
+two instances never read the same; a siphon server is recognised from its
+address with the cookie jar appearing beside it; **the Advanced section's
+yt-dlp options** are live with a server set, greyed and kept with none, and
+what is typed there — SponsorBlock, a clip, a speed limit, a client — rides
+with the job the page posts, in the server's vocabulary, and survives a
+reload; a first visit on a site whose owner set
 `SIPHON_RELAY_URL` takes the relay with nothing to do, is told whose it is,
 and the header says "relay for YouTube"; a measured cobalt instance in
 `config.json` is adopted when there is no relay and named as public; the guide
