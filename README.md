@@ -204,9 +204,25 @@ the headers that resolve named, so it is a tunnel and not an open proxy.
 
 ### Configuration
 
-The app has three settings, all optional: the **helper** address, its
-**access key** if it wants one, and, under Advanced, where **ffmpeg.wasm** is
-fetched from (blank means the copy deployed beside the app).
+The app has two settings, both optional: the **helper** address and its
+**access key** if it wants one. **Test** names the address and says what it
+is, and for an Invidious or Piped instance whether it answers this page for
+a video, before you save. Under **Advanced** are yt-dlp's options, applied by
+your own server to every download it makes (with any other helper they are
+kept, greyed, until one is set):
+
+| option | what it does |
+|---|---|
+| **Remove sponsor segments** | cuts sponsors, self-promotion and "like and subscribe" out of YouTube videos, from the community's [SponsorBlock](https://sponsor.ajay.app) data |
+| **Clip** | only the part between two times, as `1:23` or `01:02:03`; only that span is fetched, cut on keyframes |
+| **Speed limit** | bytes per second, as `500K` or `2M` |
+| **YouTube client** | which of YouTube's clients to try first; the ladder still follows |
+| **YouTube sign-in** | your `cookies.txt`, stored on the server owner-only — step 2 of *Making YouTube work* above |
+
+Each value is narrowed by the server before it reaches yt-dlp — a number, a
+name off a list — so the API is a short vocabulary, not a way to pass
+arbitrary options. ffmpeg.wasm needs no setting: the converter is deployed
+beside the app.
 
 The server takes environment variables:
 
@@ -334,10 +350,10 @@ pip install -r server/requirements.txt pytest httpx       # yt-dlp[default] carr
 # and a JavaScript runtime beside it — Deno — which yt-dlp needs for YouTube since late 2025;
 # the Docker image ships one, and the settings sheet says when a server has none.
 WEB_DIR=web uvicorn server.app:app --reload --port 8000   # the server
-pytest server/tests -q                                    # 125
+pytest server/tests -q                                    # 158
 npm test                                                  # 171 — the extractor, detection, the measurements
 npm run test:e2e        # the device, a fake Invidious, Piped and cobalt — 48; needs playwright, ffmpeg
-npm run test:deployed   # the app as a static deploy over HTTPS — 57; needs playwright, openssl
+npm run test:deployed   # the app as a static deploy over HTTPS — 65; needs playwright, openssl
 npm run test:bridge     # the userscript against a host that refuses — 8
 npm run test:split      # a server that only resolves, a device that downloads — 24
 npm run test:innertube  # what YouTube says to a bare request from this machine

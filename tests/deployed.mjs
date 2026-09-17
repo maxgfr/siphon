@@ -79,6 +79,8 @@ let root = WEB;
 let hasApi = false;
 /** Files answered with test content instead of what is on disk, by path. */
 const overrides = new Map();
+/** Every job body the page posted to the stub server. */
+const posted = [];
 
 const server = createServer(
   { key: readFileSync(join(WORK, 'key.pem')), cert: readFileSync(join(WORK, 'cert.pem')) },
@@ -123,6 +125,22 @@ const server = createServer(
     if (path === '/relay' || path.startsWith('/relay/')) {
       if (!url.searchParams.get('url')) return response.writeHead(400, { 'Content-Type': 'application/json' }).end('{"error":"no url parameter"}');
       return response.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' }).end('User-agent: *\nDisallow: /comment\n');
+    }
+
+    // A job, as the page posts one: the body is kept for the checks, and the
+    // job then fails at once — there is no yt-dlp here, only the wiring.
+    if (path === '/api/jobs' && request.method === 'POST') {
+      let raw = '';
+      request.on('data', (chunk) => { raw += chunk; });
+      request.on('end', () => {
+        try { posted.push(JSON.parse(raw)); } catch { posted.push({ raw }); }
+        response.writeHead(200, { 'Content-Type': 'application/json' }).end('{"id":"stub1","state":"queued","stage":"starting","progress":0}');
+      });
+      return undefined;
+    }
+    if (path === '/api/jobs/stub1') {
+      return response.writeHead(200, { 'Content-Type': 'application/json' })
+        .end('{"id":"stub1","state":"error","stage":"failed","progress":0,"error":"a stub server, with no yt-dlp behind it"}');
     }
 
     // The one endpoint that tells a container apart from a static host.
@@ -343,6 +361,7 @@ for (const [old, expected] of [
   const closed = (await page.textContent('#statusText')) || '';
   check('an Invidious instance is recognised, and its shut video endpoint named before saving',
     /An Invidious instance/.test(closed) && /does not answer this page for a video/.test(closed), closed.slice(0, 120));
+  check('naming the instance, so two of them never read the same', closed.startsWith('127.0.0.1:8443 — '), closed.slice(0, 40));
   check('with an amber light, not a green one', (await page.evaluate(() => document.getElementById('statusDot').className)) === 'dot warn');
 
   // The real one: this very host answers /api/health, so it is a siphon server.
@@ -367,6 +386,55 @@ for (const [old, expected] of [
     helper: JSON.parse(localStorage.getItem('siphon:settings') || '{}').helper?.kind,
   }));
   check('the address and what it is survive a reload', kept.endpoint === BASE && kept.helper === 'siphon', JSON.stringify(kept));
+  check('the status names the address it describes', ((await page.textContent('#statusText')) || '').startsWith('127.0.0.1:8443 — '), (await page.textContent('#statusText')) || '');
+
+  // The Advanced section: yt-dlp's options, applied by your own server. With
+  // one set they are live; what is typed rides with every job the page posts.
+  await page.click('#advanced summary');
+  await page.waitForTimeout(200);
+  check('there is no converter field to configure: the converter ships beside the app', (await page.locator('#coreUrl').count()) === 0);
+  check('with your own server set, the yt-dlp options are live', !(await page.evaluate(() => document.getElementById('ytdlpBlock').classList.contains('off'))) && /Applied by your server/.test((await page.textContent('#ytdlpScope')) || ''),
+    ((await page.textContent('#ytdlpScope')) || '').slice(0, 60));
+  await page.check('#optSponsor');
+  await page.fill('#optClipStart', '0:10');
+  await page.fill('#optClipEnd', '1:00');
+  await page.fill('#optRate', '2M');
+  await page.selectOption('#optClient', 'tv');
+  await page.click('#saveSettings');
+  await page.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 15_000 });
+  posted.length = 0;
+  await page.fill('#url', 'https://example.com/a-video');
+  await page.click('#go');
+  await page.waitForFunction(() => document.querySelector('#queueList li'), null, { timeout: 15_000 });
+  await page.waitForTimeout(1500);
+  const body = posted[0] || {};
+  check('the options ride with every job, in the server\'s vocabulary',
+    body.sponsorblock === true && body.clip_start === '0:10' && body.clip_end === '1:00' && body.rate_limit === '2M' && body.yt_client === 'tv' && body.url === 'https://example.com/a-video',
+    JSON.stringify(body).slice(0, 160));
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForTimeout(1200);
+  await page.click('#openSettings');
+  await page.waitForTimeout(300);
+  const back = await page.evaluate(() => ({
+    sponsor: document.getElementById('optSponsor').checked,
+    clip: `${document.getElementById('optClipStart').value}-${document.getElementById('optClipEnd').value}`,
+    rate: document.getElementById('optRate').value,
+    client: document.getElementById('optClient').value,
+  }));
+  check('and survive a reload', back.sponsor && back.clip === '0:10-1:00' && back.rate === '2M' && back.client === 'tv', JSON.stringify(back));
+
+  // With no helper the options wait, greyed but kept, and say for whom.
+  await page.fill('#endpoint', '');
+  await setApi(false);
+  await page.click('#testConnection');
+  await page.waitForTimeout(800);
+  check('with no server set they are greyed, and say what they wait for', (await page.evaluate(() => document.getElementById('ytdlpBlock').classList.contains('off'))) && /your own siphon server/.test((await page.textContent('#ytdlpScope')) || ''),
+    ((await page.textContent('#ytdlpScope')) || '').slice(0, 70));
+  check('but not lost', (await page.inputValue('#optRate')) === '2M');
+  await setApi(true);
+  await page.fill('#endpoint', BASE);
+  await page.click('#testConnection');
+  await page.waitForTimeout(1200);
 
   // Phone width is what this app is for; the sheet must not scroll sideways.
   const overflow = await page.evaluate(() => {

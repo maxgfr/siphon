@@ -1034,3 +1034,102 @@ def test_yt_dlp_is_quiet_unless_asked_to_speak(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(server_app, "YTDLP_VERBOSE", True)
     loud = server_app.build_options(job, None)
     assert loud["quiet"] is False and loud["verbose"] is True and loud["no_warnings"] is False
+
+
+# ------------------------------------------------------- per-job options
+
+
+class TestJobOptions:
+    """
+    What the page's Advanced section may ask yt-dlp for. Every value is
+    narrowed before it reaches yt-dlp — a float, an int, a name off a list —
+    so this is a vocabulary, never a passthrough.
+    """
+
+    @staticmethod
+    def _job(**kwargs) -> "server_app.Job":
+        return server_app.Job(id="o1", url="https://www.youtube.com/watch?v=abc", preset="video_720", **kwargs)
+
+    @pytest.mark.parametrize(
+        ("text", "seconds"),
+        [("", None), ("45", 45.0), ("1:23", 83.0), ("01:02:03", 3723.0), ("1:02:03.5", 3723.5), ("90:00", 5400.0), ("0:00", 0.0)],
+    )
+    def test_timestamps_are_read_as_a_clock(self, text: str, seconds: float | None) -> None:
+        assert server_app.parse_timestamp(text) == seconds
+
+    @pytest.mark.parametrize("text", ["abc", "1:99", "1:60:00", "1:2:3:4", "-5", "1h"])
+    def test_a_non_time_is_refused_with_the_shape_to_use(self, text: str) -> None:
+        with pytest.raises(ValueError, match="1:23"):
+            server_app.parse_timestamp(text)
+
+    @pytest.mark.parametrize(
+        ("text", "limit"),
+        [("", None), ("500K", 512000), ("2M", 2 * 1024**2), ("1.5m/s", int(1.5 * 1024**2)), ("300 KiB", 300 * 1024), ("4096", 4096)],
+    )
+    def test_speed_limits_are_read_with_their_unit(self, text: str, limit: int | None) -> None:
+        assert server_app.parse_rate_limit(text) == limit
+
+    @pytest.mark.parametrize("text", ["fast", "0", "-1M", "2T"])
+    def test_a_non_limit_is_refused(self, text: str) -> None:
+        with pytest.raises(ValueError, match="500K"):
+            server_app.parse_rate_limit(text)
+
+    def test_a_client_is_one_off_the_list(self) -> None:
+        assert server_app.check_yt_client("TV") == "tv"
+        assert server_app.check_yt_client("") == ""
+        with pytest.raises(ValueError, match="Unknown YouTube client"):
+            server_app.check_yt_client("netscape")
+
+    def test_sponsorblock_cuts_before_anything_else_touches_the_file(self) -> None:
+        pps = server_app.build_options(self._job(sponsorblock=True), None)["postprocessors"]
+        assert [pp["key"] for pp in pps[:2]] == ["SponsorBlock", "ModifyChapters"]
+        assert pps[0]["when"] == "after_filter"
+        assert pps[0]["categories"] == pps[1]["remove_sponsor_segments"] == server_app.SPONSOR_CATEGORIES
+        # The preset's own steps still follow.
+        assert any(pp["key"] == "FFmpegMetadata" for pp in pps[2:])
+        assert "SponsorBlock" not in [pp["key"] for pp in server_app.build_options(self._job(), None)["postprocessors"]]
+
+    def test_a_clip_fetches_only_its_span_and_cuts_on_keyframes(self) -> None:
+        options = server_app.build_options(self._job(clip_start=83.0, clip_end=100.0), None)
+        assert options["force_keyframes_at_cuts"] is True
+        spans = list(options["download_ranges"]({"id": "abc", "duration": 300}, None))
+        assert spans == [{"start_time": 83.0, "end_time": 100.0}]
+        # An open end runs to the end of the video.
+        open_end = server_app.build_options(self._job(clip_start=83.0), None)
+        assert list(open_end["download_ranges"]({"id": "abc"}, None))[0]["end_time"] == float("inf")
+        assert "download_ranges" not in server_app.build_options(self._job(), None)
+
+    def test_a_speed_limit_is_handed_to_yt_dlp_in_bytes(self) -> None:
+        assert server_app.build_options(self._job(rate_limit=512000), None)["ratelimit"] == 512000
+        assert "ratelimit" not in server_app.build_options(self._job(), None)
+
+    def test_the_client_asked_for_goes_first_and_the_ladder_still_follows(self) -> None:
+        assert server_app.player_client_chain(False, "android_vr") == ["android_vr", None, "tv", "web_safari"]
+        assert server_app.player_client_chain(True, "tv") == ["tv", None, "web_safari", "mweb"]
+        assert server_app.player_client_chain(False, "") == [None, "tv", "web_safari", "android_vr"]
+
+    @pytest.mark.parametrize(
+        ("body", "detail"),
+        [
+            ({"clip_start": "1:99"}, "1:23"),
+            ({"clip_start": "2:00", "clip_end": "1:00"}, "end after it starts"),
+            ({"rate_limit": "fast"}, "500K"),
+            ({"yt_client": "netscape"}, "Unknown YouTube client"),
+        ],
+    )
+    def test_the_api_refuses_a_bad_option_with_the_reason(self, client: TestClient, monkeypatch: pytest.MonkeyPatch, body: dict, detail: str) -> None:
+        _public_dns(monkeypatch)
+        response = client.post("/api/jobs", json={"url": "https://www.youtube.com/watch?v=abc", **body})
+        assert response.status_code == 400
+        assert detail in response.json()["detail"]
+
+    def test_the_api_stores_the_options_on_the_job(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        _public_dns(monkeypatch)
+        monkeypatch.setattr(server_app.threading, "Thread", lambda *a, **k: type("T", (), {"start": lambda self: None})())
+        response = client.post(
+            "/api/jobs",
+            json={"url": "https://www.youtube.com/watch?v=abc", "sponsorblock": True, "clip_start": "0:10", "clip_end": "1:00", "rate_limit": "2M", "yt_client": "TV"},
+        )
+        assert response.status_code == 200
+        job = server_app.JOBS[response.json()["id"]]
+        assert (job.sponsorblock, job.clip_start, job.clip_end, job.rate_limit, job.yt_client) == (True, 10.0, 60.0, 2 * 1024**2, "tv")

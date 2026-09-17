@@ -210,7 +210,7 @@ def is_bot_wall(message: str) -> bool:
     return any(marker in lowered for marker in BOT_WALL_MARKERS)
 
 
-def player_client_chain(has_cookies: bool) -> list[str | None]:
+def player_client_chain(has_cookies: bool, first: str = "") -> list[str | None]:
     """
     Which YouTube clients to try, in order. None means "yt-dlp's own default",
     which tracks upstream and is right far more often than anything pinned here.
@@ -224,9 +224,72 @@ def player_client_chain(has_cookies: bool) -> list[str | None]:
     when cookies are present it is left out and the web/mobile clients, which do
     use the session, are tried instead.
     """
-    if has_cookies:
-        return [None, "web_safari", "mweb"]
-    return [None, "tv", "web_safari", "android_vr"]
+    chain: list[str | None] = [None, "web_safari", "mweb"] if has_cookies else [None, "tv", "web_safari", "android_vr"]
+    # A client the person asked for goes first; the ladder still follows it,
+    # because a wall on that one is no reason to give up on the others.
+    if first:
+        chain = [first, *(client for client in chain if client != first)]
+    return chain
+
+
+# ------------------------------------------------------- per-job options
+
+# What a page may ask yt-dlp for, per download: a short vocabulary rather than
+# a passthrough, since an arbitrary option would be a way to run anything.
+
+# YouTube clients a person may put first in the ladder.
+YT_CLIENTS = frozenset({"tv", "web_safari", "android_vr", "mweb", "web", "ios", "tv_embedded"})
+
+# The SponsorBlock categories worth cutting out unasked: the segments the
+# community marks as skippable in every player. Chapters and highlights stay.
+SPONSOR_CATEGORIES = ["sponsor", "selfpromo", "interaction"]
+
+_TIMESTAMP = re.compile(r"^(?:(\d{1,3}):)?(?:(\d{1,2}):)?(\d{1,2}(?:\.\d{1,3})?)$")
+_RATE = re.compile(r"^(\d+(?:\.\d+)?)\s*([kmg]?)(?:i?b)?(?:/s)?$", re.I)
+
+
+def parse_timestamp(text: str) -> float | None:
+    """'1:23' → 83.0; '01:02:03.5' → 3723.5; '' → None; anything else raises."""
+    value = (text or "").strip()
+    if not value:
+        return None
+    match = _TIMESTAMP.match(value)
+    if not match:
+        raise ValueError("Clip times look like 1:23 or 01:02:03.")
+    hours, minutes, seconds = match.groups()
+    # Two prefixes mean h:m:s; one means m:s — the regex puts a lone prefix in
+    # the first group, so move it over.
+    if hours is not None and minutes is None:
+        hours, minutes = None, hours
+    # Past the first colon the parts are clock digits: 1:99 is not a time.
+    if minutes is not None and float(seconds) >= 60:
+        raise ValueError("Clip times look like 1:23 or 01:02:03.")
+    if hours is not None and int(minutes) >= 60:
+        raise ValueError("Clip times look like 1:23 or 01:02:03.")
+    return float(seconds) + 60 * int(minutes or 0) + 3600 * int(hours or 0)
+
+
+def parse_rate_limit(text: str) -> int | None:
+    """'500K' → 512000 bytes per second; '2M', '1.5m', '300k/s'; '' → None; junk raises."""
+    value = (text or "").strip()
+    if not value:
+        return None
+    match = _RATE.match(value)
+    if not match:
+        raise ValueError("A speed limit looks like 500K or 2M.")
+    number, unit = match.groups()
+    scale = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3}[unit.lower()]
+    limit = int(float(number) * scale)
+    if limit <= 0:
+        raise ValueError("A speed limit looks like 500K or 2M.")
+    return limit
+
+
+def check_yt_client(text: str) -> str:
+    value = (text or "").strip().lower()
+    if value and value not in YT_CLIENTS:
+        raise ValueError(f"Unknown YouTube client. One of: {', '.join(sorted(YT_CLIENTS))}.")
+    return value
 
 
 def extractor_args(client: str | None) -> dict[str, Any]:
@@ -325,6 +388,12 @@ class Job:
     items_total: int = 0
     subs: str = "off"
     sub_langs: str = "en"
+    # Per-job yt-dlp options, already validated: see JobRequest.
+    sponsorblock: bool = False
+    clip_start: float | None = None
+    clip_end: float | None = None
+    rate_limit: int | None = None
+    yt_client: str = ""
 
     @property
     def directory(self) -> Path:
@@ -475,6 +544,23 @@ def build_options(job: Job, client: str | None) -> dict[str, Any]:
         options["ignoreerrors"] = True
     if have_cookies():
         options["cookiefile"] = str(COOKIES_PATH)
+    if job.sponsorblock:
+        # The community's segment list is fetched after the video is chosen,
+        # and the cuts are made before anything else touches the file.
+        options["postprocessors"] = [
+            {"key": "SponsorBlock", "categories": SPONSOR_CATEGORIES, "when": "after_filter"},
+            {"key": "ModifyChapters", "remove_sponsor_segments": SPONSOR_CATEGORIES, "force_keyframes": False},
+            *options.get("postprocessors", []),
+        ]
+    if job.clip_start is not None or job.clip_end is not None:
+        # Only the span asked for is fetched, and it is cut on keyframes so the
+        # first second is not a smear of grey.
+        options["download_ranges"] = yt_dlp.utils.download_range_func(
+            None, [(job.clip_start or 0.0, job.clip_end if job.clip_end is not None else float("inf"))]
+        )
+        options["force_keyframes_at_cuts"] = True
+    if job.rate_limit:
+        options["ratelimit"] = job.rate_limit
     args = extractor_args(client)
     if args:
         options["extractor_args"] = args
@@ -493,7 +579,7 @@ def run_job(job: Job) -> None:
     """
     with RUNNING:
         job.state = "running"
-        attempts = player_client_chain(have_cookies()) if is_youtube(job.url) else [None]
+        attempts = player_client_chain(have_cookies(), job.yt_client) if is_youtube(job.url) else [None]
         last_error: Exception | None = None
 
         for index, client in enumerate(attempts):
@@ -617,6 +703,14 @@ class JobRequest(BaseModel):
     playlist: bool = False
     subs: str = "off"  # off | embed | files
     sub_langs: str = Field(default="en", max_length=200)
+    # yt-dlp options, as the page's Advanced section offers them. Each is
+    # parsed into something narrow (a float, an int, a name off a list) before
+    # it reaches yt-dlp; a page cannot smuggle an option through here.
+    sponsorblock: bool = False
+    clip_start: str = Field(default="", max_length=20)
+    clip_end: str = Field(default="", max_length=20)
+    rate_limit: str = Field(default="", max_length=20)
+    yt_client: str = Field(default="", max_length=32)
 
 
 class ProbeRequest(BaseModel):
@@ -879,6 +973,15 @@ async def create_job(body: JobRequest, authorization: str | None = Header(defaul
     if body.preset not in PRESETS:
         raise HTTPException(status_code=400, detail=f"Unknown preset: {body.preset}")
     url = assert_fetchable(body.url)
+    try:
+        clip_start = parse_timestamp(body.clip_start)
+        clip_end = parse_timestamp(body.clip_end)
+        rate_limit = parse_rate_limit(body.rate_limit)
+        yt_client = check_yt_client(body.yt_client)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if clip_start is not None and clip_end is not None and clip_end <= clip_start:
+        raise HTTPException(status_code=400, detail="The clip has to end after it starts.")
 
     with JOBS_LOCK:
         active = sum(1 for job in JOBS.values() if job.state in ("queued", "running"))
@@ -891,6 +994,11 @@ async def create_job(body: JobRequest, authorization: str | None = Header(defaul
             is_playlist=body.playlist,
             subs=body.subs if body.subs in ("off", "embed", "files") else "off",
             sub_langs=body.sub_langs.strip() or "en",
+            sponsorblock=body.sponsorblock,
+            clip_start=clip_start,
+            clip_end=clip_end,
+            rate_limit=rate_limit,
+            yt_client=yt_client,
         )
         JOBS[job.id] = job
 

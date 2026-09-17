@@ -763,3 +763,8 @@ footer.legal p { margin: 0 0 7px; }
 li.q-error { border-color: var(--danger); background: var(--danger-wash); }
 li.q-error .q-msg { color: var(--danger); }
 .q-msg { font-size: 12px; line-height: 1.45; margin-top: 6px; color: var(--ink-2); }
+
+/* The yt-dlp options apply to your own server; with any other helper they
+   wait, greyed but kept, rather than vanish. */
+#ytdlpBlock.off { opacity: 0.45; pointer-events: none; }
+#ytdlpBlock select { width: 100%; padding: 10px 12px; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--surface-2); color: var(--ink); font: inherit; }

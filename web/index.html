@@ -197,43 +197,72 @@
     <label class="lbl" for="endpointKey">Access key <span style="font-weight:400;color:var(--muted)">— if the helper asks for one</span></label>
     <input type="password" id="endpointKey" autocomplete="off" placeholder="Optional" />
 
-    <div id="cookiesBlock" hidden>
-      <label class="lbl">YouTube sign-in <span id="cookiesState" style="font-weight:400;color:var(--muted)"></span></label>
-      <p class="hint">
-        YouTube turns anonymous downloads away with <em>"Sign in to confirm you're not a bot"</em>.
-        Your server already retries with several of YouTube's own clients, and that clears most of it.
-        When it does not, your own session does — export <code>cookies.txt</code> with a
-        Netscape-format cookie extension and upload it here.
-      </p>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
-        <label class="chip-btn" for="cookiesFile" style="display:grid;place-items:center">
-          Upload cookies.txt
-          <input type="file" id="cookiesFile" accept=".txt,text/plain" hidden />
-        </label>
-        <button type="button" class="chip-btn" id="cookiesClear" hidden>Remove</button>
-      </div>
-      <p class="hint" id="cookiesResult" style="margin-top:8px"></p>
-      <p class="hint">
-        <strong>This is a logged-in session.</strong> Only upload it to a server you control, and
-        use a throwaway account if you would rather not hand over your main one.
-      </p>
-    </div>
-
     <div id="phoneHint" hidden>
       <label class="lbl">On your phone</label>
       <p class="hint" id="phoneHintBody"></p>
     </div>
 
-    <details style="margin-top:14px">
-      <summary class="lbl" style="cursor:pointer">Advanced</summary>
-      <label class="lbl" for="coreUrl">Converter <span style="font-weight:400;color:var(--muted)">— optional</span></label>
-      <input type="url" id="coreUrl" inputmode="url" autocapitalize="off" autocorrect="off"
-             spellcheck="false" placeholder="ffmpeg-core.js from a CDN" />
-      <p class="hint">
-        ffmpeg.wasm is deployed beside this app and fetched from there the first time a download
-        needs converting on this device — about 32 MB, cached afterwards. Nothing to set. This is
-        only for pointing at a different build.
-      </p>
+    <details style="margin-top:14px" id="advanced">
+      <summary class="lbl" style="cursor:pointer">Advanced — yt-dlp options</summary>
+      <p class="hint" id="ytdlpScope"></p>
+      <div id="ytdlpBlock">
+        <label class="lbl" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="optSponsor" /> Remove sponsor segments
+        </label>
+        <p class="hint">
+          Sponsors, self-promotion and "like and subscribe" are cut out of YouTube videos, from
+          the community's <a href="https://sponsor.ajay.app" target="_blank" rel="noopener">SponsorBlock</a> data.
+        </p>
+
+        <label class="lbl" for="optClipStart">Clip <span style="font-weight:400;color:var(--muted)">— only this part</span></label>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="optClipStart" inputmode="numeric" spellcheck="false" placeholder="from 0:00" />
+          <input type="text" id="optClipEnd" inputmode="numeric" spellcheck="false" placeholder="to 1:30" />
+        </div>
+        <p class="hint">As <code>1:23</code> or <code>01:02:03</code>. Leave both empty for the whole video.</p>
+
+        <label class="lbl" for="optRate">Speed limit <span style="font-weight:400;color:var(--muted)">— optional</span></label>
+        <input type="text" id="optRate" inputmode="text" spellcheck="false" autocapitalize="off" placeholder="e.g. 2M" />
+        <p class="hint">Bytes per second, as <code>500K</code> or <code>2M</code>, so a download does not eat the connection.</p>
+
+        <label class="lbl" for="optClient">YouTube client</label>
+        <select id="optClient">
+          <option value="">yt-dlp's own choice, then the ladder</option>
+          <option value="tv">tv</option>
+          <option value="web_safari">web_safari</option>
+          <option value="android_vr">android_vr</option>
+          <option value="mweb">mweb</option>
+          <option value="web">web</option>
+          <option value="ios">ios</option>
+          <option value="tv_embedded">tv_embedded</option>
+        </select>
+        <p class="hint">
+          Which of YouTube's clients to try first. The others still follow when it is turned away.
+        </p>
+      </div>
+
+      <div id="cookiesBlock" hidden>
+        <label class="lbl">YouTube sign-in <span id="cookiesState" style="font-weight:400;color:var(--muted)"></span></label>
+        <p class="hint">
+          YouTube turns anonymous downloads away with <em>"Sign in to confirm you're not a bot"</em>.
+          Your server already retries with several of YouTube's own clients, and that clears most of it.
+          When it does not, your own session does — export <code>cookies.txt</code> with a
+          Netscape-format cookie extension and upload it here.
+        </p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+          <label class="chip-btn" for="cookiesFile" style="display:grid;place-items:center">
+            Upload cookies.txt
+            <input type="file" id="cookiesFile" accept=".txt,text/plain" hidden />
+          </label>
+          <button type="button" class="chip-btn" id="cookiesClear" hidden>Remove</button>
+        </div>
+        <p class="hint" id="cookiesResult" style="margin-top:8px"></p>
+        <p class="hint">
+          <strong>This is a logged-in session.</strong> Only upload it to a server you control, and
+          use a throwaway account if you would rather not hand over your main one.
+        </p>
+      </div>
+
       <p class="hint">
         <strong>The bridge.</strong> A userscript that lets this page fetch anything, with no
         server anywhere — see <code>bridge/</code> in the project. Once installed it is used
