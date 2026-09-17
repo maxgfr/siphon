@@ -467,6 +467,39 @@ if (PIPED) {
   }
 }
 
+/*
+ * The measured ones: what the daily refresh saw answer a page, of every
+ * kind — the chips a visitor is offered. Each is tried as a visitor would
+ * take it; the verdict names the one that delivered, or every refusal.
+ */
+{
+  const open = (() => {
+    try {
+      return JSON.parse(readFileSync(join(WEB, 'instances.json'), 'utf8')).open || [];
+    } catch {
+      return [];
+    }
+  })();
+  if (open.length === 0) {
+    say('\nmeasured instances: none in web/instances.json, so no chips are offered, skipped');
+  } else {
+    say(`\nmeasured instances: ${open.length} in web/instances.json (the chips)`);
+    let delivered = null;
+    const refusals = [];
+    for (const entry of open) {
+      const r = await attempt('video_480', { [entry.kind]: entry.url });
+      if (r.saved && /Video: (h264|vp9|av1)/.test(inspect(r.saved))) {
+        delivered = entry;
+        break;
+      }
+      refusals.push(`${entry.kind} ${new URL(entry.url).host}: ${r.error || 'a file, but not video'}`);
+    }
+    for (const line of refusals) say(`   ${line.slice(0, 200)}`);
+    if (delivered) verdict(true, `measured: video_480 produced real video through ${delivered.kind} ${new URL(delivered.url).host}`);
+    else verdict(false, `measured: none of ${open.length} chip(s) delivered the video`, refusals[0] || '');
+  }
+}
+
 /* The site's default: the relay the relay-config workflow found, if any. */
 if (SITE.relay) {
   say(`\nsite relay: ${SITE.relay} (${SITE.relayKind || '?'}, instance ${SITE.instance || '-'})`);

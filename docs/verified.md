@@ -6,9 +6,9 @@ still unproven.
 | suite | what it is | result |
 |---|---|---|
 | `pytest server/tests` | the server, including two against real yt-dlp on loopback, the per-job yt-dlp options, and the converter vendoring | 158 pass |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them | 171 pass |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh and the daily measurement of which instances answer a page, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them | 179 pass |
 | `npm run test:e2e` | the device alone, real Chromium, two origins; a fake Invidious, a fake Piped and a fake cobalt each carrying a YouTube link; the bundled converter | 48 pass |
-| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips, an instance whose video endpoint is shut, the yt-dlp options riding with a job, the guide, the site's relay or cobalt instance | 65 pass |
+| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips from the measured list and none when it is empty, an instance whose video endpoint is shut, the yt-dlp options riding with a job, the guide, the site's relay or cobalt instance | 68 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
 | `npm run test:split` | a server that only resolves, a device that downloads | 24 pass |
 | `npm run test:youtube` | YouTube, for real, from the browser mode in CI — through the relay, Piped, and the bundled Invidious list | informative — see [youtube.md](youtube.md) |
@@ -43,7 +43,13 @@ bot-walled instance leads to the next ones and the answer names the one that
 delivered, a private video stops at the first, the walk is capped, and the
 error after a full walk says how many were tried. The refresh script is
 covered against a fixture of the API's pairs and one of the docs page's
-markup.
+markup, Piped's directory and its seed; and its measurement against a fake
+internet of instances — one open, one refusing the video endpoint, one
+answering it without the cross-origin header, one whose proxy will not
+stream, a keyed cobalt — with each verdict said and only the open ones
+kept, with their kind. The measured list is probed first by the search, and
+the file beside the app is read whole: the lists, the measured ones of a
+usable kind, the date.
 
 The unit tests cover what needs no network: HLS attribute and playlist parsing,
 byte-range continuation, IV derivation, YouTube URL shapes, page-scraping
@@ -101,8 +107,10 @@ deployed suite, in a real browser over HTTPS under a `/siphon/` subpath with
 the service worker actually registered: a first visit to a host with no API
 lands on a screen that works; a first visit to a host that answers
 `/api/health` recognises your own server; settings written by the older
-three-mode version are migrated; the bundled list becomes chips and tapping
-one fills the address in and tests it; an unreachable address is refused with
+three-mode version are migrated; the measured list becomes chips with the date it was
+measured, tapping one fills the address in and tests it, and on a day none
+answered there is no chip and no Find, only the field and a sentence saying
+so; an unreachable address is refused with
 its reason and the sheet left open; **an Invidious instance whose video
 endpoint is shut is recognised and then said to be shut, with an amber light,
 before anyone saves it**, and every status names the address it is about, so

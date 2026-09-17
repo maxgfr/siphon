@@ -145,27 +145,54 @@ const BUNDLED_URL = new URL('./instances.json', import.meta.url).href;
 let bundledPromise = null;
 let bundledBy = null;
 
+const EMPTY = Object.freeze({ invidious: [], piped: [], open: [], measured: '' });
+
 /**
- * @returns {Promise<string[]>} the bundled Invidious addresses, [] when the file is missing
+ * @returns {Promise<{ invidious: string[], piped: string[], open: {url: string, kind: string}[], measured: string }>}
+ *   the file beside the app, empty lists when it is missing
  *
  * Read once per fetch implementation: the app always passes the same one, so
  * the file is fetched once; a test with a stubbed fetch gets its own read.
  */
-export function invidiousInstances({ fetchImpl = globalThis.fetch, timeout = 6000, fresh = false } = {}) {
+export function bundledInfo({ fetchImpl = globalThis.fetch, timeout = 6000, fresh = false } = {}) {
   if (!bundledPromise || fresh || bundledBy !== fetchImpl) {
     bundledBy = fetchImpl;
     bundledPromise = (async () => {
       try {
         const response = await fetchImpl(BUNDLED_URL, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(timeout) });
-        if (!response.ok) return [];
+        if (!response.ok) return EMPTY;
         const body = await response.json();
-        return (Array.isArray(body?.invidious) ? body.invidious : []).map(trimSlash).filter(Boolean);
+        const addresses = (list) => (Array.isArray(list) ? list : []).map(trimSlash).filter(Boolean);
+        return {
+          invidious: addresses(body?.invidious),
+          piped: addresses(body?.piped),
+          // Only the kinds the app can use are offered, whatever the file says.
+          open: (Array.isArray(body?.open) ? body.open : [])
+            .filter((entry) => entry && typeof entry.url === 'string' && PUBLIC.has(entry.kind))
+            .map((entry) => ({ url: trimSlash(entry.url), kind: entry.kind }))
+            .filter((entry) => entry.url),
+          measured: typeof body?.measured === 'string' ? body.measured : '',
+        };
       } catch {
-        return [];
+        return EMPTY;
       }
     })();
   }
   return bundledPromise;
+}
+
+/** The bundled Invidious addresses, [] when the file is missing. */
+export async function invidiousInstances(options = {}) {
+  return (await bundledInfo(options)).invidious;
+}
+
+/**
+ * The instances the daily measurement saw answer a page for a video — the
+ * only ones the sheet offers as chips. Empty means none did that day, and
+ * then nothing is offered: an address that will refuse is worse than none.
+ */
+export async function openInstances(options = {}) {
+  return (await bundledInfo(options)).open;
 }
 
 /**
@@ -297,9 +324,15 @@ export async function findInstance({ fetchImpl = globalThis.fetch, detect, candi
     return found[0] || null;
   };
 
+  // Round zero: what the daily measurement saw answer a page — the shortest
+  // list and the likeliest, so it goes first and alone.
+  const info = await bundledInfo({ fetchImpl, timeout });
+  const measured = await probe(fresh(info.open.map((entry) => entry.url)));
+  if (measured) return measured;
+
   // Round one: the list published beside the app. It is the plan, so it gets
   // the whole budget to itself before a single directory is contacted.
-  const bundled = await probe(fresh(await invidiousInstances({ fetchImpl, timeout })));
+  const bundled = await probe(fresh([...info.invidious, ...info.piped]));
   if (bundled) return bundled;
 
   // Round two: the projects' live directories, round-robin across them

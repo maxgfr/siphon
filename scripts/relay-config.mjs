@@ -178,6 +178,15 @@ export function sourceEntries(text) {
   for (const raw of String(text || '').split(/\r?\n/)) {
     const line = raw.replace(/\s+(#|\/\/).*$/, '').trim();
     if (!line || /^(#|\/\/|;)/.test(line)) continue;
+    // The list behind cobalt.directory, as measured: one instance per line as
+    // `api,frontend,protocol` — bare domains, the protocol last. A line with
+    // commas is read that way; the http ones a page cannot call are left out
+    // by the reader below.
+    if (line.includes(',')) {
+      const [api, , protocol] = line.split(',').map((part) => part.trim());
+      if (api) entries.push(...cobaltEntries([{ api, protocol: (protocol || 'https').toLowerCase() }]));
+      continue;
+    }
     const keyed = /^["']?api(?:_url|Url)?["']?\s*[:=]\s*["']?((?:https?:\/\/)?[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?(?:\/[^\s"',]*)?)/i.exec(line);
     const bare = /^(?:https?:\/\/)?[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?(?:\/\S*)?$/i.test(line);
     const address = keyed ? keyed[1] : bare ? line : null;

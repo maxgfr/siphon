@@ -223,6 +223,20 @@ test('a file of the source is read as JSON, or line by line when it is not', () 
   );
   assert.deepEqual(sourceEntries('nothing of the kind'), []);
   assert.deepEqual(sourceEntries(''), []);
+  // The list behind cobalt.directory, as the fourth measurement read it:
+  // `api,frontend,protocol` per line, bare domains, comments above.
+  const csv = [
+    '# How to format:',
+    '# api,frontend,protocol',
+    '# Do not include any slashes, just the domain names/IPs',
+    "# For protocol, it's either http or https, whatever the instance uses",
+    'api.one.example,one.example,https',
+    'api.two.example, two.example , https',
+    'api.plain.example,plain.example,http',
+    'api.three.example,three.example',
+    '',
+  ].join('\n');
+  assert.deepEqual(sourceEntries(csv).map((e) => e.api), ['https://api.one.example', 'https://api.two.example', 'https://api.three.example']);
 });
 
 test('the source measured to be one file — an object with its content — is read without a second request', async () => {
