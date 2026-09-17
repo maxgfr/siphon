@@ -112,7 +112,7 @@ Sources for the survey:
 [Universal Video Sniffer](https://greasyfork.org/en/scripts/557721-universal-video-sniffer),
 [sniff-hls](https://github.com/nuoyax/sniff-hls).
 
-## What was measured, 2026-09-16
+## What was measured, 2026-09-16 and 17
 
 Every line below is from a GitHub Actions runner's log, quoted rather than
 summarised. A runner is a datacentre IP, which is the case YouTube treats
@@ -206,8 +206,76 @@ now reads the list the site is built from — the opt-in list
 `backend/instances`, through Codeberg's plain API — and names each directory
 and the source with what it said. The third measurement reached that file
 (the API answered it with its content, where a folder had been expected) and
-the reader was taught its shape; the next log says what it lists.
-`cobalt.tools` itself is keyed, Turnstile-gated and blocked by YouTube.
+the reader was taught its shape; the section below quotes what it lists
+and what each of the 12 said. `cobalt.tools` itself is keyed,
+Turnstile-gated and blocked by YouTube.
+
+### Every public instance, asked as a page asks — 2026-09-17
+
+Since 2026-09-17 the daily refresh (`instances.yml`) measures the whole of
+it in one pass: every Invidious instance on the project's list, every Piped
+instance in its directory plus a seed of long-standing ones, and every cobalt
+instance in the opt-in list behind `cobalt.directory` — which the run now
+reads from Codeberg, in the `api,frontend,protocol` shape it keeps. Each is
+asked exactly what the page asks: the video endpoint with an `Origin` header,
+which must answer 200 with the cross-origin header and streams, then the
+first 64 KB of the media it names; cobalt is asked for a tunnel. The first
+run, from a runner:
+
+```
+7 Invidious instances from api.invidious.io + seed, 5 Piped from https://piped-instances.kavin.rocks/ + seed
+
+cobalt instances, from the list behind cobalt.directory:
+     source https://codeberg.org/api/v1/repos/hyperdefined/cobalt.directory/contents/backend/instances: 1 file(s), 12 instance(s) to ask
+
+asked as a page asks, with an Origin header:
+shut  invidious invidious.f5.si                videos HTTP 500, cors=yes — {"error":"Error while communicating with Invidious companion: Unexpected char '<
+shut  invidious inv.nadeko.net                 videos HTTP 403, cors=NONE — Endpoint disabled
+shut  invidious yewtu.be                       videos HTTP 403, cors=NONE — <html> <head><title>403 Forbidden</title></head> <body> <center><h1>403 Forbidde
+shut  invidious invidious.nerdvpn.de           videos HTTP 401, cors=NONE — <html> <head><title>401 Authorization Required</title></head> <body> <center><h1
+shut  invidious yt.chocolatemoo53.com          videos HTTP 403, cors=NONE — forbidden
+shut  invidious invidious.tiekoetter.com       videos HTTP 403, cors=NONE — <html> <head><title>403 Forbidden</title></head> <body> <center><h1>403 Forbidde
+shut  invidious inv.thepixora.com              videos HTTP 200, cors=NONE — <!DOCTYPE html><html lang="en"><head><title>Select instance - Invidious</title><
+shut  piped     pipedapi.kavin.rocks           videos HTTP 526, cors=NONE —
+shut  piped     pipedapi-libre.kavin.rocks     videos ETIMEDOUT
+shut  piped     pipedapi.adminforge.de         videos HTTP 403, cors=NONE — <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/st
+shut  piped     pipedapi.leptons.xyz           videos HTTP 403, cors=NONE — <!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title><meta htt
+shut  piped     pipedapi.ducks.party           videos HTTP 500, cors=yes — {"error":"org.schabi.newpipe.extractor.exceptions.SignInConfirmNotBotException:
+shut  cobalt    nachos.imput.net               answer HTTP 403
+shut  cobalt    blossom.imput.net              answer HTTP 403
+shut  cobalt    kityune.imput.net              answer HTTP 403
+shut  cobalt    sunny.imput.net                answer HTTP 403
+shut  cobalt    api.qwkuns.me                  answer HTTP 400 error.api.auth.jwt.missing
+shut  cobalt    cobaltapi.cjs.nz               answer HTTP 400 error.api.youtube.login
+shut  cobalt    cobaltapi.squair.xyz           answer HTTP 403
+shut  cobalt    cobaltapi.kittycat.boo         answer HTTP 403
+shut  cobalt    fox.kittycat.boo               answer HTTP 403
+shut  cobalt    dog.kittycat.boo               answer HTTP 403
+shut  cobalt    cobalt-alpha.wolfy.love        answer HTTP 400 error.api.auth.jwt.missing
+shut  cobalt    cobalt-omega.wolfy.love        answer HTTP 400 error.api.auth.jwt.missing
+
+0 instance(s) answer a page for a video today
+  none: the sheet offers no chips, only the field
+```
+
+Read line by line, the doors are shut in four different ways, and none of
+them is this code's to open. The Invidious instances either refuse the video
+endpoint outright (`Endpoint disabled`, a 401, a 403 from the front server)
+or answer it without the cross-origin header a page needs; the two that do
+send the header are themselves refused by YouTube (`f5.si`'s companion
+returns HTML where JSON was expected; `ducks.party` says
+`SignInConfirmNotBotException`, which is the bot wall passed through). The
+Piped instances are behind a Cloudflare challenge, a 526, or the same bot
+wall. Every cobalt instance on the opt-in list either wants a key
+(`error.api.auth.jwt.missing`), turns a runner's request away (`403`), or
+reports YouTube demanding a login (`error.api.youtube.login`) — the last is
+the datacentre-IP case again, seen from a stranger's server. The list of 12
+is real and readable now; its answer is that public cobalt is keyed.
+
+So the file the app ships says `open: []`, the sheet shows the field and the
+sentence, and the walk is over 7 + 5 instances the moment one of them
+starts answering. The measurement runs every day; the day it finds one, the
+chip appears with that date beside it.
 
 ### The server itself: yt-dlp on a runner
 
