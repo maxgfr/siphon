@@ -1,5 +1,5 @@
 {
-  "updated": "2026-09-16",
+  "updated": "2026-09-17",
   "source": "api.invidious.io + seed",
   "invidious": [
     "https://invidious.f5.si",
@@ -10,7 +10,13 @@
     "https://invidious.tiekoetter.com",
     "https://inv.thepixora.com"
   ],
-  "piped": [],
+  "piped": [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi-libre.kavin.rocks",
+    "https://pipedapi.adminforge.de",
+    "https://pipedapi.leptons.xyz",
+    "https://pipedapi.ducks.party"
+  ],
   "open": [],
-  "measured": "2026-09-16"
+  "measured": "2026-09-17"
 }
