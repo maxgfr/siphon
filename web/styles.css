@@ -617,6 +617,8 @@ footer.legal p { margin: 0 0 7px; }
 .tour-head .chip-btn { padding: 7px 10px; }
 .tour-steps { margin: 10px 0 0; padding-left: 20px; }
 .tour-steps li + li { margin-top: 6px; }
+.tour-desktop { margin: 10px 0 0; color: var(--muted); font-size: 12.5px; }
+.tour-desktop a { color: var(--accent); font-weight: 600; }
 .tour-youtube { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
 .tour-youtube p { margin: 6px 0 0; }
 .tour-youtube a { color: var(--accent); font-weight: 600; }

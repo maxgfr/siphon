@@ -8,7 +8,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { detectEndpoint, privacyNote, describeEndpoint } from '../web/endpoint.js';
+import { detectEndpoint, privacyNote, describeEndpoint, ytdlpAge, STALE_AFTER_DAYS } from '../web/endpoint.js';
 
 /** A fetch that answers from a table of path → response, and records what was asked. */
 function stub(table) {
@@ -36,6 +36,7 @@ test('a siphon server is known by its health, ffmpeg and all', async () => {
   assert.deepEqual(helper.lanUrls, ['http://10.0.0.2:8000']);
   assert.equal(helper.hasCookies, true);
   assert.match(helper.label, /2026\.09\.01/);
+  assert.equal(helper.ytDlpVersion, '2026.09.01');
   // One request was enough, and the trailing slash did not double up.
   assert.deepEqual(asked, ['https://ytdl.example/api/health']);
 });
@@ -155,4 +156,29 @@ test('the sentences follow from the kind', () => {
   assert.match(privacyNote({ kind: 'invidious' }), /Invidious instance/);
   assert.match(describeEndpoint({ kind: 'invidious' }), /An Invidious instance/);
   assert.match(describeEndpoint(null), /helper/i);
+});
+
+test('the age of a yt-dlp is read off its calendar version', () => {
+  const today = new Date('2026-09-17T12:00:00Z');
+  assert.equal(ytdlpAge('2026.08.19', today), 29);
+  assert.equal(ytdlpAge('2026.09.17', today), 0);
+  assert.equal(ytdlpAge('2026.09.17.232839', today), 0, 'a nightly carries a suffix');
+  assert.equal(ytdlpAge('', today), null);
+  assert.equal(ytdlpAge(undefined, today), null);
+  assert.equal(ytdlpAge('nightly', today), null);
+});
+
+test('a server with a months-old yt-dlp is told to pull the image; a current one is not', () => {
+  const today = new Date('2026-09-17T12:00:00Z');
+  const stale = describeEndpoint({ kind: 'siphon', ffmpeg: true, label: 'yt-dlp 2026.05.01', ytDlpVersion: '2026.05.01' }, today);
+  assert.match(stale, /139 days old/);
+  assert.match(stale, /docker compose pull/);
+  assert.match(stale, /^Your server — yt-dlp 2026\.05\.01, with ffmpeg\./, 'the rest of the sentence is unchanged');
+  const fresh = describeEndpoint({ kind: 'siphon', ffmpeg: true, label: 'yt-dlp 2026.09.01', ytDlpVersion: '2026.09.01' }, today);
+  assert.doesNotMatch(fresh, /days old/);
+  const edge = describeEndpoint({ kind: 'siphon', ffmpeg: true, label: 'yt-dlp x', ytDlpVersion: '2026.08.03' }, today);
+  assert.equal(ytdlpAge('2026.08.03', today), STALE_AFTER_DAYS);
+  assert.doesNotMatch(edge, /days old/, 'exactly the threshold is not yet stale');
+  const unknown = describeEndpoint({ kind: 'siphon', ffmpeg: true, label: 'yt-dlp ?' }, today);
+  assert.doesNotMatch(unknown, /days old/, 'an older server that names no version is not warned about');
 });
