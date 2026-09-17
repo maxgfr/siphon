@@ -9,7 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { cobaltEntries, findInstance, invidiousInstances, looksUnreachable, servesPages, COBALT_DIRECTORY, DIRECTORIES, SEED } from '../web/instances.js';
+import { bundledInfo, cobaltEntries, findInstance, invidiousInstances, looksUnreachable, openInstances, servesPages, COBALT_DIRECTORY, DIRECTORIES, SEED } from '../web/instances.js';
 
 /** A fetch that answers the directories from a table, and records the asks. */
 function directories(table) {
@@ -19,8 +19,8 @@ function directories(table) {
     fetchImpl: async (url) => {
       asked.push(url);
       if (isBundled(url)) {
-        if (!('bundled' in table)) throw new TypeError('Failed to fetch');
-        return new Response(JSON.stringify({ invidious: table.bundled }), { status: 200 });
+        if (!('bundled' in table) && !('open' in table)) throw new TypeError('Failed to fetch');
+        return new Response(JSON.stringify({ invidious: table.bundled || [], piped: table.piped || [], open: table.open || [], measured: '2026-09-17' }), { status: 200 });
       }
       if (!(url in table)) throw new TypeError('Failed to fetch');
       const answer = table[url];
@@ -192,6 +192,55 @@ test('an excluded address on the bundled list is skipped, so a dead one is not o
   const found = await findInstance({ fetchImpl, detect, exclude: ['https://dead.example/'] });
   assert.equal(found.endpoint, 'https://alive.example');
   assert.ok(!probed.includes('https://dead.example'));
+});
+
+test('the measured list is probed first, and alone when one of it answers', async () => {
+  // `open` is what the daily measurement saw answer a page; it is short and
+  // the likeliest, so it gets a round to itself before the full lists.
+  const { fetchImpl, asked } = directories({
+    open: [{ url: 'https://open.example/', kind: 'piped' }, { url: 'https://also.example', kind: 'invidious' }],
+    bundled: ['https://one.example', 'https://two.example'],
+    [COBALT_LIST]: [{ api: 'c.example' }],
+    [PIPED_LIST]: [],
+    [INVIDIOUS_LIST]: [],
+  });
+  const { detect, probed } = prober({
+    'https://open.example': { kind: 'piped', label: 'Piped instance' },
+    'https://two.example': { kind: 'invidious', label: 'Invidious instance' },
+  });
+  const found = await findInstance({ fetchImpl, detect });
+  assert.equal(found.endpoint, 'https://open.example');
+  assert.deepEqual(probed.sort(), ['https://also.example', 'https://open.example'], 'only the measured ones were asked');
+  assert.ok(!asked.includes(COBALT_LIST));
+});
+
+test('when the measured list is empty or dead, the full lists follow, Piped included', async () => {
+  const { fetchImpl } = directories({
+    open: [{ url: 'https://gone.example', kind: 'invidious' }],
+    bundled: ['https://one.example'],
+    piped: ['https://p.example'],
+    [COBALT_LIST]: [],
+    [PIPED_LIST]: [],
+    [INVIDIOUS_LIST]: [],
+  });
+  const { detect, probed } = prober({ 'https://p.example': { kind: 'piped', label: 'Piped instance' } });
+  const found = await findInstance({ fetchImpl, detect });
+  assert.equal(found.endpoint, 'https://p.example');
+  assert.deepEqual(probed, ['https://gone.example', 'https://one.example', 'https://p.example']);
+});
+
+test('the file beside the app is read whole: the lists, the measured ones of a usable kind, and the date', async () => {
+  const fetchImpl = async () => new Response(JSON.stringify({
+    invidious: ['https://i.example/'], piped: ['https://p.example'], measured: '2026-09-17',
+    open: [{ url: 'https://i.example/', kind: 'invidious' }, { url: 'https://x.example', kind: 'siphon' }, { kind: 'piped' }, 'junk'],
+  }));
+  const info = await bundledInfo({ fetchImpl });
+  assert.deepEqual(info, { invidious: ['https://i.example'], piped: ['https://p.example'], open: [{ url: 'https://i.example', kind: 'invidious' }], measured: '2026-09-17' });
+  assert.deepEqual(await openInstances({ fetchImpl }), [{ url: 'https://i.example', kind: 'invidious' }]);
+  assert.deepEqual(await invidiousInstances({ fetchImpl }), ['https://i.example']);
+  // An older file, or none: empty lists, never a throw.
+  assert.deepEqual(await bundledInfo({ fetchImpl: async () => new Response('{"invidious":["https://i.example"]}'), fresh: true }), { invidious: ['https://i.example'], piped: [], open: [], measured: '' });
+  assert.deepEqual((await bundledInfo({ fetchImpl: async () => { throw new TypeError('Failed to fetch'); }, fresh: true })).open, []);
 });
 
 test('the bundled list is read once and shared', async () => {

@@ -1,11 +1,14 @@
-name: Refresh the Invidious instance list
+name: Refresh and measure the public instance lists
 
-# The app on Pages reaches YouTube through public Invidious instances, and
-# which of those are up changes week to week. This keeps web/instances.json
-# in step with the list the Invidious project publishes itself
-# (https://docs.invidious.io/instances/), so a fresh visitor starts from
-# today's list rather than the one committed months ago. The app still probes
-# every address before using it; this only decides which ones it tries.
+# The app on Pages can reach YouTube through a public Invidious, Piped or
+# cobalt instance, and which of those answer a web page changes week to week.
+# This keeps web/instances.json in step with the lists the projects publish
+# (docs.invidious.io, piped-instances.kavin.rocks, the list behind
+# cobalt.directory) and, the part a visitor sees, measures each instance as
+# the page would use it: the video endpoint with an Origin header, then the
+# first bytes of the media it names. Only the ones that answer go into
+# `open`, which is what the settings sheet offers as chips — none on a day
+# none did. The app still probes every address before using it.
 
 on:
   schedule:
@@ -41,7 +44,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add web/instances.json
-          git commit -m "chore: refresh the Invidious instance list"
+          git commit -m "chore: the public instances, refreshed and measured"
           git push
       # A push made with GITHUB_TOKEN does not trigger other workflows, so the
       # Pages deploy is asked for directly — otherwise the fresh list would sit

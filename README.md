@@ -70,16 +70,22 @@ an Invidious or Piped instance it also asks the one question that matters —
 whether the instance will answer *this page* for a video — and says so with
 a green or an amber light before you save. That matters because most public
 instances now keep the video endpoint shut to other apps to survive YouTube's
-blocking; the stats endpoint that names them still answers everyone. The
-settings sheet offers the first few instances of the bundled list as chips,
-**Find a public instance** walks the lists for one that answers, and when the
-instance in use stops answering mid-download the next few from the list are
-tried inside the same job, naming the one that delivered.
+blocking; the stats endpoint that names them still answers everyone.
 
-Where the list comes from: `web/instances.json` is the Invidious project's
-[own list](https://docs.invidious.io/instances/), refreshed daily by
-`.github/workflows/instances.yml` and deployed beside the page; the projects'
-live directories are asked only when nothing on it answers.
+**What the sheet offers is measured, not assumed.** `.github/workflows/instances.yml`
+runs `scripts/instances.mjs` daily on a machine with real network: it reads
+the lists the projects publish (Invidious's [own](https://docs.invidious.io/instances/),
+Piped's [directory](https://piped-instances.kavin.rocks/), the opt-in list
+behind [cobalt.directory](https://cobalt.directory/)), then asks every
+instance exactly what this page asks — the video endpoint with an `Origin`
+header, then the first bytes of the media it names — and writes the ones that
+answered into `web/instances.json` as `open`. Those are the chips in settings,
+and **Find a public instance** walks them first. On a day none answered there
+are no chips and no search, only the field for an address you know, and a
+sentence saying so with the date: offering an instance that will refuse
+would look like a broken app. When the instance in use stops answering
+mid-download, the next few from the list are tried inside the same job,
+naming the one that delivered.
 
 **The measured state of it:** on 2026-09-16, every public Invidious instance
 on the list refused the video endpoint to a page, every public CORS proxy
@@ -351,9 +357,9 @@ pip install -r server/requirements.txt pytest httpx       # yt-dlp[default] carr
 # the Docker image ships one, and the settings sheet says when a server has none.
 WEB_DIR=web uvicorn server.app:app --reload --port 8000   # the server
 pytest server/tests -q                                    # 158
-npm test                                                  # 171 — the extractor, detection, the measurements
+npm test                                                  # 179 — the extractor, detection, the measurements
 npm run test:e2e        # the device, a fake Invidious, Piped and cobalt — 48; needs playwright, ffmpeg
-npm run test:deployed   # the app as a static deploy over HTTPS — 65; needs playwright, openssl
+npm run test:deployed   # the app as a static deploy over HTTPS — 68; needs playwright, openssl
 npm run test:bridge     # the userscript against a host that refuses — 8
 npm run test:split      # a server that only resolves, a device that downloads — 24
 npm run test:innertube  # what YouTube says to a bare request from this machine

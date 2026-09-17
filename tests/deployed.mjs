@@ -305,7 +305,9 @@ for (const [old, expected] of [
   // the sheet opens and turns it into chips. Set at the server, because the
   // page's fetch goes through the service worker, where page.route cannot see it.
   const listed = ['https://127.0.0.1:1/one', `${BASE}/two`, 'https://127.0.0.1:3/three', 'https://127.0.0.1:4/four'];
-  overrides.set('/siphon/instances.json', JSON.stringify({ invidious: listed }));
+  // Chips come from `open` — what the daily measurement saw answer a page —
+  // never from the full list.
+  overrides.set('/siphon/instances.json', JSON.stringify({ invidious: listed, open: listed.map((url) => ({ url, kind: 'invidious' })), measured: '2026-09-17' }));
   await page.reload({ waitUntil: 'networkidle' });
   await page.waitForTimeout(1200);
   await page.click('#openSettings');
@@ -322,12 +324,30 @@ for (const [old, expected] of [
   // an instance to tap, not a search to run.
   await page.waitForSelector('#suggested button', { timeout: 5_000 }).catch(() => {});
   const chips = await page.$$eval('#suggested button', (nodes) => nodes.map((node) => node.textContent.trim()));
-  check('the first three of the bundled list are offered as chips', chips.length === 3 && chips.every((host, i) => host === new URL(listed[i]).host), chips.join(', '));
+  check('the first three of the measured list are offered as chips', chips.length === 3 && chips.every((host, i) => host.startsWith(new URL(listed[i]).host)), chips.join(', '));
+  check('with the date they were measured, and Find offered', /Measured 2026-09-17/.test((await page.textContent('#openNote')) || '') && !(await page.evaluate(() => document.getElementById('findInstance').hidden)),
+    ((await page.textContent('#openNote')) || '').slice(0, 60));
   await page.click('#suggested button:nth-child(2)');
   await page.waitForFunction(() => !/checking/i.test(document.getElementById('statusText').textContent || ''), null, { timeout: 15_000 });
   const tapped = { address: await page.inputValue('#endpoint'), status: (await page.textContent('#statusText')) || '' };
   check('tapping one fills the address in and tests it', tapped.address === `${BASE}/two` && !/not checked|checking/i.test(tapped.status),
     `${tapped.address} — ${tapped.status.slice(0, 60)}`);
+  // A day none answered: no chips, no Find, the field, and a sentence that
+  // says so — offering an instance that will refuse would look like a
+  // broken app.
+  overrides.set('/siphon/instances.json', JSON.stringify({ invidious: listed, open: [], measured: '2026-09-17' }));
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForTimeout(1200);
+  await page.click('#openSettings');
+  await page.waitForTimeout(400);
+  const none = await page.evaluate(() => ({
+    chips: document.querySelectorAll('#suggested button').length,
+    find: document.getElementById('findInstance').hidden,
+    note: document.getElementById('openNote').textContent,
+    field: Boolean(document.getElementById('endpoint')),
+  }));
+  check('when none answered a page, no chip and no Find are offered', none.chips === 0 && none.find === true, JSON.stringify({ chips: none.chips, find: none.find }));
+  check('only the field, and a sentence saying so with the date', none.field && /Measured 2026-09-17: no public instance answered/.test(none.note), none.note.slice(0, 80));
   overrides.delete('/siphon/instances.json');
   // Back to an empty box for what follows, which is written for one.
   await page.fill('#endpoint', '');

@@ -11,7 +11,7 @@
  * primary action pinned within thumb reach, and no interaction that needs a
  * hover or a precise tap.
  */
-import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, invidiousInstances, looksUnreachable, privacyNote, describeEndpoint, servesPages } from './api.js';
+import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, bundledInfo, looksUnreachable, privacyNote, describeEndpoint, servesPages } from './api.js';
 
 const SETTINGS_KEY = 'siphon:settings';
 const POLL_MS = 700;
@@ -218,6 +218,11 @@ async function offerPublicInstance() {
   } catch {
     /* storage off: offering once per session is the harmless side */
   }
+  // Only when the daily measurement saw at least one instance answer a page:
+  // a search that would contact a dozen strangers to find nothing is not
+  // worth a first visit's time, and the day's answer is already beside the app.
+  const { open } = await bundledInfo().catch(() => ({ open: [] }));
+  if (open.length === 0) return;
   const found = await findInstance({ detect: (address) => detectEndpoint(address), verify: servesPages }).catch(() => null);
   try {
     localStorage.setItem(INSTANCE_OFFERED, '1');
@@ -903,19 +908,24 @@ function scopeYtdlp(helper) {
 const SUGGESTED = 3;
 
 /**
- * The first few Invidious instances from the bundled list, as chips.
- *
- * "Find a public instance" runs a search; these are the answer to "just give
- * me one": tap it and the address is filled in and tested, and the sheet
- * says what it found. The list is the project's own, refreshed daily, so the
- * chips are today's instances, not the ones committed months ago.
+ * The instances the daily measurement saw answer a page for a video, as
+ * chips: tap one and the address is filled in and tested. Nothing is offered
+ * on a day none did — the field is still there for an address you know —
+ * and the sentence beside it says which of the two it is, and when it was
+ * measured. "Find a public instance" is offered only when there is something
+ * to find.
  */
 async function renderSuggested() {
   const box = $('suggested');
-  const list = (await invidiousInstances().catch(() => [])).slice(0, SUGGESTED);
+  const { open, measured } = await bundledInfo().catch(() => ({ open: [], measured: '' }));
+  const list = open.slice(0, SUGGESTED);
   box.hidden = list.length === 0;
+  $('findInstance').hidden = open.length === 0;
+  $('openNote').textContent = open.length
+    ? `Measured ${measured || 'recently'}: ${open.length === 1 ? 'this instance answered' : `these ${open.length} instances answered`} a web page for a video. Tap one to fill it in and test it, or paste another.`
+    : `${measured ? `Measured ${measured}: no` : 'No'} public instance answered a web page for a video, so none is offered. Paste one you know, or use a relay or your own server — those are never refused.`;
   box.innerHTML = list
-    .map((address) => `<button type="button" class="chip-btn" data-address="${escapeHtml(address)}">${escapeHtml(hostOf(address))}</button>`)
+    .map((entry) => `<button type="button" class="chip-btn" data-address="${escapeHtml(entry.url)}">${escapeHtml(hostOf(entry.url))}<small> · ${escapeHtml(entry.kind)}</small></button>`)
     .join('');
   for (const chip of box.querySelectorAll('[data-address]')) {
     chip.addEventListener('click', () => {

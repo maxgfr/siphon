@@ -174,9 +174,10 @@
       <button type="button" class="chip-btn" id="useLocalhost">Use this computer</button>
       <button type="button" class="chip-btn" id="findInstance">Find a public instance</button>
     </div>
-    <!-- The first few Invidious instances from the list deployed beside the app,
-         each one tap away: an address to try directly, not a search to run. -->
+    <!-- The instances the daily measurement saw answer a page for a video,
+         each one tap away — and none on a day none did. -->
     <div id="suggested" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px" hidden></div>
+    <p class="hint" id="openNote"></p>
     <p class="hint">
       Any of these, and it is recognised on its own:
       <strong>your own siphon server</strong> — the <code>server/</code> folder, one <code>docker run</code>.
@@ -188,10 +189,10 @@
       Leave it empty and this device still handles direct files, HLS and pages that allow it.
     </p>
     <p class="hint">
-      <strong>Find a public instance</strong> tries the Invidious instances published beside this
-      app — the list at docs.invidious.io, refreshed daily — then the cobalt, Invidious and Piped
-      projects&#39; own directories, and fills in the first that answers. It is someone else&#39;s server: the address it picks is named here and on
-      the main screen, it sees every link it is asked about, and clearing the field undoes it.
+      Public instances are someone else&#39;s server: whichever one is set is named here and on the
+      main screen, it sees every link it is asked about, and clearing the field undoes it. The
+      list beside this app is measured daily, from a machine with real network, by asking each
+      instance exactly what this page asks; only the ones that answered are offered.
     </p>
 
     <label class="lbl" for="endpointKey">Access key <span style="font-weight:400;color:var(--muted)">— if the helper asks for one</span></label>
