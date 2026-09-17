@@ -87,13 +87,14 @@ would look like a broken app. When the instance in use stops answering
 mid-download, the next few from the list are tried inside the same job,
 naming the one that delivered.
 
-**The measured state of it:** on 2026-09-16, every public Invidious instance
-on the list refused the video endpoint to a page, every public CORS proxy
-refused to fetch for a page, and cobalt's directory turned a runner away with a
-browser challenge. The path is real, tested end to end against instances
-speaking the real APIs, and offered honestly: a public instance that answers
-a page is a find, not a plan. [docs/youtube.md](docs/youtube.md) quotes every
-measurement.
+**The measured state of it:** on 2026-09-17, the first full run asked 7
+Invidious, 5 Piped and 12 cobalt instances, and none answered a page for a
+video — the Invidious ones keep the endpoint shut or send no cross-origin
+header, the Piped ones sit behind a challenge or YouTube's bot wall, and every
+public cobalt wants a key or reports YouTube demanding a login. The path is
+real, tested end to end against instances speaking the real APIs, and offered
+honestly: a public instance that answers a page is a find, not a plan.
+[docs/youtube.md](docs/youtube.md) quotes every line of every measurement.
 
 ### No server anywhere: the bridge
 
@@ -321,10 +322,11 @@ public instance is a stranger's server that sees every link routed through
 it, and the app says so on screen.
 
 **Today's answer is empty.** Not one public proxy carried the page's requests,
-and cobalt's directory was unreadable from a runner; the log of every attempt
-is quoted in [docs/youtube.md](docs/youtube.md). The measurement keeps running
-in case that changes; it is not the plan. The paths that are not refused are
-the ones that are yours: the bridge, the relay, the server.
+and the 12 cobalt instances on the opt-in list are keyed, refuse a runner, or
+report YouTube demanding a login; the log of every attempt is quoted in
+[docs/youtube.md](docs/youtube.md). The measurement keeps running in case
+that changes; it is not the plan. The paths that are not refused are the ones
+that are yours: the bridge, the relay, the server.
 
 ## What else it does
 
