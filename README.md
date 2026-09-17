@@ -188,9 +188,11 @@ the next one if the previous fails:
 
 If all three fail it is almost certainly the IP: datacentre ranges get the
 strictest treatment, which is why your own machine is the first option here.
-And check the version — `docker compose build --pull` refreshes a months-old
-yt-dlp; the header shows the running one. Running the server outside the
-image? yt-dlp has needed a JavaScript runtime for YouTube since late 2025
+And check the version: yt-dlp is what YouTube breaks, and it releases about
+monthly, so the image is rebuilt every Monday with the newest one and
+`docker compose pull && docker compose up -d` is the whole update. **Test**
+in settings shows the running version and says when it is more than 45 days
+old. Running the server outside the image? yt-dlp has needed a JavaScript runtime for YouTube since late 2025
 (it solves the signature challenge with YouTube's own player script); the
 image ships [Deno](https://deno.com), and **Test** in settings says when a
 server has none. The `server-youtube` job measures
@@ -332,6 +334,13 @@ that are yours: the bridge, the relay, the server.
 
 - **A queue.** Paste, tap, and the box clears for the next link. Each download
   is a row with its own progress; several run at once; rows survive a reload.
+- **Several links at once.** Paste a whole list, drop a selection of links on
+  the page, or share a message full of them: each becomes its own row, in
+  order, at the quality chosen. `Ctrl+V` with nothing focused lands in the
+  field too, and "Title https://…" from a share becomes just the link.
+- **Send to siphon.** A bookmarklet in the guide: drag it to the bookmarks
+  bar, and on any video page one click opens the app with that page's link —
+  the desktop counterpart of the phone's share sheet.
 - **Resume.** A connection that dies at 80% is picked up from 80%. A refusal —
   a 404, a private video — is not retried, because repeating it would only
   make the same answer arrive later.

@@ -59,6 +59,8 @@ writeFileSync(join(PREVIOUS, 'index.html'), `<!doctype html><html><head><meta ch
 <body><p id="old-build">the previous deploy</p><script type="module" src="./app.js"></script></body></html>`);
 writeFileSync(join(PREVIOUS, 'app.js'),
   `if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('./sw.js');\n`);
+// The cache the shipped worker names, read off the source so a bump there is not a test to edit.
+const CURRENT_CACHE = /const CACHE = '([^']+)'/.exec(readFileSync(join(WEB, 'sw.js'), 'utf8'))[1];
 writeFileSync(join(PREVIOUS, 'sw.js'), `const CACHE = 'siphon-v1';
 self.addEventListener('install', (e) => e.waitUntil(
   caches.open(CACHE).then((c) => c.addAll(['./', './index.html', './app.js'])).then(() => self.skipWaiting())));
@@ -547,6 +549,38 @@ for (const [old, expected] of [
   await context.close();
 }
 
+/* 6b. A computer's habits: the bookmarklet, a dropped link, Ctrl+V with nothing focused. */
+{
+  const { context, page } = await fresh();
+  await setApi(false);
+  await page.goto(APP, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(1000);
+  const href = (await page.getAttribute('#bookmarklet', 'href')) || '';
+  check('the guide offers a bookmarklet that opens this deploy, subpath and all',
+    href.startsWith('javascript:') && href.includes(`"${APP}"`) && href.includes("?url='+encodeURIComponent(location.href)"), href.slice(0, 120));
+  await page.click('#bookmarklet');
+  check('tapping it here says to drag it instead, and goes nowhere', /Drag/.test((await page.textContent('#feedback')) || '') && page.url().startsWith(APP), page.url());
+
+  const dropped = `${BASE}/dropped/clip.mp4`;
+  await page.evaluate((link) => {
+    const dt = new DataTransfer();
+    dt.setData('text/uri-list', `# A bookmark\r\n${link}\r\n`);
+    document.body.dispatchEvent(new DragEvent('dragover', { dataTransfer: dt, bubbles: true, cancelable: true }));
+    document.body.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+  }, dropped);
+  check('a link dropped anywhere on the page fills the field', (await page.inputValue('#url')) === dropped, await page.inputValue('#url'));
+
+  const pasted = `${BASE}/pasted/clip.mp4`;
+  await page.evaluate((link) => {
+    const dt = new DataTransfer();
+    dt.setData('text/plain', `Watch this ${link}!`);
+    document.body.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+  }, pasted);
+  check('Ctrl+V with nothing focused takes the link out of the text', (await page.inputValue('#url')) === pasted, await page.inputValue('#url'));
+  check('and nothing was contacted off this machine for any of it', context.__offsite.length === 0, context.__offsite.join(','));
+  await context.close();
+}
+
 /* 7. A deploy landing under a returning visitor, worker and all. */
 {
   const { context, page } = await fresh();
@@ -566,7 +600,7 @@ for (const [old, expected] of [
     caches: await caches.keys(),
     controlled: Boolean(navigator.serviceWorker.controller),
   }));
-  check('the new worker takes over', after.caches.includes('siphon-v3'), after.caches.join(','));
+  check('the new worker takes over', after.caches.includes(CURRENT_CACHE), after.caches.join(','));
   check('the previous cache is swept, not left to rot', !after.caches.includes('siphon-v1'), after.caches.join(','));
   check('the new app is rendered, not the cached old one',
     (await page.locator('#endpoint').count()) === 1 && (await page.locator('#old-build').count()) === 0);

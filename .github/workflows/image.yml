@@ -17,6 +17,13 @@ on:
       - "web/**"
       - ".github/workflows/image.yml"
     tags: ["v*"]
+  # yt-dlp is what YouTube breaks, and it releases about monthly. An image
+  # built once and pulled months later carries a stale extractor, which is the
+  # most common "it stopped working" there is for tools like this one. So the
+  # image is rebuilt weekly from the same sources with `yt-dlp[default]` at
+  # its newest, and `docker compose pull` is the whole update.
+  schedule:
+    - cron: "23 5 * * 1"
   workflow_dispatch:
 
 permissions:

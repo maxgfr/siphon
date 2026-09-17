@@ -6,9 +6,9 @@ still unproven.
 | suite | what it is | result |
 |---|---|---|
 | `pytest server/tests` | the server, including two against real yt-dlp on loopback, the per-job yt-dlp options, and the converter vendoring | 158 pass |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh and the daily measurement of which instances answer a page, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them | 179 pass |
-| `npm run test:e2e` | the device alone, real Chromium, two origins; a fake Invidious, a fake Piped and a fake cobalt each carrying a YouTube link; the bundled converter | 48 pass |
-| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips from the measured list and none when it is empty, an instance whose video endpoint is shut, the yt-dlp options riding with a job, the guide, the site's relay or cobalt instance | 68 pass |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh and the daily measurement of which instances answer a page, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them, the links in a pasted or dropped text, the age of a server's yt-dlp | 187 pass |
+| `npm run test:e2e` | the device alone, real Chromium, two origins; a fake Invidious, a fake Piped and a fake cobalt each carrying a YouTube link; a pasted list of links; the bundled converter | 54 pass |
+| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips from the measured list and none when it is empty, an instance whose video endpoint is shut, the yt-dlp options riding with a job, the guide and its bookmarklet, a dropped link, a paste with nothing focused, the site's relay or cobalt instance | 73 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
 | `npm run test:split` | a server that only resolves, a device that downloads | 24 pass |
 | `npm run test:youtube` | YouTube, for real, from the browser mode in CI — through the relay, Piped, and the bundled Invidious list | informative — see [youtube.md](youtube.md) |
@@ -82,6 +82,10 @@ origin and the media on another, so the CORS path under test is the real one:
   network stubbed.
 - A finished row survives a reload with its Save button intact, because the
   file is in OPFS.
+- **A pasted list is one row per link.** Two links inside a sentence, with
+  punctuation stuck to them, are pasted into the field: the page says how
+  many it queued, the field is left empty, two rows appear, and both files
+  land byte-identical.
 - **An Invidious instance carries YouTube.** A fake one speaking the real API —
   `/api/v1/stats` naming the software, `/api/v1/videos/{id}` with numbers as
   strings and media paths relative to the instance, `/videoplayback`, WebVTT at
@@ -124,7 +128,11 @@ reload; a first visit on a site whose owner set
 and the header says "relay for YouTube"; a measured cobalt instance in
 `config.json` is adopted when there is no relay and named as public; the guide
 is on the first screen, says what is set and what would make YouTube work,
-stays closed once closed, and comes back from the ? in the header; a visitor
+stays closed once closed, and comes back from the ? in the header; **the
+bookmarklet it offers opens this very deploy, subpath and all**, and tapping
+it in place says to drag it instead; a link dropped anywhere on the page, and
+one pasted with nothing focused, land in the field with the words around
+them stripped; a visitor
 who cleared the helper is not handed it again; a deploy landing under a
 returning visitor replaces the old worker and its cache; with the network cut
 the shell still opens; and nothing scrolls sideways at phone width. Nothing is

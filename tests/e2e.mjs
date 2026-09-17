@@ -455,6 +455,38 @@ async function download(url, preset) {
 
 const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
 
+/* Several links at once: a pasted list becomes one row each, in order, and
+   every one of them lands. The text is the shape a share or a chat gives —
+   words around the links, punctuation stuck to them. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.check('input[name="quality"][value="video_best"]');
+  const landed = [];
+  const collect = (event) => landed.push(event);
+  page.on('download', collect);
+  await page.evaluate(({ a, b }) => {
+    const dt = new DataTransfer();
+    dt.setData('text/plain', `Two clips: ${a}, and ${b}.`);
+    document.getElementById('url').dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+  }, { a: `${MEDIA}/media/clip.mp4`, b: `${MEDIA}/media/page.html` });
+  check('a pasted list says how many it queued', /2 links queued/.test((await page.textContent('#feedback')) || ''));
+  check('and leaves the field empty for the next', (await page.inputValue('#url')) === '');
+  await page.waitForFunction(() => document.querySelectorAll('#queueList li').length === 2, null, { timeout: 30_000 }).catch(() => {});
+  const rows = await page.$$eval('#queueList li', (items) => items.length);
+  check('two links, two rows', rows === 2, `${rows} rows`);
+  const deadline = Date.now() + 180_000;
+  while (landed.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 250));
+  page.off('download', collect);
+  check('and both files land', landed.length === 2, `${landed.length} downloads`);
+  for (const [index, event] of landed.entries()) {
+    const saved = join(DOWNLOADS, `many-${index}-${event.suggestedFilename()}`);
+    await event.saveAs(saved);
+    check(`file ${index + 1} of the list is byte-identical to the source`, Buffer.compare(source, readFileSync(saved)) === 0, event.suggestedFilename());
+  }
+}
+
 /* A progressive MP4 that already meets the preset: no conversion at all. */
 {
   coreRequests = 0;

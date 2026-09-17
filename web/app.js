@@ -12,6 +12,7 @@
  * hover or a precise tap.
  */
 import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, bundledInfo, looksUnreachable, privacyNote, describeEndpoint, servesPages } from './api.js';
+import { looksLikeUrl, urlsIn } from './links.js';
 
 const SETTINGS_KEY = 'siphon:settings';
 const POLL_MS = 700;
@@ -313,16 +314,6 @@ const platform = {
   },
 };
 
-function looksLikeUrl(value) {
-  const text = String(value || '').trim();
-  if (!text) return false;
-  try {
-    const parsed = new URL(text);
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
-  } catch {
-    return false;
-  }
-}
 
 /* ------------------------------------------------------------------ render */
 
@@ -1160,6 +1151,45 @@ function clearInput() {
   renderAction();
 }
 
+/**
+ * Several links at once — a pasted list, a dropped selection, a shared
+ * message full of them. Each becomes its own row, in the order given, with
+ * the quality chosen; the field is left empty for the next one.
+ */
+async function enqueueMany(links) {
+  clearInput();
+  renderFeedback(`<div class="notice"><p>${links.length} links queued.</p></div>`);
+  for (const link of links) await enqueue(link);
+}
+
+/** Put one link in the field, as if typed. */
+function fillUrl(value) {
+  const input = $('url');
+  input.value = value;
+  input.dispatchEvent(new Event('input'));
+}
+
+/**
+ * What a paste or a drop carries. One link fills the field — "Title https://…"
+ * from a share becomes just the link; several are queued straight away.
+ * Returns whether there was anything to take.
+ */
+function takeText(text) {
+  const links = urlsIn(text);
+  if (links.length > 1) {
+    enqueueMany(links);
+    return true;
+  }
+  if (links.length === 1) {
+    fillUrl(links[0]);
+    return true;
+  }
+  return false;
+}
+
+/** Whether a drag carries text — the only kind of drop this page takes. */
+const carriesText = (dt) => Array.from(dt?.types || []).some((type) => type === 'text/uri-list' || type === 'text/plain' || type === 'text');
+
 /* --------------------------------------------------------------------- boot */
 
 function readSharedUrl() {
@@ -1228,13 +1258,37 @@ function init() {
     }
   });
 
+  // A paste into the field of a whole list queues the lot; one link, or
+  // anything else, is left to the field itself.
+  urlInput.addEventListener('paste', (event) => {
+    const links = urlsIn(event.clipboardData?.getData('text') || '');
+    if (links.length > 1) {
+      event.preventDefault();
+      enqueueMany(links);
+    }
+  });
+  // Ctrl+V with nothing focused — the desktop habit — lands in the field too.
+  document.addEventListener('paste', (event) => {
+    const target = event.target;
+    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target?.isContentEditable) return;
+    if ($('settings').open) return;
+    if (takeText(event.clipboardData?.getData('text') || '')) event.preventDefault();
+  });
+  // A link dragged from another window and dropped anywhere on the page.
+  document.addEventListener('dragover', (event) => {
+    if (carriesText(event.dataTransfer)) event.preventDefault();
+  });
+  document.addEventListener('drop', (event) => {
+    const dt = event.dataTransfer;
+    if (!dt) return;
+    const text = dt.getData('text/uri-list') || dt.getData('text/plain') || dt.getData('text');
+    if (takeText(text)) event.preventDefault();
+  });
+
   $('paste').addEventListener('click', async () => {
     try {
       const text = await navigator.clipboard.readText();
-      if (text) {
-        urlInput.value = text.trim();
-        urlInput.dispatchEvent(new Event('input'));
-      }
+      if (text && !takeText(text)) fillUrl(text.trim());
     } catch {
       // Clipboard reads need permission and a secure origin; focusing the field
       // lets the user use the keyboard's own paste instead.
@@ -1362,6 +1416,16 @@ function setupTour() {
     try {
       localStorage.setItem(TOUR_SEEN, '1');
     } catch { /* nothing to do */ }
+  });
+  // The bookmarklet: from any video page on a computer, one click opens this
+  // app — at its own address, subpath and all — with that page's link. The
+  // link is for dragging to the bookmarks bar; a tap here would only send
+  // this page to itself, so the tap says so instead.
+  const app = new URL('./', location.href).href;
+  $('bookmarklet').href = `javascript:void(location.href=${JSON.stringify(app)}+'?url='+encodeURIComponent(location.href))`;
+  $('bookmarklet').addEventListener('click', (event) => {
+    event.preventDefault();
+    renderFeedback('<div class="notice"><p>Drag <strong>Send to siphon</strong> to the bookmarks bar; it is for other pages, not this one.</p></div>');
   });
   $('copyDocker').addEventListener('click', async () => {
     try {

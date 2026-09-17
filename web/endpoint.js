@@ -79,6 +79,7 @@ export async function detectEndpoint(address, key = '', fetchImpl = globalThis.f
     return {
       kind: 'siphon',
       label: `yt-dlp ${body.ytDlpVersion || '?'}`,
+      ytDlpVersion: body.ytDlpVersion || '',
       ffmpeg: body.ffmpeg !== false,
       // Older servers say nothing about it; only an explicit "no" is a warning.
       jsRuntime: body.jsRuntime !== false,
@@ -150,16 +151,36 @@ export function privacyNote(endpoint) {
   }
 }
 
+/**
+ * How old a yt-dlp is, in days, from its calendar version (2026.08.19); null
+ * when the version is not one. YouTube changes often enough that the age of
+ * the extractor is the first thing to check when a download fails.
+ */
+export function ytdlpAge(version, now = new Date()) {
+  const match = /^(\d{4})\.(\d{2})\.(\d{2})/.exec(String(version || ''));
+  if (!match) return null;
+  const released = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  return Math.floor((now.getTime() - released) / 86_400_000);
+}
+
+/** Past this, the sheet says so: yt-dlp releases about monthly, and the image is rebuilt weekly. */
+export const STALE_AFTER_DAYS = 45;
+
 /** The sentence in the settings sheet after Test. */
-export function describeEndpoint(endpoint) {
+export function describeEndpoint(endpoint, now = new Date()) {
   switch (endpoint?.kind) {
     case 'siphon': {
-      const base = endpoint.ffmpeg
+      let text = endpoint.ffmpeg
         ? `Your server — ${endpoint.label}, with ffmpeg. It does everything: every site yt-dlp knows, playlists, subtitles.`
         : `Your server — ${endpoint.label}, no ffmpeg. It resolves links; this device downloads and converts.`;
-      return endpoint.jsRuntime === false
-        ? `${base} It has no JavaScript runtime beside yt-dlp, so YouTube formats may be missing — install Deno there, or use the Docker image, which has one.`
-        : base;
+      if (endpoint.jsRuntime === false) {
+        text += ' It has no JavaScript runtime beside yt-dlp, so YouTube formats may be missing — install Deno there, or use the Docker image, which has one.';
+      }
+      const age = ytdlpAge(endpoint.ytDlpVersion, now);
+      if (age !== null && age > STALE_AFTER_DAYS) {
+        text += ` Its yt-dlp is ${age} days old, and YouTube changes often: the image is rebuilt every week, so pull it again (docker compose pull) when a download fails.`;
+      }
+      return text;
     }
     case 'cobalt':
       return `A ${endpoint.label} instance. This device does what it can; the rest goes to the instance.`;
