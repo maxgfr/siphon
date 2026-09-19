@@ -5,8 +5,8 @@ still unproven.
 
 | suite | what it is | result |
 |---|---|---|
-| `pytest server/tests` | the server, including two against real yt-dlp on loopback, the per-job yt-dlp options, and the converter vendoring | 158 pass |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh and the daily measurement of which instances answer a page, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them, the links in a pasted or dropped text, the age of a server's yt-dlp | 187 pass |
+| `pytest server/tests` | the server, including two against real yt-dlp on loopback, the per-job yt-dlp options, the sweep that leaves a running job alone, the tunnel's answer for an upstream it cannot reach, and the converter vendoring | 162 pass |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh and the daily measurement of which instances answer a page, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them, the links in a pasted or dropped text, the age of a server's yt-dlp, the access key checked before an address is saved, YouTube behind a tunnel answered by the server rather than by the tunnel's refusal, and the service worker's shell holding every module the app loads | 195 pass |
 | `npm run test:e2e` | the device alone, real Chromium, two origins; a fake Invidious, a fake Piped and a fake cobalt each carrying a YouTube link; a pasted list of links; the bundled converter | 54 pass |
 | `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips from the measured list and none when it is empty, an instance whose video endpoint is shut, the yt-dlp options riding with a job, the guide and its bookmarklet, a dropped link, a paste with nothing focused, the site's relay or cobalt instance | 73 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |

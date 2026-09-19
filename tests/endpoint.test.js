@@ -46,6 +46,32 @@ test('a server that wants a key says so rather than looking like something else'
   await assert.rejects(() => detectEndpoint('https://ytdl.example', '', fetchImpl), /access key/i);
 });
 
+test('a server that wants a key is asked with it, and a wrong one is found out before saving', async () => {
+  const health = { body: { service: 'siphon', ytDlpVersion: '2026.09.01', ffmpeg: true, requiresKey: true } };
+  // The right key: a gated endpoint answers 404 for a job that does not exist, and the key is taken.
+  const right = stub({ '/api/health': health, '/api/jobs/': { status: 404, body: { detail: 'No such download.' } } });
+  const helper = await detectEndpoint('https://ytdl.example', 'k3y', right.fetchImpl);
+  assert.equal(helper.kind, 'siphon');
+  assert.equal(helper.requiresKey, true);
+  assert.equal(helper.keyAccepted, true);
+  assert.deepEqual(right.asked, ['https://ytdl.example/api/health', 'https://ytdl.example/api/jobs/key-check']);
+  // A wrong key: health still answers everyone, so without this the sheet
+  // would say "your server" and the first download would say 401. Still a
+  // siphon server, though — a first visit at a keyed one adopts it and asks
+  // for the key later, so this is reported rather than thrown.
+  const wrong = stub({ '/api/health': health, '/api/jobs/': { status: 401, body: { detail: 'This server needs an access key.' } } });
+  const refused = await detectEndpoint('https://ytdl.example', 'nope', wrong.fetchImpl);
+  assert.equal(refused.kind, 'siphon');
+  assert.equal(refused.keyAccepted, false);
+  assert.equal((await detectEndpoint('https://ytdl.example', '', wrong.fetchImpl)).keyAccepted, false);
+});
+
+test('a server that wants no key is not asked twice', async () => {
+  const { fetchImpl, asked } = stub({ '/api/health': { body: { service: 'siphon', ytDlpVersion: '2026.09.01', ffmpeg: true, requiresKey: false } } });
+  await detectEndpoint('https://ytdl.example', '', fetchImpl);
+  assert.deepEqual(asked, ['https://ytdl.example/api/health']);
+});
+
 test('nothing at this page\'s own origin is an answer, not an error', async () => {
   const { fetchImpl } = stub({ '/api/health': { status: 404, body: '<html>not found</html>' } });
   const helper = await detectEndpoint('', '', fetchImpl);

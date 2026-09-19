@@ -16,6 +16,14 @@ import { looksLikeUrl, urlsIn } from './links.js';
 
 const SETTINGS_KEY = 'siphon:settings';
 const POLL_MS = 700;
+/**
+ * How many polls in a row may fail before a running download is given up
+ * on. One missed poll is a phone changing cells or a laptop lid closing for
+ * a moment; the server is still working, and marking the row failed would
+ * have the person start the same download again beside it. Ten seconds or
+ * so of silence is a different thing, and is reported.
+ */
+const POLL_MISSES = 12;
 
 const NO_HELPER = Object.freeze({ kind: 'none', label: 'this device only' });
 
@@ -702,6 +710,7 @@ async function pollAll() {
     active.map(async (entry) => {
       try {
         const job = await backend.poll(entry.id);
+        entry.misses = 0;
         Object.assign(entry, {
           stage: job.stage,
           progress: job.progress,
@@ -726,11 +735,19 @@ async function pollAll() {
           afterFailure(entry);
         }
       } catch (error) {
-        // A 404 means the server swept it; anything else is a real failure.
-        entry.state = /no such download/i.test(String(error?.message)) ? 'expired' : 'error';
-        if (entry.state === 'error') {
-          entry.error = error instanceof BackendError ? error.message : 'Lost contact with the server.';
+        // A 404 means the server swept it. A refusal — the key is wrong —
+        // will not change by asking again. Anything else is the network,
+        // and the server is still working: only a silence that lasts is a
+        // failure.
+        if (/no such download/i.test(String(error?.message))) {
+          entry.state = 'expired';
+          return;
         }
+        entry.misses = (entry.misses || 0) + 1;
+        const final = error instanceof BackendError && error.retryable === false;
+        if (!final && entry.misses < POLL_MISSES) return;
+        entry.state = 'error';
+        entry.error = error instanceof BackendError ? error.message : 'Lost contact with the server.';
       }
     }),
   );
@@ -979,6 +996,19 @@ async function probeDraft() {
   try {
     const helper = await detectEndpoint(draft.endpoint, draft.key);
     if (seq !== probeSeq) return null;
+    if (helper.kind === 'siphon' && helper.keyAccepted === false) {
+      // The server is there and wants a key this sheet does not have right.
+      // Saying so now beats saving the address and reading a 401 at the
+      // first download.
+      setStatus(
+        'bad',
+        named(host, draft.key ? 'Your server, but it rejected that access key. It is the AUTH_TOKEN the server was started with.' : 'Your server, and it wants an access key — the AUTH_TOKEN it was started with.'),
+      );
+      $('cookiesBlock').hidden = true;
+      showPhoneHint(helper.lanUrls || []);
+      scopeYtdlp(null);
+      return null;
+    }
     reflectHelper(helper, host);
     // Recognising an instance is its stats endpoint answering, which every
     // public one still does. The endpoint a download needs is another door,
