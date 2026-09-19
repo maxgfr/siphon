@@ -54,12 +54,16 @@ jobs:
       - run: npm run test:split
 
   # Informative, not gating. A runner is a datacentre IP, and whether YouTube
-  # answers one on a given day is YouTube's decision, not this code's — a red
-  # here says "look", never "do not merge". What it must never be is silent:
-  # the log names the client that got through, or the exact refusal.
+  # answers one on a given day is YouTube's decision, not this code's. What it
+  # must never be is silent: the log names the client that got through, or
+  # the exact refusal, and the job summary says which it was.
+  #
+  # The measurement steps carry `continue-on-error`, not the job: a job that
+  # tolerates its own failure still ends up marked failed, and that red mark
+  # lands on every commit of main for an answer that is YouTube's. The step
+  # keeps its red cross in the log; the job, and so the commit, stay green.
   youtube:
     runs-on: ubuntu-latest
-    continue-on-error: true
     # The harness has its own 20-minute watchdog; this is the ceiling for
     # everything around it (installs, the probe, a hung browser), so an
     # informative job can never sit on a runner for hours.
@@ -80,22 +84,38 @@ jobs:
       # First, what YouTube's API says to a bare request from this runner:
       # one hand-built call per client, no browser, no relay, no library. A
       # red below is read against this instead of guessed at.
-      - run: node tests/innertube-probe.mjs
+      - id: probe
+        run: node tests/innertube-probe.mjs
+        continue-on-error: true
         env:
           SIPHON_PIPED_URL: https://pipedapi.kavin.rocks
-      - run: npm run test:youtube
+      - id: browser
+        run: npm run test:youtube
+        continue-on-error: true
         env:
           SIPHON_PIPED_URL: https://pipedapi.kavin.rocks
+      # The answer, where it is read without opening a log.
+      - run: |
+          {
+            echo "## YouTube from the browser mode, from this runner, today"
+            echo
+            echo "| measurement | outcome |"
+            echo "|---|---|"
+            echo "| InnerTube, one hand-built call per client | ${{ steps.probe.outcome }} |"
+            echo "| the app: the relay, Piped, the bundled Invidious list | ${{ steps.browser.outcome }} |"
+            echo
+            echo "A failure is YouTube's answer to a datacentre IP today, not this code's; the step's log quotes every refusal. The job stays green so that main is not marked red for it."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Informative, like `youtube`: the server half against the real site, from
   # this checkout, on a runner — the README's first recommendation, measured.
   # First plain, then with the community proof-of-origin provider beside it
   # (the docker-compose.potoken.yml arrangement), because a datacentre IP is
   # exactly the case that provider exists for. The log says what yt-dlp said,
-  # client by client, in both cases.
+  # client by client, in both cases. The step tolerates the failure, not the
+  # job, for the reason given above `youtube`.
   server-youtube:
     runs-on: ubuntu-latest
-    continue-on-error: true
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
@@ -114,6 +134,18 @@ jobs:
           node-version: "22"
       # The provider as the compose overlay runs it: the image, its port.
       - run: docker run -d --name potoken -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider:latest
-      - run: npm run test:server
+      - id: server
+        run: npm run test:server
+        continue-on-error: true
         env:
           POT_PROVIDER_URL: http://127.0.0.1:4416
+      - run: |
+          {
+            echo "## YouTube from the server, from this runner, today"
+            echo
+            echo "| measurement | outcome |"
+            echo "|---|---|"
+            echo "| yt-dlp, plain and then with the proof-of-origin provider | ${{ steps.server.outcome }} |"
+            echo
+            echo "A failure is YouTube's answer to a datacentre IP without a session, not this code's; the step's log quotes yt-dlp client by client. The job stays green so that main is not marked red for it."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -18,9 +18,11 @@ The four gating suites and the two informative ones run on every pull request:
 `fast` (the server suite and the unit tests) and `browser` (the four Playwright
 suites) gate the merge; `youtube` and `server-youtube` do not, because a runner
 is a datacentre IP and whether YouTube answers one on a given day is YouTube's
-decision, not this code's. A red there says *look*, never *do not merge* — and
-the log says exactly why: every step announces itself, every refusal is printed
-with its body.
+decision, not this code's. So the measurement step tolerates its own failure
+and the job stays green: the step's red cross and the job summary say what
+YouTube answered, and the log says exactly why — every step announces itself,
+every refusal is printed with its body — without the commit on `main` being
+marked red for an answer that is YouTube's.
 
 ## The device alone
 
