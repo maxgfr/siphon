@@ -31,7 +31,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator, Literal
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request as UrlRequest, urlopen
 
@@ -373,6 +373,10 @@ class Job:
     filename: str | None = None
     error: str | None = None
     created: float = field(default_factory=time.time)
+    # When the job reached done or error. The TTL counts from here, not from
+    # `created`: a fifty-track playlist can take longer than the TTL to fetch,
+    # and sweeping on age alone was deleting the directory under yt-dlp.
+    finished: float | None = None
     # Set once the postprocessing step starts, so the UI can stop showing a
     # percentage that has already hit 100 and say "converting" instead.
     stage: str = "starting"
@@ -426,10 +430,20 @@ RUNNING = threading.Semaphore(MAX_CONCURRENT_JOBS)
 
 
 def sweep_expired() -> None:
-    """Drop finished jobs and their files once they are past the TTL."""
+    """
+    Drop finished jobs and their files once they are past the TTL.
+
+    Only finished ones: a job still running is a download in progress, and
+    its directory is where yt-dlp is writing. How long it has been at it is
+    no reason to pull the disk out from under it.
+    """
     cutoff = time.time() - JOB_TTL_SECONDS
     with JOBS_LOCK:
-        stale = [job for job in JOBS.values() if job.created < cutoff]
+        stale = [
+            job
+            for job in JOBS.values()
+            if job.state in ("done", "error") and (job.finished or job.created) < cutoff
+        ]
         for job in stale:
             JOBS.pop(job.id, None)
     for job in stale:
@@ -639,6 +653,7 @@ def run_job(job: Job) -> None:
                 job.filename = chosen.name
                 job.progress = 1.0
                 job.stage = "ready"
+                job.finished = time.time()
                 job.state = "done"
                 return
             except Exception as exc:  # noqa: BLE001 — surfaced to the user verbatim
@@ -648,9 +663,10 @@ def run_job(job: Job) -> None:
                     continue
                 break
 
-        job.state = "error"
         job.stage = "failed"
         job.error = humanize_error(last_error or Exception("The download failed."), job.url)
+        job.finished = time.time()
+        job.state = "error"
 
 
 def humanize_error(exc: Exception, url: str = "") -> str:
@@ -1350,6 +1366,13 @@ async def tunnel(url: str, request: Request, key: str | None = None, authorizati
             return urlopen(UrlRequest(target, headers=headers), timeout=30)
         except HTTPError as exc:
             return exc  # an HTTPError is a response too; pass its status through
+        except (URLError, OSError) as exc:
+            # A host that cannot be reached at all — refused, unresolvable,
+            # silent past the timeout — is not this server's fault, and not
+            # a 500 with a traceback: it is the upstream, and the page reads
+            # a 502 as "try again", which is the right reading.
+            reason = getattr(exc, "reason", None) or exc
+            raise HTTPException(status_code=502, detail=f"Could not reach {host}: {reason}") from exc
 
     upstream = await asyncio.to_thread(open_upstream)
     status = getattr(upstream, "status", None) or getattr(upstream, "code", 502)

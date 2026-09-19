@@ -241,3 +241,13 @@ test('a relay address is a base of ours or a template of anyone\'s', () => {
   assert.equal(relayEscape('https://cors.eu.org/{raw}').via('https://a.b/c'), 'https://cors.eu.org/https://a.b/c');
   assert.equal(relayEscape(''), null);
 });
+
+/* ------------------------------------------------------------ the escapes */
+
+test('a relay and the bridge reach any host; a tunnel reaches only what its server resolved', () => {
+  assert.equal(new Fetcher().hasOpenEscape, false, 'nothing set');
+  assert.equal(new Fetcher({ escape: relayEscape('https://relay.example') }).hasOpenEscape, true);
+  const tunnel = new Fetcher({ escape: { name: 'tunnel', via: (url) => `https://ytdl.example/api/tunnel?url=${encodeURIComponent(url)}` } });
+  assert.equal(tunnel.hasEscape, true, 'a tunnel is an escape for the hosts it was told about');
+  assert.equal(tunnel.hasOpenEscape, false, 'but not for YouTube\'s own API, which no resolve names');
+});

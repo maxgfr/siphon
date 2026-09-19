@@ -18,7 +18,9 @@ import {
   titleFromUrl,
   extensionOf,
   innertubeFetch,
+  extract,
 } from '../web/extract.js';
+import { BackendError } from '../web/errors.js';
 import { pickSubtitle } from '../web/inbrowser.js';
 
 /* ------------------------------------------------------------------ sniffing */
@@ -606,4 +608,33 @@ test('no tracks at all is null, and nothing downstream has to guess', () => {
   assert.equal(pickSubtitle([], 'en'), null);
   assert.equal(pickSubtitle(undefined, 'en'), null);
   assert.equal(pickSubtitle([{ lang: 'en' }], 'en'), null, 'a track with no url is not a track');
+});
+
+/* ------------------------------------------------- youtube behind a tunnel */
+
+test('behind a server tunnel, a resolver\'s answer about YouTube is the answer — InnerTube is not tried through it', async () => {
+  // A server that only resolves: its tunnel carries the hosts it named and
+  // nothing else, so YouTube's API through it is refused before the first
+  // byte. The person must read what the server said (a bot wall, cookies),
+  // not the tunnel's refusal — and youtubei.js must not be fetched for it.
+  const net = { hasEscape: true, hasOpenEscape: false, hasBridge: false, escape: { name: 'tunnel' } };
+  const server = {
+    name: 'server',
+    generic: true,
+    resolve: async () => {
+      throw new BackendError('YouTube asked this server to prove it is not a bot, on every client tried.');
+    },
+  };
+  await assert.rejects(() => extract(WATCH, { net, resolvers: [server] }), /prove it is not a bot/);
+});
+
+test('with no escape at all, a resolver\'s final answer is final', async () => {
+  const net = { hasEscape: false, hasOpenEscape: false, hasBridge: false, escape: null };
+  const instance = { name: 'invidious', generic: false, resolve: async () => { throw new BackendError('That video is private.', { retryable: false }); } };
+  await assert.rejects(() => extract(WATCH, { net, resolvers: [instance] }), /private/);
+});
+
+test('with nothing to ask and no escape, YouTube is refused in a sentence that names the cure', async () => {
+  const net = { hasEscape: false, hasOpenEscape: false, hasBridge: false, escape: null };
+  await assert.rejects(() => extract(WATCH, { net, resolvers: [] }), (error) => /helper|relay|bridge/i.test(error.hint) && error.retryable === false);
 });

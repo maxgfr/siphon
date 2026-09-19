@@ -520,19 +520,29 @@ export function innertubeFetch(net) {
   };
 }
 
-let sessionPromise = null;
+/**
+ * One session per fetcher, not one for the page.
+ *
+ * The session keeps the fetch it was created with, and the fetch is what
+ * decides the route — the bridge, this relay, that relay. Settings can
+ * change under a running page, and each change builds a new Fetcher; a
+ * session cached on the module would go on using the old one, sending
+ * YouTube's calls to a relay the person has just cleared.
+ */
+const sessions = new WeakMap();
 
 async function youtubeSession(net) {
-  if (!sessionPromise) {
-    sessionPromise = (async () => {
+  if (!sessions.has(net)) {
+    const created = (async () => {
       const { Innertube } = await loadInnertube();
       return Innertube.create({ fetch: innertubeFetch(net), retrieve_player: true, generate_session_locally: true });
     })().catch((error) => {
-      sessionPromise = null;
+      sessions.delete(net);
       throw error;
     });
+    sessions.set(net, created);
   }
-  return sessionPromise;
+  return sessions.get(net);
 }
 
 /** Bot walls are worth another client; a private video is not. */
@@ -550,17 +560,24 @@ async function extractYouTube(url, context) {
   // browser on youtube.com goes first: a server with yt-dlp and cookies, an
   // instance. InnerTube from here, through an escape, is the last resort —
   // it works from a home connection and is bot-walled from a datacentre.
+  //
+  // "An escape" here means one that can carry YouTube's own API: the bridge
+  // or a relay. A server's tunnel carries only the hosts that server
+  // resolved, so through it InnerTube is refused before the first byte —
+  // and the answer the person would read is the tunnel's refusal rather
+  // than what the server actually said about the video.
+  const canReachYouTube = Boolean(context.net.hasOpenEscape);
   let instanceFailure = null;
   for (const resolver of context.resolvers || []) {
     try {
       return await resolver.resolve(url, context);
     } catch (error) {
-      if (error instanceof BackendError && error.retryable === false && !context.net.hasEscape) throw error;
+      if (error instanceof BackendError && error.retryable === false && !canReachYouTube) throw error;
       instanceFailure = error;
     }
   }
 
-  if (!context.net.hasEscape) {
+  if (!canReachYouTube) {
     if (instanceFailure) throw instanceFailure;
     throw new BackendError('YouTube will not talk to a web page directly.', {
       hint:

@@ -23,7 +23,7 @@ const trimSlash = (value) => String(value || '').trim().replace(/\/+$/, '');
 /** Public, tiny, unmistakable: a 200 whose body names a User-agent came from YouTube. */
 const ROBOTS = 'https://www.youtube.com/robots.txt';
 
-/** @typedef {{ kind: 'none'|'siphon'|'cobalt'|'piped'|'invidious'|'relay', label: string, ffmpeg?: boolean, lanUrls?: string[], hasCookies?: boolean, requiresKey?: boolean }} Endpoint */
+/** @typedef {{ kind: 'none'|'siphon'|'cobalt'|'piped'|'invidious'|'relay', label: string, ffmpeg?: boolean, lanUrls?: string[], hasCookies?: boolean, requiresKey?: boolean, keyAccepted?: boolean }} Endpoint */
 
 const NONE = Object.freeze({ kind: 'none', label: 'this device only' });
 
@@ -76,8 +76,20 @@ export async function detectEndpoint(address, key = '', fetchImpl = globalThis.f
   const health = await get('/api/health');
   if (health?.json?.service === 'siphon') {
     const body = health.json;
+    // Health answers everyone, so it cannot say whether the key in the sheet
+    // is the right one — and without this, a wrong key passed Test and failed
+    // at the first download. A gated endpoint is asked instead: 401 is the
+    // key being wrong or missing; a 404 is the key being taken. Reported
+    // rather than thrown, because the server is still a siphon server: a
+    // first visit at a keyed server adopts it and asks for the key later.
+    let keyAccepted = true;
+    if (body.requiresKey === true) {
+      const gate = await get('/api/jobs/key-check');
+      keyAccepted = gate?.status !== 401;
+    }
     return {
       kind: 'siphon',
+      keyAccepted,
       label: `yt-dlp ${body.ytDlpVersion || '?'}`,
       ytDlpVersion: body.ytDlpVersion || '',
       ffmpeg: body.ffmpeg !== false,

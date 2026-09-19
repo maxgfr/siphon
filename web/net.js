@@ -70,6 +70,18 @@ export class Fetcher {
     return this.hasBridge || this.hasRelay;
   }
 
+  /**
+   * Whether *any* host can be reached past the page's rules.
+   *
+   * The bridge and a relay fetch whatever they are handed. A server's
+   * tunnel does not: it carries only the hosts that server just resolved,
+   * so a request it was not told about — YouTube's own API, say — is
+   * refused, and asking it is a wasted round trip and a misleading error.
+   */
+  get hasOpenEscape() {
+    return this.hasBridge || this.escape?.name === 'relay';
+  }
+
   /** What the escape's URL looks like for a given target. */
   via(url) {
     return this.escape ? this.escape.via(url) : url;

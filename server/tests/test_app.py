@@ -137,6 +137,47 @@ def test_file_is_refused_while_the_job_is_unfinished(client: TestClient) -> None
         server_app.JOBS.pop(job.id, None)
 
 
+# ------------------------------------------------------------------- sweep
+
+
+class TestSweep:
+    @pytest.fixture(autouse=True)
+    def _isolate(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:  # noqa: ANN001
+        monkeypatch.setattr(server_app, "JOBS", {})
+        monkeypatch.setattr(server_app, "DOWNLOAD_ROOT", tmp_path)
+        monkeypatch.setattr(server_app, "JOB_TTL_SECONDS", 3600)
+
+    def _job(self, job_id: str, **kwargs) -> server_app.Job:  # noqa: ANN003
+        job = server_app.Job(id=job_id, url="https://example.com/v", preset="video_best", **kwargs)
+        job.directory.mkdir(parents=True, exist_ok=True)
+        server_app.JOBS[job.id] = job
+        return job
+
+    def test_a_running_job_is_never_swept_however_old(self) -> None:
+        """A long playlist outlives the TTL; its directory is where yt-dlp is writing."""
+        long_ago = server_app.time.time() - 10 * 3600
+        running = self._job("running", state="running", created=long_ago)
+        queued = self._job("queued", state="queued", created=long_ago)
+        server_app.sweep_expired()
+        assert "running" in server_app.JOBS and running.directory.exists()
+        assert "queued" in server_app.JOBS and queued.directory.exists()
+
+    def test_a_finished_job_is_swept_from_when_it_finished(self) -> None:
+        now = server_app.time.time()
+        # Started long ago, finished a minute ago: the file is still wanted.
+        fresh = self._job("fresh", state="done", created=now - 10 * 3600, finished=now - 60)
+        # Finished past the TTL: gone, files and all.
+        old = self._job("old", state="error", created=now - 10 * 3600, finished=now - 2 * 3600)
+        server_app.sweep_expired()
+        assert "fresh" in server_app.JOBS and fresh.directory.exists()
+        assert "old" not in server_app.JOBS and not old.directory.exists()
+
+    def test_a_finished_job_with_no_finish_time_falls_back_to_its_age(self) -> None:
+        self._job("legacy", state="done", created=server_app.time.time() - 2 * 3600)
+        server_app.sweep_expired()
+        assert "legacy" not in server_app.JOBS
+
+
 # -------------------------------------------------------------------- auth
 
 def test_auth_token_gates_every_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -767,6 +808,20 @@ class TestResolveAndTunnel:
         assert sent.get_header("Referer") == "https://site.example/"
         assert sent.get_header("User-agent") == "yt-dlp-ua"
         assert sent.get_header("X-internal") is None
+
+    def test_tunnel_reports_an_unreachable_upstream_as_a_502(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A host that refuses the connection is the upstream's failure, not a traceback."""
+        from urllib.error import URLError
+
+        client.post("/api/resolve", json={"url": "https://site.example/watch?v=abc"})
+
+        def refused(*_a, **_k):  # noqa: ANN002, ANN003
+            raise URLError(ConnectionRefusedError(111, "Connection refused"))
+
+        monkeypatch.setattr(server_app, "urlopen", refused)
+        response = client.get("/api/tunnel", params={"url": "https://cdn.example/v.webm"})
+        assert response.status_code == 502
+        assert "cdn.example" in response.json()["detail"]
 
     def test_tunnel_passes_an_upstream_refusal_through(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         client.post("/api/resolve", json={"url": "https://site.example/watch?v=abc"})
