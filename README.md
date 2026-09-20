@@ -79,13 +79,19 @@ Piped's [directory](https://piped-instances.kavin.rocks/), the opt-in list
 behind [cobalt.directory](https://cobalt.directory/)), then asks every
 instance exactly what this page asks — the video endpoint with an `Origin`
 header, then the first bytes of the media it names — and writes the ones that
-answered into `web/instances.json` as `open`. Those are the chips in settings,
-and **Find a public instance** walks them first. On a day none answered there
-are no chips and no search, only the field for an address you know, and a
-sentence saying so with the date: offering an instance that will refuse
-would look like a broken app. When the instance in use stops answering
-mid-download, the next few from the list are tried inside the same job,
-naming the one that delivered.
+answered into `web/instances.json` as `open`. Those are the chips in settings.
+On a day none answered there are no chips, only the field for an address you
+know and a sentence saying so with the date: offering an instance that will
+refuse would look like a broken app. **Find a public instance** is always
+there: it asks the Invidious project's own directory,
+[api.invidious.io/instances.json](https://api.invidious.io/instances.json),
+keeps the entries whose `api` field is `true`, and tests each one as the
+page would — then the day's list beside the app, then the other projects'
+directories. **Nothing is set by default:** a first visit is this device
+only, and an instance is something you pick and see named, never something
+picked for you. When the instance in use stops answering mid-download, the
+next few from the list are tried inside the same job, naming the one that
+delivered.
 
 **The measured state of it:** on 2026-09-17, the first full run asked 7
 Invidious, 5 Piped and 12 cobalt instances, and none answered a page for a
@@ -319,9 +325,11 @@ with real network, by asking each candidate exactly what the page asks:
   the app would send it, and the first whose tunnel streams bytes is kept.
 
 The first that passes is written in and Pages redeploys; nothing passing
-leaves the file empty, so a visitor is never pointed at a dead default. A
-public instance is a stranger's server that sees every link routed through
-it, and the app says so on screen.
+leaves the file empty. Only the relay is taken up by a visitor with nothing
+set: a cobalt instance found this way is recorded for the guide and the
+measurement, never adopted — a public instance is a stranger's server that
+sees every link routed through it, so it is something you pick in settings,
+where it is named, and never something picked for you.
 
 **Today's answer is empty.** Not one public proxy carried the page's requests,
 and the 12 cobalt instances on the opt-in list are keyed, refuse a runner, or

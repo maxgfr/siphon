@@ -193,18 +193,13 @@ const browser = await chromium.launch({
   args: ['--ignore-certificate-errors'],
 });
 
-async function fresh({ offerInstance = false } = {}) {
+async function fresh() {
   const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 412, height: 915 } });
   const page = await context.newPage();
   page.on('pageerror', (error) => context.__errors.push(error.message));
   context.__errors = [];
-  // A first visit with nothing behind the page goes looking for a public
-  // instance, which means contacting real directories and real strangers. No
-  // test may do that, so the "already offered" flag is set unless a case is
-  // specifically about the search.
-  if (!offerInstance) {
-    await page.addInitScript(() => localStorage.setItem('siphon:instance-offered', '1'));
-  }
+  // A first visit with nothing behind the page contacts nobody: no public
+  // instance is adopted by default, and `__offsite` is what proves it.
   context.__offsite = [];
   page.on('request', (request) => {
     const host = new URL(request.url()).host;
@@ -334,9 +329,9 @@ for (const [old, expected] of [
   const tapped = { address: await page.inputValue('#endpoint'), status: (await page.textContent('#statusText')) || '' };
   check('tapping one fills the address in and tests it', tapped.address === `${BASE}/two` && !/not checked|checking/i.test(tapped.status),
     `${tapped.address} — ${tapped.status.slice(0, 60)}`);
-  // A day none answered: no chips, no Find, the field, and a sentence that
-  // says so — offering an instance that will refuse would look like a
-  // broken app.
+  // A day none answered: no chips, the field, and a sentence that says so —
+  // offering an instance that will refuse would look like a broken app. Find
+  // stays, because it asks the live directory rather than the day's file.
   overrides.set('/siphon/instances.json', JSON.stringify({ invidious: listed, open: [], measured: '2026-09-17' }));
   await page.reload({ waitUntil: 'networkidle' });
   await page.waitForTimeout(1200);
@@ -348,8 +343,8 @@ for (const [old, expected] of [
     note: document.getElementById('openNote').textContent,
     field: Boolean(document.getElementById('endpoint')),
   }));
-  check('when none answered a page, no chip and no Find are offered', none.chips === 0 && none.find === true, JSON.stringify({ chips: none.chips, find: none.find }));
-  check('only the field, and a sentence saying so with the date', none.field && /Measured 2026-09-17: no public instance answered/.test(none.note), none.note.slice(0, 80));
+  check('when none answered a page, no chip is offered, and Find still is', none.chips === 0 && none.find === false, JSON.stringify({ chips: none.chips, find: none.find }));
+  check('the field, and a sentence saying so with the date and where Find looks', none.field && /Measured 2026-09-17: no public instance answered/.test(none.note) && /Invidious directory/.test(none.note), none.note.slice(0, 80));
   overrides.delete('/siphon/instances.json');
   // Back to an empty box for what follows, which is written for one.
   await page.fill('#endpoint', '');
@@ -518,7 +513,7 @@ for (const [old, expected] of [
   overrides.delete('/siphon/config.json');
 }
 
-/* 5b. No relay, but a cobalt instance the measurement saw deliver: adopted, and named as public. */
+/* 5b. No relay, but a cobalt instance in config.json: not adopted — no public instance is, by default. */
 {
   overrides.set('/siphon/config.json', JSON.stringify({ relay: '', relayKind: '', instance: '', cobalt: `${BASE}/cobalt` }));
   const { context, page } = await fresh();
@@ -526,11 +521,11 @@ for (const [old, expected] of [
   await page.goto(APP, { waitUntil: 'networkidle' });
   await page.waitForTimeout(2500);
   const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:settings') || '{}'));
-  check("the site's measured cobalt instance is taken when there is no relay", saved.helper?.kind === 'cobalt' && saved.endpoint === `${BASE}/cobalt`,
+  check('a cobalt instance in config.json is not adopted: a first visit is this device only', saved.helper?.kind === 'none' && !saved.endpoint,
     JSON.stringify({ helper: saved.helper?.kind, endpoint: saved.endpoint }));
   const notice = (await page.textContent('#feedback')) || '';
-  check('and named as a public instance that sees the links', /public cobalt instance/.test(notice) && notice.includes('127.0.0.1:8443'), notice.replace(/\s+/g, ' ').slice(0, 90));
-  check('nothing was contacted off this machine', context.__offsite.length === 0, context.__offsite.slice(0, 3).join(', '));
+  check('and no notice names an instance', !/public cobalt instance|Using a public instance/.test(notice), notice.replace(/\s+/g, ' ').slice(0, 90));
+  check('the instance in config.json was never contacted', !context.__offsite.length && !(await page.evaluate(() => performance.getEntriesByType('resource').some((e) => e.name.includes('/cobalt')))));
   await context.close();
   overrides.delete('/siphon/config.json');
 }

@@ -11,7 +11,7 @@
  * primary action pinned within thumb reach, and no interaction that needs a
  * hover or a precise tap.
  */
-import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, bundledInfo, looksUnreachable, privacyNote, describeEndpoint, servesPages } from './api.js';
+import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, bundledInfo, privacyNote, describeEndpoint, servesPages } from './api.js';
 import { looksLikeUrl, urlsIn } from './links.js';
 
 const SETTINGS_KEY = 'siphon:settings';
@@ -34,11 +34,6 @@ const DEFAULT_SETTINGS = Object.freeze({
   endpoint: '',
   key: '',
   helper: NO_HELPER,
-  // Whether siphon may go looking for a public instance on its own — to fill
-  // in a first visit, or to replace one that has died. Someone who clears the
-  // address is saying they would rather it did not, so clearing turns this off
-  // and it stays off.
-  autoInstance: true,
   // Where ffmpeg.wasm is fetched from. Blank is the copy deployed beside the
   // app, and there is no field for it: it is here for tests and for anyone
   // who edits storage by hand.
@@ -118,7 +113,6 @@ async function pickInitialHelper() {
   }
 }
 
-const INSTANCE_OFFERED = 'siphon:instance-offered';
 const SITE_RELAY_TAKEN = 'siphon:site-relay';
 const TOUR_SEEN = 'siphon:tour-seen';
 
@@ -148,6 +142,12 @@ function siteConfig() {
 /**
  * Take the site's relay, once, when nothing else is set.
  *
+ * The relay is the one thing adopted without being asked, because it is the
+ * site owner's own and keeps every download on this device. A public
+ * instance is never adopted by default — not the measured cobalt in
+ * config.json, not the bundled lists: those are one tap away in settings,
+ * chosen and named, never chosen for the person.
+ *
  * The person still sees whose server their YouTube links will reach — the
  * notice names it, and settings show it — and clearing it is one tap. Tried
  * again on a later visit only if the relay could not be reached this time,
@@ -158,15 +158,11 @@ async function adoptSiteRelay() {
   try {
     if (localStorage.getItem(SITE_RELAY_TAKEN) === '1') return false;
   } catch { /* storage off: once per session is the harmless side */ }
-  const { relay, relayKind, instance, cobalt } = await siteConfig();
-  // The relay first — it keeps the download on this device — and, failing
-  // one, a cobalt instance the daily measurement saw deliver a YouTube file:
-  // that one does the whole download itself and sees every link.
-  const address = relay || cobalt;
-  if (!address) return false;
+  const { relay, relayKind, instance } = await siteConfig();
+  if (!relay) return false;
   let helper;
   try {
-    helper = await detectEndpoint(address);
+    helper = await detectEndpoint(relay);
   } catch {
     return false;
   }
@@ -175,21 +171,7 @@ async function adoptSiteRelay() {
   } catch { /* nothing to do */ }
   // A helper the person chose in the meantime wins; so does an address that
   // turned out to be something else than the measurement said.
-  const expected = relay ? 'relay' : 'cobalt';
-  if (helper.kind !== expected || settings.helper.kind !== 'none' || settings.endpoint) return false;
-
-  if (!relay) {
-    settings = { ...settings, endpoint: cobalt, key: '', helper };
-    saveSettings();
-    applyBackend();
-    refreshBackendLabel();
-    renderFeedback(
-      '<div class="notice"><p><strong>Using a public instance.</strong> ' +
-        `Links this device cannot read itself go to <strong>${escapeHtml(hostOf(cobalt))}</strong>, a public cobalt instance ` +
-        'that does the download and sees those links — it was the one that delivered YouTube today. Change or clear it in settings.</p></div>',
-    );
-    return true;
-  }
+  if (helper.kind !== 'relay' || settings.helper.kind !== 'none' || settings.endpoint) return false;
 
   settings = { ...settings, endpoint: relay, key: '', helper, siteInstance: instance };
   saveSettings();
@@ -207,58 +189,6 @@ async function adoptSiteRelay() {
       ' Change or clear it in settings.</p></div>',
   );
   return true;
-}
-
-/**
- * Nothing behind the page, so go and find a public instance.
- *
- * Runs after the first screen is already usable, because it talks to
- * directories and then to several strangers, and none of that should hold up
- * a paste. When one answers it is applied and *named* — the person has to be
- * able to see whose server their links are about to reach, and to undo it.
- *
- * Once per browser: if the search finds nothing, or the person clears the
- * address afterwards, it is not tried again behind their back.
- */
-async function offerPublicInstance() {
-  if (!settings.autoInstance) return;
-  try {
-    if (localStorage.getItem(INSTANCE_OFFERED) === '1') return;
-  } catch {
-    /* storage off: offering once per session is the harmless side */
-  }
-  // Only when the daily measurement saw at least one instance answer a page:
-  // a search that would contact a dozen strangers to find nothing is not
-  // worth a first visit's time, and the day's answer is already beside the app.
-  const { open } = await bundledInfo().catch(() => ({ open: [] }));
-  if (open.length === 0) return;
-  const found = await findInstance({ detect: (address) => detectEndpoint(address), verify: servesPages }).catch(() => null);
-  try {
-    localStorage.setItem(INSTANCE_OFFERED, '1');
-  } catch { /* nothing to do */ }
-  // A helper the person chose in the meantime wins over anything found here.
-  if (!found || settings.helper.kind !== 'none' || settings.endpoint) return;
-
-  settings = { ...settings, endpoint: found.endpoint, key: '', helper: found.helper };
-  saveSettings();
-  applyBackend();
-  refreshBackendLabel();
-  renderFeedback(
-    '<div class="notice"><p><strong>Using a public instance.</strong> ' +
-      `Nothing of yours is running, so links this device cannot read itself go to ` +
-      `<strong>${escapeHtml(hostOf(found.endpoint))}</strong>, which is someone else's server and sees them. ` +
-      'Change or clear it in settings.</p>' +
-      '<button class="retry" type="button" id="instanceSettings">Settings</button> ' +
-      '<button class="retry" type="button" id="instanceClear">Use this device only</button></div>',
-  );
-  $('instanceSettings')?.addEventListener('click', openSettings);
-  $('instanceClear')?.addEventListener('click', () => {
-    settings = { ...settings, endpoint: '', key: '', helper: NO_HELPER, autoInstance: false };
-    saveSettings();
-    applyBackend();
-    refreshBackendLabel();
-    renderFeedback('');
-  });
 }
 
 const hostOf = (url) => {
@@ -556,61 +486,6 @@ function cancelEntry(key) {
   renderQueue();
 }
 
-/**
- * An instance that has stopped answering is replaced, once, and the download
- * retried.
- *
- * Instances come and go — that is the deal with using someone else's server —
- * and the list that found this one has others on it. Doing nothing with that
- * list means a dead instance looks like a dead app.
- *
- * Bounded on purpose: at most a couple of switches in a session, never for a
- * failure that is about the video rather than the helper, and never silently.
- */
-const SWITCH_LIMIT = 2;
-/** The helpers that are someone else's public instance, and so have peers to fall back to. */
-const PUBLIC_KINDS = new Set(['cobalt', 'piped', 'invidious']);
-let switches = 0;
-const spentInstances = new Set();
-
-async function switchInstance(entry) {
-  if (!settings.autoInstance) return false;
-  if (!PUBLIC_KINDS.has(settings.helper.kind)) return false;
-  if (switches >= SWITCH_LIMIT || !looksUnreachable(entry.error || '')) return false;
-
-  switches += 1;
-  spentInstances.add(settings.endpoint);
-  const dead = hostOf(settings.endpoint);
-  const found = await findInstance({
-    detect: (address) => detectEndpoint(address),
-    verify: servesPages,
-    exclude: [...spentInstances],
-  }).catch(() => null);
-  if (!found) {
-    renderFeedback(
-      '<div class="notice error" role="alert"><p><strong>' + escapeHtml(dead) + ' stopped answering,</strong> ' +
-        'and no other public instance answered either. Try again later, or run your own server.</p></div>',
-    );
-    return false;
-  }
-
-  settings = { ...settings, endpoint: found.endpoint, key: '', helper: found.helper };
-  saveSettings();
-  applyBackend();
-  refreshBackendLabel();
-  renderFeedback(
-    '<div class="notice"><p><strong>Switched instance.</strong> ' +
-      `${escapeHtml(dead)} stopped answering, so this is now going through ` +
-      `<strong>${escapeHtml(hostOf(found.endpoint))}</strong>. Change or clear it in settings.</p></div>`,
-  );
-  return true;
-}
-
-/** An entry has just failed: switch instance and try again, or leave it failed. */
-async function afterFailure(entry) {
-  if (await switchInstance(entry)) retryEntry(entry.key);
-}
-
 function retryEntry(key) {
   const entry = findEntry(key);
   if (!entry) return;
@@ -687,7 +562,6 @@ async function enqueueOne(url, { preset = settings.preset, playlist = false, tit
     entry.state = 'error';
     entry.error = error instanceof BackendError ? error.message : String(error?.message || error);
     if (error instanceof BackendError && error.hint) entry.error += ` ${error.hint}`;
-    afterFailure(entry);
   }
   saveQueue();
   renderQueue();
@@ -732,7 +606,6 @@ async function pollAll() {
         } else if (job.state === 'error') {
           entry.state = 'error';
           entry.error = job.error || 'The download failed.';
-          afterFailure(entry);
         }
       } catch (error) {
         // A 404 means the server swept it. A refusal — the key is wrong —
@@ -917,21 +790,22 @@ const SUGGESTED = 3;
 
 /**
  * The instances the daily measurement saw answer a page for a video, as
- * chips: tap one and the address is filled in and tested. Nothing is offered
+ * chips: tap one and the address is filled in and tested. No chip is offered
  * on a day none did — the field is still there for an address you know —
  * and the sentence beside it says which of the two it is, and when it was
- * measured. "Find a public instance" is offered only when there is something
- * to find.
+ * measured. "Find a public instance" is always there: it asks the Invidious
+ * project's directory for the instances with their API on and tests each
+ * one, which is the live answer on any day.
  */
 async function renderSuggested() {
   const box = $('suggested');
   const { open, measured } = await bundledInfo().catch(() => ({ open: [], measured: '' }));
   const list = open.slice(0, SUGGESTED);
   box.hidden = list.length === 0;
-  $('findInstance').hidden = open.length === 0;
+  $('findInstance').hidden = false;
   $('openNote').textContent = open.length
-    ? `Measured ${measured || 'recently'}: ${open.length === 1 ? 'this instance answered' : `these ${open.length} instances answered`} a web page for a video. Tap one to fill it in and test it, or paste another.`
-    : `${measured ? `Measured ${measured}: no` : 'No'} public instance answered a web page for a video, so none is offered. Paste one you know, or use a relay or your own server — those are never refused.`;
+    ? `Measured ${measured || 'recently'}: ${open.length === 1 ? 'this instance answered' : `these ${open.length} instances answered`} a web page for a video. Tap one to fill it in and test it, paste another, or Find asks the Invidious directory for more.`
+    : `${measured ? `Measured ${measured}: no` : 'No'} public instance answered a web page for a video, so none is offered. Find asks the Invidious directory for the instances with their API on and tests each; or paste one you know, or use a relay or your own server — those are never refused.`;
   box.innerHTML = list
     .map((entry) => `<button type="button" class="chip-btn" data-address="${escapeHtml(entry.url)}">${escapeHtml(hostOf(entry.url))}<small> · ${escapeHtml(entry.kind)}</small></button>`)
     .join('');
@@ -1365,9 +1239,7 @@ function init() {
     // reached is not saved, and the reason stays on screen.
     const helper = await probeDraft();
     if (!helper) return;
-    // An address typed in by hand is a decision. Nothing should quietly
-    // replace it afterwards, so saving one turns the automatic search off.
-    settings = { ...draftSettings(), helper, autoInstance: !draftSettings().endpoint };
+    settings = { ...draftSettings(), helper };
     saveSettings();
     applyBackend();
     $('settings').close();
@@ -1411,12 +1283,11 @@ async function boot(firstVisit) {
   await restoreQueue();
   refreshBackendLabel();
   setupTour();
-  // The site's own relay first — the owner set it up for exactly this — and
-  // only failing that, on a genuine first visit, a public instance. Neither
-  // holds up a paste: the screen is already usable. Someone who has used the
-  // app before with no helper chose that, and is not searched for again.
-  const adopted = await adoptSiteRelay();
-  if (!adopted && firstVisit && settings.helper.kind === 'none' && !settings.endpoint) offerPublicInstance();
+  // The site's own relay, if the owner set one up — and nothing else: no
+  // public instance is ever adopted by default. Someone who wants one finds
+  // it in settings, where it is named. This does not hold up a paste: the
+  // screen is already usable.
+  await adoptSiteRelay();
   fillTour();
 }
 

@@ -8,7 +8,7 @@ still unproven.
 | `pytest server/tests` | the server, including two against real yt-dlp on loopback, the per-job yt-dlp options, the sweep that leaves a running job alone, the tunnel's answer for an upstream it cannot reach, and the converter vendoring | 162 pass |
 | `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh and the daily measurement of which instances answer a page, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them, the links in a pasted or dropped text, the age of a server's yt-dlp, the access key checked before an address is saved, YouTube behind a tunnel answered by the server rather than by the tunnel's refusal, and the service worker's shell holding every module the app loads | 195 pass |
 | `npm run test:e2e` | the device alone, real Chromium, two origins; a fake Invidious, a fake Piped and a fake cobalt each carrying a YouTube link; a pasted list of links; the bundled converter | 54 pass |
-| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips from the measured list and none when it is empty, an instance whose video endpoint is shut, the yt-dlp options riding with a job, the guide and its bookmarklet, a dropped link, a paste with nothing focused, the site's relay or cobalt instance | 73 pass |
+| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips from the measured list and none when it is empty, an instance whose video endpoint is shut, the yt-dlp options riding with a job, the guide and its bookmarklet, a dropped link, a paste with nothing focused, the site's relay taken and a cobalt instance in config.json left alone, Find offered on a day the measured list is empty | 73 pass |
 | `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
 | `npm run test:split` | a server that only resolves, a device that downloads | 24 pass |
 | `npm run test:youtube` | YouTube, for real, from the browser mode in CI — through the relay, Piped, and the bundled Invidious list | informative — see [youtube.md](youtube.md) |
@@ -27,17 +27,23 @@ marked red for an answer that is YouTube's.
 ## The device alone
 
 Finding a public instance is covered with the bundled list, the directories
-and the probe all stubbed: that the bundled list is tried first and alone when
-one of it answers, that the directories are asked only when it does not, that
-a listed address is only used once it has answered for itself, that an
+and the probe all stubbed: that the Invidious directory is asked first,
+filtered to the entries whose `api` field is `true`, and alone when one of
+it answers; that the measured list and then the full list beside the app
+follow when it does not, and the other directories after those; that a
+listed address is only used once it has answered for itself, that an
 instance listed as offline is never even contacted, that a directory which
 changed shape is ignored rather than thrown on, that a siphon server or a relay
 appearing in such a list is not mistaken for an instance, that the Invidious
-directory's `[name, details]` pairs are read with onion, API-less and CORS-less
-entries left out, that cobalt's directory is read in every shape it has had
-and its source repository behind it, and that the number of strangers
-contacted on a first visit is capped — and spread across the directories, so a
-long cobalt list cannot crowd the YouTube-only kinds out of that budget.
+directory's `[name, details]` pairs are read with onion and API-off entries
+left out (the `api` flag is a boolean, and a claim the probe then checks),
+that cobalt's directory is read in every shape it has had and its source
+repository behind it, and that the number of strangers contacted in one
+search is capped — and spread across the other directories, so a long cobalt
+list cannot crowd Piped out of that budget. Nothing is adopted by default:
+the deployed suite checks that a first visit with a cobalt instance in
+`config.json` stays "this device only" and contacts nobody, and that Find is
+offered on a day the measured list is empty.
 Detection is covered for every kind, including an Invidious instance whose
 stats endpoint is switched off — the default — which is then known by the one
 sentence it refuses with. The replica walk is pinned with a stubbed network: a
