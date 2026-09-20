@@ -92,9 +92,11 @@ test('Piped is taken when no cobalt instance answers', async () => {
   assert.equal((await findInstance({ fetchImpl, detect })).endpoint, 'https://p.example');
 });
 
-test('the Invidious directory is read in its own pair shape, and the unreachable are left out', async () => {
-  // api.invidious.io answers [name, details] pairs: onion and i2p entries a
-  // browser cannot reach, instances with the API off, and clearnet ones.
+test('the Invidious directory is read in its own pair shape, filtered on api: true', async () => {
+  // api.invidious.io answers [name, details] pairs. The `api` flag is the
+  // filter: an instance that says its API is on is a candidate, whatever
+  // else it says; one with the API off, or an address a browser cannot
+  // resolve, is not. The probe decides the rest.
   const { fetchImpl } = directories({
     [COBALT_LIST]: [],
     [PIPED_LIST]: [],
@@ -102,6 +104,7 @@ test('the Invidious directory is read in its own pair shape, and the unreachable
       ['inv.example', { type: 'https', uri: 'https://inv.example', api: true, cors: true }],
       ['dark.onion', { type: 'onion', uri: 'http://dark.onion', api: true }],
       ['noapi.example', { type: 'https', uri: 'https://noapi.example', api: false }],
+      ['unsaid.example', { type: 'https', uri: 'https://unsaid.example' }],
       ['nocors.example', { type: 'https', uri: 'https://nocors.example', api: true, cors: false }],
       ['ygg', { type: 'https', uri: 'https://inv.nadeko.ygg', api: true, cors: true }],
       'not a pair at all',
@@ -109,9 +112,10 @@ test('the Invidious directory is read in its own pair shape, and the unreachable
   });
   const { detect, probed } = prober({ 'https://inv.example': { kind: 'invidious', label: 'Invidious instance' } });
 
-  const found = await findInstance({ fetchImpl, detect, candidates: 1 });
+  const found = await findInstance({ fetchImpl, detect });
   assert.equal(found.endpoint, 'https://inv.example');
-  assert.deepEqual(probed, ['https://inv.example'], 'the first candidate was the one clearnet entry with an API');
+  assert.deepEqual(probed.sort(), ['https://inv.example', 'https://nocors.example'], 'only the clearnet entries that say api: true');
+  assert.deepEqual(DIRECTORIES[2].read([['x', { type: 'https', uri: 'https://x.example', api: 'true' }]]), [], 'the flag is a boolean, not a string');
 });
 
 test('Invidious is preferred over cobalt: it is the plan for YouTube, and it answers a page', async () => {
@@ -142,27 +146,45 @@ test('Invidious is preferred over Piped, both reaching only YouTube', async () =
   assert.equal((await findInstance({ fetchImpl, detect })).helper.kind, 'invidious');
 });
 
-/* ------------------------------------------------- the list beside the app */
+/* ------------------------------------ the directory first, then the lists */
 
-test('the bundled list is tried first, and alone when one of it answers', async () => {
-  // web/instances.json is same-origin and the plan; the directories are
-  // strangers and the fallback. When the bundled list delivers, no directory
-  // is contacted at all.
+test('the Invidious directory is asked first, and alone when one of it answers', async () => {
+  // api.invidious.io is the live list and the plan. When one of its
+  // api-on instances answers, neither the file beside the app nor the
+  // other directories are touched.
   const { fetchImpl, asked } = directories({
     bundled: ['https://one.example', 'https://two.example'],
     [COBALT_LIST]: [{ api: 'c.example' }],
     [PIPED_LIST]: [],
-    [INVIDIOUS_LIST]: [],
+    [INVIDIOUS_LIST]: [['inv.example', { type: 'https', uri: 'https://inv.example', api: true }]],
+  });
+  const { detect, probed } = prober({
+    'https://inv.example': { kind: 'invidious', label: 'Invidious instance' },
+    'https://two.example': { kind: 'invidious', label: 'Invidious instance' },
+  });
+
+  const found = await findInstance({ fetchImpl, detect });
+  assert.equal(found.endpoint, 'https://inv.example');
+  assert.deepEqual(probed, ['https://inv.example'], 'nothing beyond the directory was probed');
+  assert.ok(!asked.includes(COBALT_LIST) && !asked.some(isBundled), 'neither the file nor another directory was asked');
+});
+
+test('when the directory yields nothing that answers, the list beside the app follows', async () => {
+  const { fetchImpl, asked } = directories({
+    bundled: ['https://one.example', 'https://two.example'],
+    [COBALT_LIST]: [{ api: 'c.example' }],
+    [PIPED_LIST]: [],
+    [INVIDIOUS_LIST]: [['dead.example', { type: 'https', uri: 'https://dead.example', api: true }]],
   });
   const { detect, probed } = prober({ 'https://two.example': { kind: 'invidious', label: 'Invidious instance' } });
 
   const found = await findInstance({ fetchImpl, detect });
   assert.equal(found.endpoint, 'https://two.example');
-  assert.deepEqual(probed.sort(), ['https://one.example', 'https://two.example']);
-  assert.ok(!asked.includes(COBALT_LIST), 'no directory was asked');
+  assert.deepEqual(probed, ['https://dead.example', 'https://one.example', 'https://two.example']);
+  assert.ok(!asked.includes(COBALT_LIST), 'the other directories were not needed');
 });
 
-test('when nothing on the bundled list answers, the directories are asked', async () => {
+test('when nothing on the bundled list answers either, the other directories are asked', async () => {
   const { fetchImpl, asked } = directories({
     bundled: ['https://dead.example'],
     [COBALT_LIST]: [{ api: 'c.example' }],
@@ -173,7 +195,7 @@ test('when nothing on the bundled list answers, the directories are asked', asyn
 
   const found = await findInstance({ fetchImpl, detect });
   assert.equal(found.endpoint, 'https://c.example');
-  assert.ok(probed.includes('https://dead.example'), 'the bundled one was tried first');
+  assert.ok(probed.includes('https://dead.example'), 'the bundled one was tried before');
   assert.ok(asked.includes(COBALT_LIST));
 });
 
@@ -194,9 +216,10 @@ test('an excluded address on the bundled list is skipped, so a dead one is not o
   assert.ok(!probed.includes('https://dead.example'));
 });
 
-test('the measured list is probed first, and alone when one of it answers', async () => {
+test('the measured list opens the bundled rounds, and alone when one of it answers', async () => {
   // `open` is what the daily measurement saw answer a page; it is short and
-  // the likeliest, so it gets a round to itself before the full lists.
+  // the likeliest, so once the directory is spent it gets a round to itself
+  // before the full lists.
   const { fetchImpl, asked } = directories({
     open: [{ url: 'https://open.example/', kind: 'piped' }, { url: 'https://also.example', kind: 'invidious' }],
     bundled: ['https://one.example', 'https://two.example'],
@@ -311,7 +334,7 @@ test('a siphon server or a relay in a public list is not a public instance', asy
   assert.equal(await findInstance({ fetchImpl, detect }), null);
 });
 
-test('the number of strangers contacted on a first visit is capped', async () => {
+test('the number of strangers contacted in one search is capped', async () => {
   const many = Array.from({ length: 40 }, (_, i) => ({ api: `x${i}.example` }));
   const { fetchImpl } = directories({ [COBALT_LIST]: many, [PIPED_LIST]: [] });
   const { detect, probed } = prober({});
@@ -320,9 +343,10 @@ test('the number of strangers contacted on a first visit is capped', async () =>
   assert.equal(probed.length, 6);
 });
 
-test('the cap is spread across the directories, not spent on the first list', async () => {
+test('the cap is spread across the other directories, not spent on the first list', async () => {
   // cobalt publishes a long list. If it were walked first, the budget would
-  // be gone before a single YouTube-only instance was tried.
+  // be gone before a single Piped instance was tried. Invidious has its own
+  // round before any of this.
   const many = Array.from({ length: 20 }, (_, i) => ({ api: `c${i}.example` }));
   const { fetchImpl } = directories({
     [COBALT_LIST]: many,
@@ -332,9 +356,9 @@ test('the cap is spread across the directories, not spent on the first list', as
   const { detect, probed } = prober({});
 
   await findInstance({ fetchImpl, detect, candidates: 4 });
-  assert.equal(probed.length, 4);
-  assert.ok(probed.includes('https://p.example'), 'Piped was within the budget');
-  assert.ok(probed.includes('https://inv.example'), 'and so was Invidious');
+  assert.deepEqual(probed[0], 'https://inv.example', 'the Invidious directory came first, on its own');
+  assert.equal(probed.length, 1 + 4, 'then one capped round across the others');
+  assert.ok(probed.includes('https://p.example'), 'with Piped within the budget');
 });
 
 test('http-only instances are left out — a page on https cannot call them — and duplicates are dropped', async () => {

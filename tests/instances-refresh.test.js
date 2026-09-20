@@ -32,7 +32,7 @@ const DOCS_HTML = `<!doctype html><html><body>
 <ul><li><a href="http://something.i2p">something.i2p</a></li></ul>
 </body></html>`;
 
-test('the API answer is read as [name, details] pairs, clearnet and API-on only', () => {
+test('the API answer is read as [name, details] pairs, clearnet and api: true only', () => {
   const list = fromDirectory([
     ['yewtu.be', { type: 'https', uri: 'https://yewtu.be/', api: true, cors: true }],
     ['dark', { type: 'onion', uri: 'http://dark.onion', api: true }],
@@ -42,7 +42,9 @@ test('the API answer is read as [name, details] pairs, clearnet and API-on only'
     ['yewtu.be', { type: 'https', uri: 'https://yewtu.be', api: true }],
     'not a pair',
   ]);
-  assert.deepEqual(list, ['https://yewtu.be', 'https://inv.nadeko.net']);
+  // `nocors` stays: the flag is a claim, and the measurement below is what
+  // decides whether a page can read the instance.
+  assert.deepEqual(list, ['https://yewtu.be', 'https://nocors.example', 'https://inv.nadeko.net']);
 });
 
 test('overlay-network addresses listed as https are still left out — a browser cannot resolve them', () => {

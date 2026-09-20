@@ -109,14 +109,15 @@ export function fromPipedDirectory(body) {
 }
 
 /**
- * The API answers `[name, details]` pairs. Only clearnet ones with the API
- * on are of use to a page; the `cors` flag is honoured when present.
+ * The API answers `[name, details]` pairs. `api: true` is the filter, the
+ * same one the app applies: the clearnet instances that say their API is
+ * on are the candidates, and the measurement below is the truth about each.
  */
 export function fromDirectory(body) {
   return unique(
     (Array.isArray(body) ? body : [])
       .map((entry) => (Array.isArray(entry) ? entry[1] : null))
-      .filter((d) => d && d.type === 'https' && d.api !== false && d.cors !== false && d.uri)
+      .filter((d) => d && d.type === 'https' && d.api === true && d.uri)
       .map((d) => trimSlash(d.uri))
       .filter(reachable),
   );

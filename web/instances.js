@@ -43,6 +43,13 @@ const reachable = (url) => {
  */
 export const COBALT_DIRECTORY = 'https://cobalt.directory/api/working?type=api';
 
+/**
+ * The Invidious project's own directory: `[name, details]` pairs, each with
+ * an `api` flag saying whether the instance has its API on. That flag is
+ * the filter, and the probe that follows is the truth.
+ */
+export const INVIDIOUS_DIRECTORY = 'https://api.invidious.io/instances.json';
+
 const passes = (value) =>
   value === true || value === 1 || (typeof value === 'string' && /^(ok|pass(ed)?|success|working|true|online|up)$/i.test(value)) ||
   (value && typeof value === 'object' && (value.ok === true || value.working === true || value.success === true || value.passed === true || passes(value.status)));
@@ -118,15 +125,15 @@ export const DIRECTORIES = Object.freeze([
   },
   {
     kind: 'invidious',
-    url: 'https://api.invidious.io/instances.json',
-    // Entries are [name, details] pairs. Only clearnet ones with the API on
-    // are any use to a page: an onion address is unreachable from a browser,
-    // and an instance that has turned its API off answers nothing a page
-    // can read.
+    url: INVIDIOUS_DIRECTORY,
+    // Entries are [name, details] pairs. `api: true` is the filter — an
+    // instance that says its API is on is a candidate, and nothing else is
+    // assumed about it: whether it answers a page is what the probe decides.
+    // Overlay addresses are left out because a browser cannot resolve them.
     read: (body) =>
       (Array.isArray(body) ? body : [])
         .map((entry) => (Array.isArray(entry) ? entry[1] : null))
-        .filter((d) => d && d.type === 'https' && d.api !== false && d.cors !== false && d.uri)
+        .filter((d) => d && d.type === 'https' && d.api === true && d.uri)
         .map((d) => d.uri)
         .filter(reachable),
   },
@@ -324,25 +331,31 @@ export async function findInstance({ fetchImpl = globalThis.fetch, detect, candi
     return found[0] || null;
   };
 
-  // Round zero: what the daily measurement saw answer a page — the shortest
-  // list and the likeliest, so it goes first and alone.
+  // Round one: the Invidious project's directory, filtered to the
+  // instances that say their API is on. It is the live list and the plan;
+  // every address on it is still probed before it is trusted.
+  const invidious = DIRECTORIES.find((directory) => directory.kind === 'invidious');
+  const listed = await probe(fresh(await askDirectory(invidious, fetchImpl, timeout)));
+  if (listed) return listed;
+
+  // Round two: what the daily measurement saw answer a page, beside the app —
+  // the shortest list and, when the directory could not be reached, the
+  // likeliest.
   const info = await bundledInfo({ fetchImpl, timeout });
   const measured = await probe(fresh(info.open.map((entry) => entry.url)));
   if (measured) return measured;
 
-  // Round one: the list published beside the app. It is the plan, so it gets
-  // the whole budget to itself before a single directory is contacted.
+  // Round three: the full lists beside the app.
   const bundled = await probe(fresh([...info.invidious, ...info.piped]));
   if (bundled) return bundled;
 
-  // Round two: the projects' live directories, round-robin across them
-  // rather than one list after another, so the cap on strangers spans every
-  // kind — a long cobalt list must not crowd the others out — and the seed
-  // behind them. Anything already known not to work is left out, which is
-  // what makes this usable when the instance in use dies, not only on a
-  // first visit.
-  const listed = interleave(await Promise.all(DIRECTORIES.map((d) => askDirectory(d, fetchImpl, timeout))));
-  return probe(fresh([...listed, ...SEED.map(trimSlash)]));
+  // Round four: the other projects' directories, round-robin across them so
+  // the cap on strangers spans every kind — a long cobalt list must not
+  // crowd Piped out — and the seed behind them. Anything already known not
+  // to work is left out.
+  const others = DIRECTORIES.filter((directory) => directory !== invidious);
+  const rest = interleave(await Promise.all(others.map((d) => askDirectory(d, fetchImpl, timeout))));
+  return probe(fresh([...rest, ...SEED.map(trimSlash)]));
 }
 
 /**
