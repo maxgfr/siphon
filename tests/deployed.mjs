@@ -374,7 +374,12 @@ for (const [old, expected] of [
   // anyone saves it and finds out on a real link.
   await page.fill('#endpoint', `${BASE}/inv-closed`);
   await page.click('#testConnection');
-  await page.waitForFunction(() => /answers this page|does not answer this page|could not/i.test(document.getElementById('statusText').textContent || ''), null, { timeout: 15_000 });
+  // "Checking that it answers this page…" matches too, and is not the verdict:
+  // on a slow run it is what would be read.
+  await page.waitForFunction(() => {
+    const text = document.getElementById('statusText').textContent || '';
+    return /answers this page|does not answer this page|could not/i.test(text) && !/Checking/.test(text);
+  }, null, { timeout: 15_000 });
   const closed = (await page.textContent('#statusText')) || '';
   check('an Invidious instance is recognised, and its shut video endpoint named before saving',
     /An Invidious instance/.test(closed) && /does not answer this page for a video/.test(closed), closed.slice(0, 120));
