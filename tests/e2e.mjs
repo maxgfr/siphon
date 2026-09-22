@@ -78,6 +78,8 @@ function buildFixtures() {
     '-c:a', 'aac', '-shortest', at('clip.mp4'),
   ]);
   ffmpeg(['-i', at('clip.mp4'), '-vframes', '1', '-vf', 'scale=320:180', at('cover.jpg')]);
+  // A song as a site would link it: the file is the link, whatever preset is set.
+  ffmpeg(['-f', 'lavfi', '-i', 'sine=frequency=330:duration=3', '-c:a', 'libmp3lame', at('song.mp3')]);
 
   const rendition = (name, scale, prefix) =>
     ffmpeg([
@@ -129,12 +131,12 @@ const TYPES = {
   '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json',
   '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml', '.png': 'image/png',
   '.jpg': 'image/jpeg', '.mp4': 'video/mp4', '.ts': 'video/mp2t', '.m3u8': 'application/vnd.apple.mpegurl',
-  '.wasm': 'application/wasm', '.key': 'application/octet-stream',
+  '.wasm': 'application/wasm', '.key': 'application/octet-stream', '.mp3': 'audio/mpeg',
 };
 
 /** A static server that allows cross-origin reads, which is what the media host must do. */
 /** How many times the flaky route has been asked for, and with what. */
-const flaky = { asks: [], cut: false };
+const flaky = { asks: [], cut: false, downUntil: 0, refused: 0 };
 
 function serve(root, port, prefix) {
   const server = createServer((request, response) => {
@@ -173,8 +175,22 @@ function serve(root, port, prefix) {
         response.writeHead(200, { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': size });
         const third = Math.floor(size / 3);
         response.write(readFileSync(source).subarray(0, third), () => {
-          setTimeout(() => response.destroy(), 200);
+          setTimeout(() => {
+            response.destroy();
+            flaky.downUntil = Date.now() + 800;
+          }, 200);
         });
+        return undefined;
+      }
+      // Then, for a moment, the network is still gone: every connection is
+      // dropped before a byte of answer, which a browser reports with the
+      // same TypeError as a CORS refusal. A moment rather than one request,
+      // because Chromium quietly retries a request whose reused socket died.
+      // This host has already answered the page, so it is the network, and
+      // the resume has to carry on through it.
+      if (Date.now() < flaky.downUntil) {
+        flaky.refused += 1;
+        request.socket.destroy();
         return undefined;
       }
       if (from > 0) {
@@ -499,6 +515,15 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   check('direct mp4 never loads the converter', coreRequests === 0, `${coreRequests} core requests`);
 }
 
+/* A direct audio file with the default video preset: the file is the link. */
+{
+  coreRequests = 0;
+  const file = await download(`${MEDIA}/media/song.mp3`, 'video_best');
+  const song = readFileSync(join(MEDIA_DIR, 'song.mp3'));
+  check('a direct mp3 under "Best" arrives byte-identical, as an mp3', file.endsWith('.mp3') && Buffer.compare(song, readFileSync(file)) === 0, file.split('/').pop());
+  check('and never loads the converter to rewrap it', coreRequests === 0, `${coreRequests} core requests`);
+}
+
 /* A connection that dies mid-download is resumed, not restarted. */
 {
   const file = await download(`${MEDIA}/media/flaky.mp4`, 'video_best');
@@ -507,6 +532,8 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   const resumed = flaky.asks.filter((ask) => /^bytes=\d+-/.test(ask.range || ''));
   check('and it asked for the rest rather than starting over',
     resumed.length > 0 && resumed[0].range !== 'bytes=0-', JSON.stringify(flaky.asks.map((a) => a.range)));
+  check('a reconnect that could not connect at all was tried again, not taken for a refusal', flaky.refused > 0 && resumed.length >= 2,
+    JSON.stringify(flaky.asks.map((a) => a.range)));
 }
 
 /* An HLS ladder: pick a rendition, fetch its segments, remux to MP4. */

@@ -83,9 +83,12 @@ export function parseMaster(text, baseUrl) {
 
     if (row.startsWith('#EXT-X-MEDIA:')) {
       const attrs = parseAttributes(row.slice('#EXT-X-MEDIA:'.length));
-      if (attrs.TYPE === 'AUDIO' && attrs.URI) {
+      // One with no URI is still listed, with a null url: it says the audio
+      // of its group is inside the variants, which is what decides whether a
+      // sibling with a URI is the soundtrack or only an alternative to it.
+      if (attrs.TYPE === 'AUDIO') {
         audio.push({
-          url: resolve(attrs.URI, baseUrl),
+          url: attrs.URI ? resolve(attrs.URI, baseUrl) : null,
           group: attrs['GROUP-ID'] || '',
           name: attrs.NAME || '',
           language: attrs.LANGUAGE || '',
@@ -123,12 +126,20 @@ export function parseMaster(text, baseUrl) {
  * `#EXT-X-MAP` is the fMP4 initialisation segment and has to be written first
  * or the result is not a playable file. `#EXT-X-BYTERANGE` means several
  * segments share one URL, so the range has to ride along with each.
+ *
+ * A playlist may change its map part-way — an ad break spliced in with its
+ * own encoding, after an `#EXT-X-DISCONTINUITY`. Joined into one file only one
+ * of them can lead it (ffmpeg skips a second `moov`), so the one reported is
+ * the map that covers the most of the running time, not merely the last one
+ * seen: the programme plays and the break is what suffers, rather than the
+ * other way round. `inits` lists each distinct map, so a caller can tell.
  */
 export function parseMedia(text, baseUrl) {
   const rows = lines(text);
   const segments = [];
-  let initUrl = null;
-  let initRange = null;
+  /** Distinct maps, by address and range, and how many seconds each one leads. */
+  const inits = new Map();
+  let init = null;
   let duration = 0;
   let pending = null;
   let range = null;
@@ -143,8 +154,18 @@ export function parseMedia(text, baseUrl) {
     }
     if (row.startsWith('#EXT-X-MAP:')) {
       const attrs = parseAttributes(row.slice('#EXT-X-MAP:'.length));
-      if (attrs.URI) initUrl = resolve(attrs.URI, baseUrl);
-      initRange = parseByteRange(attrs.BYTERANGE, null);
+      if (!attrs.URI) continue;
+      const url = resolve(attrs.URI, baseUrl);
+      const span = parseByteRange(attrs.BYTERANGE, null);
+      const id = `${url} ${span ? `${span.offset}+${span.length}` : ''}`;
+      if (!inits.has(id)) inits.set(id, { url, range: span, seconds: 0 });
+      init = inits.get(id);
+      continue;
+    }
+    if (row === '#EXT-X-PLAYLIST-TYPE:VOD') {
+      // VOD is a promise that the playlist will not change, which makes it
+      // finished whether or not the packager remembered the ENDLIST.
+      live = false;
       continue;
     }
     if (row.startsWith('#EXT-X-KEY:')) {
@@ -179,14 +200,21 @@ export function parseMedia(text, baseUrl) {
       sequence: mediaSequence + segments.length,
     });
     duration += pending || 0;
+    // A segment with no stated duration still counts, so a map is never
+    // outweighed for want of #EXTINF.
+    if (init) init.seconds += pending || 1;
     pending = null;
     range = null;
   }
 
+  const maps = [...inits.values()];
+  const lead = maps.reduce((best, map) => (!best || map.seconds > best.seconds ? map : best), null);
+
   return {
     segments,
-    initUrl,
-    initRange,
+    initUrl: lead?.url || null,
+    initRange: lead?.range || null,
+    inits: maps.map(({ url, range }) => ({ url, range })),
     duration,
     // A playlist with no #EXT-X-ENDLIST is still being written to. Downloading
     // it would never finish on its own, so the caller has to be told.

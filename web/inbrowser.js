@@ -278,6 +278,9 @@ async function runJob(backend, job) {
             signal,
             onSegment: (done, count) => advance(done / count),
             onBytes: (received) => countBytes(received),
+            onNote: (note) => {
+              job.note = note;
+            },
           })
         : await net.bytes(url, {
             signal,
@@ -480,8 +483,10 @@ async function coverArt(net, info, signal) {
  * size and a byte percentage would have to be invented. The running byte count
  * is reported separately, since that one is real and gives an honest speed.
  */
-async function downloadHls(url, { net, signal, onSegment, onBytes }) {
-  const media = parseMedia(await net.text(url, { signal }), url);
+async function downloadHls(url, { net, signal, onSegment, onBytes, onNote }) {
+  // Segments are relative to where the playlist landed, which a redirect moves.
+  const playlist = await net.document(url, { signal });
+  const media = parseMedia(playlist.text, playlist.url);
 
   if (media.segments.length === 0) throw new BackendError('That stream listed no segments.', { retryable: false });
   if (media.isLive) {
@@ -502,7 +507,25 @@ async function downloadHls(url, { net, signal, onSegment, onBytes }) {
     onBytes?.(total);
   };
 
-  if (media.initUrl) keep(await net.bytes(media.initUrl, { signal, range: media.initRange }));
+  if (media.initUrl) {
+    const init = await net.bytes(media.initUrl, { signal, range: media.initRange });
+    // Several maps with the same bytes under different names are one map.
+    // Different bytes mean the stream changes encoding part-way, and a copy
+    // into one file can only follow one of them: the parser chose the one
+    // that leads most of the running time, and the row says the rest may not
+    // play rather than letting it be found out later.
+    if (media.inits.length > 1) {
+      const others = await Promise.all(
+        media.inits
+          .filter((map) => map.url !== media.initUrl || map.range !== media.initRange)
+          .map((map) => net.bytes(map.url, { signal, range: map.range })),
+      );
+      if (others.some((bytes) => bytes.length !== init.length || bytes.some((byte, i) => byte !== init[i]))) {
+        onNote?.('This stream changes encoding part-way (an ad break, usually); the main part plays, the rest may not.');
+      }
+    }
+    keep(init);
+  }
 
   const keys = new Map();
   const count = media.segments.length;
