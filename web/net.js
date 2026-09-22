@@ -292,6 +292,9 @@ export class Fetcher {
 
 /* ------------------------------------------------------------------- bridge */
 
+/** Statuses whose response carries no body, by definition. */
+const NULL_BODY = new Set([204, 205, 304]);
+
 /**
  * The bridge: a userscript on this page that fetches on the page's behalf.
  *
@@ -327,13 +330,22 @@ function installBridge() {
     if (!waiting) return;
     if (message.siphon === 'response') {
       pending.delete(message.id);
-      waiting.resolve(
-        new Response(message.body, {
-          status: message.status,
-          statusText: message.statusText || '',
-          headers: message.headers || {},
-        }),
-      );
+      // A Response refuses a body alongside 204, 205 or 304, and any status
+      // outside 200–599 at all (a manager reports 0 for some failures). The
+      // constructor throwing here, inside a message listener, would leave the
+      // request waiting forever — so a bodiless status gets no body, and
+      // anything else it will not take is a failure the caller hears about.
+      try {
+        waiting.resolve(
+          new Response(NULL_BODY.has(message.status) ? null : message.body, {
+            status: message.status,
+            statusText: message.statusText || '',
+            headers: message.headers || {},
+          }),
+        );
+      } catch {
+        waiting.reject(new BackendError(`The bridge could not fetch that: it answered with status ${message.status}.`));
+      }
     } else if (message.siphon === 'error') {
       pending.delete(message.id);
       waiting.reject(new BackendError(`The bridge could not fetch that: ${message.message || 'unknown error'}`));

@@ -351,6 +351,9 @@ function serveCobalt(port) {
         let body = {};
         try { body = JSON.parse(raw); } catch { /* not JSON */ }
         cobalt.asks.push(body);
+        if (String(body.url || '').includes('scriptURL01')) {
+          return json(response, 200, { status: 'tunnel', url: 'javascript:window.__fromInstance=1;void 0', filename: 'x.mp4' });
+        }
         json(response, 200, { status: 'tunnel', url: `${COBALT}/tunnel?id=1`, filename: 'A clip through cobalt.mp4' });
       });
       return undefined;
@@ -707,6 +710,21 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   check('a YouTube link is sent to the instance with the quality asked for', ask.url === 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' && ask.videoQuality === '480', JSON.stringify(ask));
   check("the finished file arrives from the instance's tunnel, byte-identical", cobalt.tunnel >= 1 && Buffer.compare(source, readFileSync(saved)) === 0, `${cobalt.tunnel} tunnel reads`);
   check('under the name the instance gave it', /clip through cobalt/i.test(event.suggestedFilename()), event.suggestedFilename());
+
+  // An instance is someone else's server. What it hands back goes into a
+  // link this page clicks by itself, so a script URL from it would run as
+  // this page, settings, keys and all.
+  await page.check('input[name="quality"][value="video_best"]');
+  await page.fill('#url', 'https://www.youtube.com/watch?v=scriptURL01');
+  await page.click('#go');
+  // Settled either way — refused, or taken as a finished file — so the
+  // check below reports what happened instead of timing out.
+  await page.waitForFunction(() => [...document.querySelectorAll('#queueList li')].some((li) =>
+    /scriptURL01/.test(li.textContent) && (li.classList.contains('q-error') || li.querySelector('a.q-act'))), null, { timeout: 20_000 });
+  await page.waitForTimeout(300);
+  const refused = (await page.textContent('#queueList li:first-child .q-msg')) || '';
+  check("a cobalt answer that is not a download link is refused, not clicked", /not a download link/i.test(refused), refused.slice(0, 70));
+  check('and nothing it sent ran in this page', (await page.evaluate(() => window.__fromInstance)) === undefined);
   check('the page itself never touched googlevideo or youtube.com', strangers.length === 0, strangers.slice(0, 2).join(' ; '));
 }
 

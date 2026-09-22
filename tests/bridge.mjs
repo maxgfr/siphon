@@ -27,6 +27,11 @@ const WORK = join(HERE, '.bridge');
 const FFMPEG = process.env.FFMPEG || 'ffmpeg';
 const APP_PORT = 8795;
 const MEDIA_PORT = 8796;
+// The media host has a public-looking name, not 127.0.0.1: the bridge will
+// not fetch from this machine or this network, so a loopback address here
+// would be refused for the right reason and prove nothing. Chromium is told
+// the name is 127.0.0.1, and so is the stand-in for GM_xmlhttpRequest.
+const MEDIA_HOST = 'media.bridge.test';
 
 rmSync(WORK, { recursive: true, force: true });
 mkdirSync(join(WORK, 'media'), { recursive: true });
@@ -38,7 +43,7 @@ ffmpeg(['-f', 'lavfi', '-i', 'testsrc=size=640x360:rate=25:duration=4', '-f', 'l
   '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-g', '25', '-c:a', 'aac', '-shortest', at('clip.mp4')]);
 ffmpeg(['-i', at('clip.mp4'), '-c', 'copy', '-f', 'hls', '-hls_time', '2', '-hls_playlist_type', 'vod', '-hls_segment_filename', at('seg%d.ts'), at('index.m3u8')]);
 writeFileSync(at('page.html'), `<!doctype html><html><head><meta property="og:title" content="Refusing host page" />
-<meta property="og:video" content="http://127.0.0.1:${MEDIA_PORT}/media/clip.mp4" /></head><body>video</body></html>`);
+<meta property="og:video" content="http://${MEDIA_HOST}:${MEDIA_PORT}/media/clip.mp4" /></head><body>video</body></html>`);
 
 /* ------------------------------------------------------------------ servers */
 
@@ -49,6 +54,9 @@ function serve(root, port, { cors }) {
     createServer((request, response) => {
       let path = decodeURIComponent(new URL(request.url, 'http://x').pathname);
       if (path === '/') path = '/index.html';
+      // Answers with no body at all, which a Response refuses to carry one for.
+      const status = /\/status\/(\d{3})$/.exec(path);
+      if (status) return response.writeHead(Number(status[1])).end();
       const file = join(root, path);
       try {
         const stats = statSync(file);
@@ -77,7 +85,13 @@ const inspect = (file) => {
   try { execFileSync(FFMPEG, ['-hide_banner', '-i', file], { stdio: 'pipe' }); return ''; } catch (e) { return String(e.stderr || ''); }
 };
 
-const browser = await chromium.launch({ executablePath: process.env.CHROMIUM || undefined });
+const browser = await chromium.launch({
+  executablePath: process.env.CHROMIUM || undefined,
+  args: [`--host-resolver-rules=MAP ${MEDIA_HOST} 127.0.0.1`],
+});
+
+/** Every URL the stand-in for GM_xmlhttpRequest was actually asked to fetch. */
+const gmAsked = [];
 
 async function session({ bridge }) {
   const context = await browser.newContext({ acceptDownloads: true, viewport: { width: 412, height: 915 } });
@@ -93,7 +107,9 @@ async function session({ bridge }) {
   if (bridge) {
     // GM_xmlhttpRequest, played by Node: no same-origin policy, like the real thing.
     await page.exposeFunction('__gmFetch', async (method, url, headers, body) => {
-      const response = await fetch(url, { method, headers, body: body ? Buffer.from(body, 'base64') : undefined });
+      gmAsked.push(url);
+      const target = url.replace(`//${MEDIA_HOST}:`, '//127.0.0.1:');
+      const response = await fetch(target, { method, headers, body: body ? Buffer.from(body, 'base64') : undefined });
       const buffer = Buffer.from(await response.arrayBuffer());
       return {
         status: response.status,
@@ -105,6 +121,10 @@ async function session({ bridge }) {
     await page.addInitScript(() => {
       // The shape GM_xmlhttpRequest has; the userscript below sees only this.
       window.GM_xmlhttpRequest = (options) => {
+        // Some managers report a failed request as a load with status 0.
+        if (/\/status\/0$/.test(options.url)) {
+          return options.onload?.({ status: 0, statusText: '', responseHeaders: '', response: new ArrayBuffer(0) });
+        }
         const body = options.data ? btoa(String.fromCharCode(...new Uint8Array(options.data))) : null;
         window.__gmFetch(options.method || 'GET', options.url, options.headers || {}, body)
           .then((r) => {
@@ -137,7 +157,7 @@ async function download(page, url, preset) {
   }
 }
 
-const MEDIA = `http://127.0.0.1:${MEDIA_PORT}/media`;
+const MEDIA = `http://${MEDIA_HOST}:${MEDIA_PORT}/media`;
 
 /* Without the bridge, the refusing host is exactly that. */
 {
@@ -179,14 +199,64 @@ const MEDIA = `http://127.0.0.1:${MEDIA_PORT}/media`;
   const audio = page_.saved ? inspect(page_.saved) : '';
   check('a page on a refusing host is scraped and its video converted to mp3', /Audio: mp3/.test(audio), page_.error || page_.saved?.split('/').pop());
 
-  const routes = await page.evaluate(async () => {
+  const routes = await page.evaluate(async (media) => {
     const { BrowserBackend } = await import('./api.js');
     const backend = new BrowserBackend({});
     await new Promise((r) => setTimeout(r, 200));
-    try { await backend.net.bytes(location.origin.replace(/:\d+$/, ':8796') + '/media/clip.mp4'); } catch {}
+    try { await backend.net.bytes(`${media}/clip.mp4`); } catch {}
     return Object.fromEntries(backend.net.verdicts);
-  });
+  }, MEDIA);
   check('the route is remembered per origin, so the refusal is discovered once', Object.values(routes).includes('bridge'), JSON.stringify(routes));
+
+  // @match cannot tell siphon from whatever else runs on localhost:8000, so
+  // what the bridge will fetch is narrowed instead: public http(s) hosts, and
+  // GET, HEAD or POST. Each of these is asked for as any script on the page
+  // could, and must come back refused without the manager being asked at all.
+  const refusals = [
+    ['http://127.0.0.1:8796/media/clip.mp4'], ['http://localhost:8796/'], ['http://2130706433:8796/'],
+    ['http://169.254.169.254/latest/meta-data/'], ['http://10.0.0.1/'], ['http://172.16.0.1/'], ['http://192.168.1.1/'],
+    ['http://100.64.0.1/'], ['http://[::1]:8796/'], ['http://[fe80::1]/'], ['http://[fd00::1]/'], ['http://[::ffff:127.0.0.1]/'],
+    ['http://router/'], ['http://nas.local/'], ['http://dev.localhost/'], ['file:///etc/passwd'], ['data:text/plain,hi'],
+    [`${MEDIA}/clip.mp4`, 'PUT'], [`${MEDIA}/clip.mp4`, 'DELETE'],
+  ];
+  const asked = gmAsked.length;
+  const answers = await page.evaluate(async ({ refusals, allowed }) => {
+    const ask = (url, method = 'GET') => new Promise((resolve) => {
+      const id = `guard-${Math.random()}`;
+      const listen = (event) => {
+        if (event.source !== window || event.data?.id !== id || !['response', 'error'].includes(event.data.siphon)) return;
+        window.removeEventListener('message', listen);
+        resolve(event.data.siphon === 'response' ? `answered ${event.data.status}` : 'refused');
+      };
+      window.addEventListener('message', listen);
+      window.postMessage({ siphon: 'fetch', id, url, method }, '*');
+      setTimeout(() => resolve('silent'), 5000);
+    });
+    return {
+      refused: await Promise.all(refusals.map(([url, method]) => ask(url, method).then((answer) => `${method || 'GET'} ${url}: ${answer}`))),
+      allowed: await ask(allowed, 'HEAD'),
+    };
+  }, { refusals, allowed: `${MEDIA}/clip.mp4` });
+  const through = answers.refused.filter((line) => !line.endsWith(': refused'));
+  check('the bridge refuses this machine, the local network, other schemes and other methods', through.length === 0, through.slice(0, 3).join(' ; ') || `${refusals.length} refused`);
+  check('without the userscript manager ever being asked for them', gmAsked.length - asked === 1, gmAsked.slice(asked).join(', '));
+  check('and still fetches a public host', answers.allowed === 'answered 200', answers.allowed);
+
+  // A response with no body by definition — 204, 304 — or a status a
+  // Response will not hold at all used to throw inside the page's listener,
+  // leaving the request waiting forever.
+  const settled = await page.evaluate(async (media) => {
+    const { BrowserBackend } = await import('./api.js');
+    const backend = new BrowserBackend({});
+    await new Promise((r) => setTimeout(r, 200));
+    const within = (promise) => Promise.race([
+      promise.then((response) => `status ${response.status}`, (error) => `refused: ${error.message}`),
+      new Promise((resolve) => setTimeout(() => resolve('hung'), 5000)),
+    ]);
+    return Promise.all(['204', '304', '0'].map((code) => within(backend.net.bridge.request(`${media}/status/${code}`))));
+  }, MEDIA);
+  check('a 204 or a 304 through the bridge is an answer, not a hang', settled[0] === 'status 204' && settled[1] === 'status 304', settled.slice(0, 2).join(' ; '));
+  check('and a status no Response can hold is a failure the caller hears about', /^refused: .*status 0/.test(settled[2]), settled[2]);
 
   check('no uncaught errors in the page', errors.length === 0, errors.slice(0, 2).join(' ; '));
   await context.close();

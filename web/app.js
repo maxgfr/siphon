@@ -212,6 +212,19 @@ function saveSettings() {
 const escapeHtml = (value) =>
   String(value ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
 
+/**
+ * A finished file's address, if it is one. A row links to whatever a backend
+ * handed back, and a backend can be someone else's server: anything that is
+ * not a download — a `javascript:` URL above all — is no link at all.
+ */
+const fileHref = (url) => {
+  try {
+    return ['http:', 'https:', 'blob:'].includes(new URL(url, location.href).protocol) ? url : '';
+  } catch {
+    return '';
+  }
+};
+
 function formatBytes(bytes) {
   if (!bytes || bytes < 0) return '';
   const units = ['B', 'KB', 'MB', 'GB'];
@@ -638,10 +651,11 @@ async function pollAll() {
  * nothing is attempted automatically.
  */
 function handOver(entry) {
-  if (platform.ios && platform.standalone) return;
+  const href = fileHref(entry.fileUrl);
+  if (!href || (platform.ios && platform.standalone)) return;
 
   const anchor = document.createElement('a');
-  anchor.href = entry.fileUrl;
+  anchor.href = href;
   // A server response names the file in Content-Disposition, but a blob URL
   // from browser mode carries no headers at all — without this the file lands
   // as a UUID with no extension.
