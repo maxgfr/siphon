@@ -45,6 +45,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add web/instances.json
           git commit -m "chore: the public instances, refreshed and measured"
+          # main may have moved while this ran (a merge, the other daily job);
+          # without this the push is refused and the day's measurement is lost.
+          git pull --rebase origin main
           git push
       # A push made with GITHUB_TOKEN does not trigger other workflows, so the
       # Pages deploy is asked for directly — otherwise the fresh list would sit

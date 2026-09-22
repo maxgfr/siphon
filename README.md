@@ -131,8 +131,9 @@ Or use the hosted page and point it at the machine you are sitting at: open
 [the page](https://maxgfr.github.io/siphon/), **Settings → Use this
 computer**, Save. Browsers treat `localhost` as a secure context, so the
 HTTPS page may call it; Chrome's private-network preflight is answered.
-Verified in a real browser, with the same page refused from any other
-hostname once `ALLOWED_ORIGINS` names yours.
+Verified in a real browser. `ALLOWED_ORIGINS` names that page by default and
+nothing else, so another site open in the same browser is refused — name
+your own page there if you host a copy.
 
 `docker compose up -d` does the same with a named volume, a restart policy and
 somewhere obvious to put `AUTH_TOKEN`. To build from source:
@@ -215,7 +216,10 @@ A server exposes two small endpoints beside the full job API: `POST
 that refuse a page. A server **with** ffmpeg takes the whole job; a server
 **without** — or one you run thin — resolves, and the device downloads, merges
 and converts. The tunnel only fetches hosts a recent resolve produced, with
-the headers that resolve named, so it is a tunnel and not an open proxy.
+the headers that resolve named. A redirect is followed only to a public
+address, and a cookie or key granted to one host never follows it to
+another. What keeps strangers' pages off it is `ALLOWED_ORIGINS` and the
+key, as for the rest of the API.
 
 ### Configuration
 
@@ -243,10 +247,10 @@ The server takes environment variables:
 
 | variable | default | what it does |
 |---|---|---|
-| `ALLOWED_ORIGINS` | `*` | Comma-separated origins allowed to call the API. Set it to your page's URL once the server is reachable from outside. |
+| `ALLOWED_ORIGINS` | `https://maxgfr.github.io` | Comma-separated origins allowed to call the API from another origin. The server's own page needs no entry. Name your page if you host a copy; `*` without `AUTH_TOKEN` lets any site open in your browser use the server, and the server says so at startup. |
 | `AUTH_TOKEN` | *(unset)* | Shared secret. **Set it the moment the server is reachable from the internet.** Paste the same value into the app's settings. The server warns at startup without one. |
 | `MAX_CONCURRENT_JOBS` | `3` | Downloads running at once. |
-| `JOB_TTL_SECONDS` | `3600` | How long a finished file stays on disk. |
+| `JOB_TTL_SECONDS` | `3600` | How long a finished file stays on disk. Swept on a timer, and what a previous run left is swept at startup. |
 | `DOWNLOAD_DIR` | system temp | Where files land while you fetch them. |
 | `COOKIES_FILE` | inside `DOWNLOAD_DIR` | Where the uploaded YouTube session is kept. Put it on a volume. |
 | `POT_PROVIDER_URL` | *(unset)* | The proof-of-origin provider, e.g. `http://potoken:4416`. |
@@ -256,9 +260,12 @@ The server takes environment variables:
 | `PORT` | `8000` | Listen port. |
 
 By default the server refuses anything that is not a public `http(s)`
-address — no `file://`, no `localhost`, no `10.x`, no `169.254.169.254` —
-and resolves hostnames to check every resulting address. Qualities are an
-allow-list, not a format string, so the API cannot smuggle yt-dlp options.
+address — no `file://`, no `localhost`, no `10.x`, no `100.64/10`, no
+`169.254.169.254`. It checks the link you give it, every format it is about
+to download, and — for every connection the process opens, redirects
+included — the address the connection actually goes to. Qualities are an
+allow-list and subtitle languages are codes, not patterns, so the API
+cannot smuggle yt-dlp options.
 
 ## 3. A quick deploy
 

@@ -1183,8 +1183,234 @@ class TestJobOptions:
         monkeypatch.setattr(server_app.threading, "Thread", lambda *a, **k: type("T", (), {"start": lambda self: None})())
         response = client.post(
             "/api/jobs",
-            json={"url": "https://www.youtube.com/watch?v=abc", "sponsorblock": True, "clip_start": "0:10", "clip_end": "1:00", "rate_limit": "2M", "yt_client": "TV"},
+            json={"url": "https://www.youtube.com/watch?v=abc", "clip_start": "0:10", "clip_end": "1:00", "rate_limit": "2M", "yt_client": "TV"},
         )
         assert response.status_code == 200
         job = server_app.JOBS[response.json()["id"]]
-        assert (job.sponsorblock, job.clip_start, job.clip_end, job.rate_limit, job.yt_client) == (True, 10.0, 60.0, 2 * 1024**2, "tv")
+        assert (job.sponsorblock, job.clip_start, job.clip_end, job.rate_limit, job.yt_client) == (False, 10.0, 60.0, 2 * 1024**2, "tv")
+        sponsored = client.post("/api/jobs", json={"url": "https://www.youtube.com/watch?v=abc", "sponsorblock": True})
+        assert server_app.JOBS[sponsored.json()["id"]].sponsorblock is True
+
+    def test_sponsor_removal_and_a_clip_are_refused_together(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        """
+        yt-dlp gives a clip the clip's duration, SponsorBlock then discards
+        every segment as another video's, and the sponsors come back. Said up
+        front rather than delivered as a surprise.
+        """
+        _public_dns(monkeypatch)
+        response = client.post(
+            "/api/jobs",
+            json={"url": "https://www.youtube.com/watch?v=abc", "sponsorblock": True, "clip_start": "0:10"},
+        )
+        assert response.status_code == 400
+        assert "cannot be combined" in response.json()["detail"]
+
+    @pytest.mark.parametrize("langs", [".*", "all", "en,.*", "en|fr", "e"])
+    def test_subtitle_languages_are_codes_not_patterns(self, client: TestClient, monkeypatch: pytest.MonkeyPatch, langs: str) -> None:
+        """yt-dlp reads each entry as a regex: ".*" would fetch every auto-translation there is."""
+        _public_dns(monkeypatch)
+        response = client.post("/api/jobs", json={"url": "https://www.youtube.com/watch?v=abc", "subs": "files", "sub_langs": langs})
+        assert response.status_code == 400
+        assert "codes like en" in response.json()["detail"]
+
+    def test_subtitle_language_codes_pass(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        _public_dns(monkeypatch)
+        monkeypatch.setattr(server_app.threading, "Thread", lambda *a, **k: type("T", (), {"start": lambda self: None})())
+        response = client.post("/api/jobs", json={"url": "https://www.youtube.com/watch?v=abc", "subs": "files", "sub_langs": " en, pt-BR ,zh-Hans"})
+        assert response.status_code == 200
+        assert server_app.JOBS[response.json()["id"]].sub_langs == "en,pt-BR,zh-Hans"
+
+    def test_separate_subtitles_are_converted_to_srt(self) -> None:
+        """The settings say .srt; YouTube hands out VTT, which fewer phone players open."""
+        job = server_app.Job(id="a" * 16, url="https://www.youtube.com/watch?v=abc", preset="video_best", subs="files")
+        keys = [pp["key"] for pp in server_app.build_options(job, None).get("postprocessors", [])]
+        assert "FFmpegSubtitlesConvertor" in keys
+
+
+# ------------------------------------------------------- found in review
+
+class TestWhereConnectionsGo:
+    """
+    The guard at connect time. assert_fetchable only sees the URL a caller
+    names; redirects, a page's own video URL and a second DNS answer all went
+    around it — to loopback, to the LAN, to the cloud metadata endpoint.
+    """
+
+    def test_a_name_that_resolves_privately_is_refused_at_connect_time(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server_app, "_REAL_GETADDRINFO", lambda *_a, **_k: [(2, 1, 6, "", ("127.0.0.1", 80))])
+        with pytest.raises(server_app.PrivateAddress):
+            server_app.socket.getaddrinfo("redirected.example", 80)
+
+    @pytest.mark.parametrize("address", ["169.254.169.254", "10.1.2.3", "100.100.100.100", "::1", "fe80::1%eth0", "0.0.0.0"])
+    def test_every_non_global_address_is_refused(self, address: str) -> None:
+        assert server_app.refused_address(address)
+
+    def test_public_addresses_pass(self) -> None:
+        assert not server_app.refused_address("93.184.216.34")
+        assert not server_app.refused_address("2606:2800:220:1:248:1893:25c8:1946")
+
+    def test_binding_a_listening_socket_is_not_a_connection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server_app, "_REAL_GETADDRINFO", lambda *_a, **_k: [(2, 1, 6, "", ("0.0.0.0", 8000))])
+        assert server_app.socket.getaddrinfo("0.0.0.0", 8000, flags=server_app.socket.AI_PASSIVE)
+
+    def test_the_operators_own_sidecar_is_reachable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server_app, "_REAL_GETADDRINFO", lambda *_a, **_k: [(2, 1, 6, "", ("172.18.0.4", 4416))])
+        monkeypatch.setattr(server_app, "EXEMPT_HOSTS", frozenset({"potoken"}))
+        assert server_app.socket.getaddrinfo("potoken", 4416)
+        with pytest.raises(server_app.PrivateAddress):
+            server_app.socket.getaddrinfo("elsewhere", 4416)
+
+    def test_allow_private_hosts_turns_it_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server_app, "_REAL_GETADDRINFO", lambda *_a, **_k: [(2, 1, 6, "", ("192.168.1.20", 80))])
+        monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", True)
+        assert server_app.socket.getaddrinfo("nas.local", 80)
+
+    def test_cgnat_is_private_for_the_url_guard_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """100.64/10 is where a Tailscale network's other machines live."""
+        monkeypatch.setattr(server_app.socket, "getaddrinfo", lambda *_a, **_k: [(2, 1, 6, "", ("100.100.100.100", 80))])
+        with pytest.raises(server_app.UnsafeUrl):
+            server_app.assert_fetchable("http://tailnet-neighbour.example/x.mp4")
+
+    def test_a_chosen_format_on_a_private_address_is_refused_before_download(self) -> None:
+        """A clip is fetched by ffmpeg, which never meets the socket guard."""
+        with pytest.raises(server_app.yt_dlp.utils.DownloadError):
+            server_app.CheckMediaUrls().run({"requested_formats": [{"url": "http://169.254.169.254/latest/meta-data/"}]})
+
+
+class TestTunnelRedirects:
+    def test_a_redirect_to_a_private_address_is_refused(self) -> None:
+        handler = server_app.TunnelRedirects()
+        request = server_app.UrlRequest("https://media.example/v.mp4")
+        with pytest.raises(server_app.HTTPError) as caught:
+            handler.redirect_request(request, None, 302, "Found", {}, "http://127.0.0.1:9000/private")
+        assert caught.value.code == 403
+
+    def test_credentials_stay_with_the_host_they_were_granted_to(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        """urllib copies every header onto a redirect; a Cookie for one CDN must not reach the next host."""
+        import http.server
+        import threading as _threading
+
+        seen: dict[str, str | None] = {}
+
+        class Target(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                seen["cookie"] = self.headers.get("Cookie")
+                seen["authorization"] = self.headers.get("Authorization")
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Target)
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                self.send_response(302)
+                self.send_header("Location", f"http://localhost:{target.server_address[1]}/file")
+                self.end_headers()
+
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        first = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirector)
+        for server in (target, first):
+            _threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", True)
+            server_app._grant_host("http://127.0.0.1/", {"Cookie": "session=secret", "Authorization": "Bearer secret"})
+            response = client.get("/api/tunnel", params={"url": f"http://127.0.0.1:{first.server_address[1]}/start"})
+            assert response.status_code == 200
+            assert response.content == b"ok"
+            assert seen == {"cookie": None, "authorization": None}
+        finally:
+            for server in (target, first):
+                server.shutdown()
+
+
+class TestCookiesStayDeleted:
+    def test_each_run_gets_a_private_copy(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """yt-dlp writes its jar back on close; handed the real file, that undid a delete."""
+        monkeypatch.setattr(server_app, "COOKIES_PATH", tmp_path / "cookies.txt")
+        server_app.write_private(server_app.COOKIES_PATH, "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tx\n")
+        job = server_app.Job(id="b" * 16, url="https://www.youtube.com/watch?v=abc", preset="video_best")
+        monkeypatch.setattr(server_app, "DOWNLOAD_ROOT", tmp_path / "jobs")
+        job.directory.mkdir(parents=True)
+        cookiefile = server_app.build_options(job, None)["cookiefile"]
+        assert cookiefile != str(server_app.COOKIES_PATH)
+        assert Path(cookiefile).stat().st_mode & 0o077 == 0
+        server_app.COOKIES_PATH.unlink()
+        Path(cookiefile).write_text("written back by yt-dlp")
+        assert not server_app.COOKIES_PATH.exists()
+
+
+class TestCancelling:
+    def test_a_cancelled_job_stops_at_its_next_progress_report(self) -> None:
+        job = server_app.Job(id="c" * 16, url="https://example.com/v.mp4", preset="video_best")
+        job.cancelled = True
+        with pytest.raises(server_app.yt_dlp.utils.DownloadCancelled):
+            server_app._hook(job)({"status": "downloading", "downloaded_bytes": 10, "total_bytes": 100})
+
+    def test_a_job_cancelled_while_queued_never_starts_and_leaves_nothing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server_app, "DOWNLOAD_ROOT", tmp_path)
+        job = server_app.Job(id="d" * 16, url="https://example.com/v.mp4", preset="video_best")
+        job.directory.mkdir()
+        job.cancelled = True
+        server_app.run_job(job)
+        assert job.state == "queued"
+        assert not job.directory.exists()
+
+    def test_delete_marks_the_job_cancelled(self, client: TestClient) -> None:
+        job = server_app.Job(id="e" * 16, url="https://example.com/v.mp4", preset="video_best", state="running")
+        server_app.JOBS[job.id] = job
+        assert client.delete(f"/api/jobs/{job.id}").json() == {"deleted": True}
+        assert job.cancelled
+
+
+class TestDiskIsSwept:
+    def test_directories_no_job_owns_are_removed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """What a previous run left on a volume used to stay there for ever."""
+        monkeypatch.setattr(server_app, "DOWNLOAD_ROOT", tmp_path)
+        orphan = tmp_path / ("f" * 16)
+        orphan.mkdir()
+        (orphan / "big.mp4").write_bytes(b"x")
+        unrelated = tmp_path / "keep-me"
+        unrelated.mkdir()
+        owned = tmp_path / ("0" * 16)
+        owned.mkdir()
+        server_app.JOBS["0" * 16] = server_app.Job(id="0" * 16, url="https://example.com/v.mp4", preset="video_best")
+        try:
+            server_app.sweep_orphans()
+        finally:
+            server_app.JOBS.pop("0" * 16, None)
+        assert not orphan.exists()
+        assert unrelated.exists() and owned.exists()
+
+    def test_the_sweep_runs_on_its_own(self) -> None:
+        assert server_app.SWEEP_INTERVAL_SECONDS <= max(30, server_app.JOB_TTL_SECONDS // 2)
+
+
+class TestOrigins:
+    def test_the_default_names_the_hosted_page_only(self) -> None:
+        if "ALLOWED_ORIGINS" in __import__("os").environ:
+            pytest.skip("ALLOWED_ORIGINS is set in this environment")
+        assert server_app.ALLOWED_ORIGINS == ["https://maxgfr.github.io"]
+
+    def test_another_site_is_not_answered(self, client: TestClient) -> None:
+        response = client.options(
+            "/api/cookies",
+            headers={
+                "Origin": "https://random-site.example",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Private-Network": "true",
+            },
+        )
+        assert response.status_code == 400
+        assert "access-control-allow-origin" not in response.headers
+
+
+def test_a_non_ascii_key_is_a_401_not_a_500(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server_app, "AUTH_TOKEN", "s3cret")
+    assert client.get("/api/jobs/abc/file", params={"key": "é"}).status_code == 401

@@ -15,6 +15,7 @@ on:
     paths:
       - "server/**"
       - "web/**"
+      - "scripts/vendor_ffmpeg.py"
       - ".github/workflows/image.yml"
     tags: ["v*"]
   # yt-dlp is what YouTube breaks, and it releases about monthly. An image

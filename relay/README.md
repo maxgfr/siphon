@@ -70,7 +70,9 @@ megabyte, because the response body is streamed rather than chunked.
 
 **`ALLOWED_HOSTS`** is what keeps this from being an open proxy. The worker
 fetches only the media hosts it lists, so a stranger who finds the URL cannot
-point it at anything else. It defaults to YouTube's hosts; widen it only for
+point it at anything else — redirects included: they are followed by hand,
+and each one is checked against the list and the private-address rule
+before it is fetched. It defaults to YouTube's hosts; widen it only for
 hosts you actually want to download from.
 
 **`ALLOWED_ORIGINS`** is what keeps other people's pages from spending your
