@@ -420,7 +420,9 @@ const STAGE_TEXT = {
 
 function rowLabel(entry) {
   if (entry.state === 'error') return entry.error || 'Failed';
-  if (entry.state === 'expired') return 'No longer on the server';
+  // A device download (ids from this tab start `b-`) that is gone was cut
+  // off by a reload or swept; "the server" would be the wrong place to blame.
+  if (entry.state === 'expired') return String(entry.id || '').startsWith('b-') ? 'Interrupted, or no longer on this device' : 'No longer on the server';
   if (entry.state === 'done') return entry.filename || 'Ready';
   const stage = STAGE_TEXT[entry.stage] || 'Working…';
   return entry.itemsTotal ? `${stage} ${entry.itemsDone || 1}/${entry.itemsTotal}` : stage;
@@ -469,11 +471,14 @@ function renderQueue() {
       '<div class="q-foot">' +
       `<span>${escapeHtml(bits.join(' · '))}</span>` +
       '<span class="spacer"></span>' +
-      (entry.state === 'done' && entry.fileUrl
-        ? `<a class="q-act primary" href="${escapeHtml(entry.fileUrl)}" download>Save</a>`
+      // The name rides on the link itself: a blob URL carries no headers, so
+      // without it the Save button hands over a UUID — and after a reload, a
+      // UUID ending in .txt, since the file read back from OPFS has no type.
+      (entry.state === 'done' && fileHref(entry.fileUrl)
+        ? `<a class="q-act primary" href="${escapeHtml(fileHref(entry.fileUrl))}" download="${escapeHtml(entry.filename || '')}">Save</a>`
         : '') +
       (active ? `<button class="q-act" type="button" data-cancel="${entry.key}">Cancel</button>` : '') +
-      (entry.state === 'error' ? `<button class="q-act" type="button" data-retry="${entry.key}">Try again</button>` : '') +
+      (entry.state === 'error' || entry.state === 'expired' ? `<button class="q-act" type="button" data-retry="${entry.key}">Try again</button>` : '') +
       '</div>';
     list.appendChild(item);
   }
@@ -488,6 +493,16 @@ function renderQueue() {
 
 function findEntry(key) {
   return queue.find((entry) => entry.key === key);
+}
+
+/**
+ * Let go of a row's file. The row is the only way back to it, so a file whose
+ * row is gone is a leak: on disk in OPFS until a later visit's sweep, and a
+ * converted one in this tab's memory, behind its blob URL, until the tab
+ * closes. The backend's cancel is what frees both.
+ */
+function release(entry) {
+  if (entry.id) backend.cancel?.(entry.id);
 }
 
 function cancelEntry(key) {
@@ -549,7 +564,7 @@ async function enqueueOne(url, { preset = settings.preset, playlist = false, tit
     progress: 0,
   };
   queue.unshift(entry);
-  if (queue.length > QUEUE_MAX) queue.length = QUEUE_MAX;
+  for (const dropped of queue.splice(QUEUE_MAX)) release(dropped);
   renderQueue();
 
   try {
@@ -1114,9 +1129,10 @@ function readSharedUrl() {
   // Android share-target and plain ?url= links both land here. The shared text
   // is often "Title https://…", so pull the first URL out of it.
   const params = new URLSearchParams(location.search);
+  // urlsIn, not a bare match: "Look https://youtu.be/…." shares the
+  // sentence's full stop too, and a YouTube id with a dot on it is no id.
   const candidate = params.get('url') || params.get('text') || params.get('share') || '';
-  const match = candidate.match(/https?:\/\/\S+/);
-  return match ? match[0] : '';
+  return urlsIn(candidate)[0] || '';
 }
 
 function init() {
@@ -1139,7 +1155,9 @@ function init() {
   });
 
   $('queueClear').addEventListener('click', () => {
-    queue = queue.filter((entry) => entry.state === 'running' || entry.state === 'starting');
+    const active = (entry) => entry.state === 'running' || entry.state === 'starting';
+    for (const entry of queue) if (!active(entry)) release(entry);
+    queue = queue.filter(active);
     saveQueue();
     renderQueue();
   });

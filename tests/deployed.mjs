@@ -572,6 +572,14 @@ for (const [old, expected] of [
     document.body.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
   }, pasted);
   check('Ctrl+V with nothing focused takes the link out of the text', (await page.inputValue('#url')) === pasted, await page.inputValue('#url'));
+
+  // A share arrives as ?text=, and the text is a sentence: its full stop is
+  // not part of the link, and a YouTube id with a dot on the end is no id.
+  await page.goto(`${APP}?text=${encodeURIComponent('Watch this https://youtu.be/jNQXAC9IVRw.')}`, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(500);
+  const shared = await page.inputValue('#url');
+  check('a shared sentence gives the link without its punctuation', shared === 'https://youtu.be/jNQXAC9IVRw', shared);
+  check('and the shared text is kept out of the address bar', page.url() === APP, page.url());
   check('and nothing was contacted off this machine for any of it', context.__offsite.length === 0, context.__offsite.join(','));
   await context.close();
 }

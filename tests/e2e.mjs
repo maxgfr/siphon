@@ -206,6 +206,23 @@ function serve(root, port, prefix) {
       return createReadStream(source, { start: from }).pipe(response);
     }
 
+    // A download slow enough to be interrupted: 64 KB every 200 ms.
+    if (path.endsWith('/slow.mp4')) {
+      const size = 4 * 1024 * 1024;
+      response.writeHead(200, { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': size });
+      if (request.method === 'HEAD') return response.end();
+      let sent = 0;
+      const timer = setInterval(() => {
+        if (response.destroyed || sent >= size) return clearInterval(timer);
+        const next = Math.min(65536, size - sent);
+        response.write(Buffer.alloc(next, 7));
+        sent += next;
+        if (sent >= size) response.end();
+      }, 200);
+      response.on('close', () => clearInterval(timer));
+      return undefined;
+    }
+
     const file = join(root, path);
     if (!file.startsWith(root)) return response.writeHead(403, cors).end();
     let stats;
@@ -411,7 +428,7 @@ page.on('console', (message) => {
   // says so. That one resource is excused by URL; every other console error,
   // including any other failed load, still counts.
   const at = message.location()?.url || '';
-  if (at.includes('/flaky.mp4')) return;
+  if (at.includes('/flaky.mp4') || at.includes('/slow.mp4')) return;
   // Working out what an address is means asking it things it is not: an
   // Invidious instance answers 404 to /api/health, / and /config before its
   // stats endpoint says what it is, and Chrome reports each miss here. Those
@@ -603,6 +620,54 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   const label = (await page.textContent('#queueList li .q-msg')) || '';
   const save = await page.locator('#queueList li a.q-act').count();
   check('a finished row comes back after a reload', save > 0 && !/no longer/i.test(label), label.slice(0, 60));
+}
+
+/* The Save button names the file — on a blob URL nothing else will. */
+{
+  await download(`${MEDIA}/media/clip.mp4`, 'video_best');
+  const tapped = page.waitForEvent('download', { timeout: 15_000 });
+  await page.click('#queueList li a.q-act');
+  const first = (await tapped).suggestedFilename();
+  check('tapping Save hands over the file under its name, not a UUID', first === 'clip.mp4', first);
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForSelector('#queueList li a.q-act', { timeout: 15_000 });
+  const again = page.waitForEvent('download', { timeout: 15_000 });
+  await page.click('#queueList li a.q-act');
+  const second = (await again).suggestedFilename();
+  check('and after a reload too, not a UUID ending in .txt', second === 'clip.mp4', second);
+
+  const stored = () => page.evaluate(async () => {
+    const folder = await (await navigator.storage.getDirectory()).getDirectoryHandle('downloads', { create: true });
+    const names = [];
+    for await (const [name] of folder.entries()) names.push(name);
+    return names;
+  });
+  // The rows' own files, by job id: earlier checks' files are still there,
+  // waiting for the sweep, because their rows were wiped by hand.
+  const ids = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:queue') || '[]').map((entry) => entry.id).filter(Boolean));
+  const before = (await stored()).filter((name) => ids.includes(name));
+  await page.click('#queueClear');
+  await page.waitForTimeout(500);
+  const after = (await stored()).filter((name) => ids.includes(name));
+  check('"Clear finished" lets go of the files, not just the rows', before.length > 0 && after.length === 0, `${before.length} → ${after.length} of the cleared rows' files in OPFS`);
+}
+
+/* A download cut off by a reload is not "Ready". */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.fill('#url', `${MEDIA}/media/slow.mp4`);
+  await page.click('#go');
+  await page.waitForFunction(() => /\d+%/.test(document.querySelector('#queueList li')?.textContent || ''), null, { timeout: 20_000 });
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForSelector('#queueList li', { timeout: 15_000 });
+  await page.waitForTimeout(1500);
+  const label = (await page.textContent('#queueList li .q-msg')) || '';
+  const save = await page.locator('#queueList li a.q-act').count();
+  const retry = await page.locator('#queueList li [data-retry]').count();
+  check('a download interrupted by a reload does not come back as a finished file', save === 0 && !/ready/i.test(label), label.slice(0, 60));
+  check('it says it was interrupted, and offers to try again', /interrupted/i.test(label) && retry === 1, label.slice(0, 60));
 }
 
 /* An Invidious instance, given as the one address, carries YouTube for the device. */
