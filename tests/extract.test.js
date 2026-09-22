@@ -21,6 +21,7 @@ import {
   extract,
 } from '../web/extract.js';
 import { BackendError } from '../web/errors.js';
+import { Fetcher } from '../web/net.js';
 import { pickSubtitle } from '../web/inbrowser.js';
 
 /* ------------------------------------------------------------------ sniffing */
@@ -117,6 +118,15 @@ test('malformed JSON-LD does not stop the other routes', () => {
 test('non-http schemes are ignored', () => {
   const found = scrapePage('<video src="blob:https://site.example/abc"><source src="data:video/mp4,AAA">', 'https://site.example/');
   assert.deepEqual(found, []);
+});
+
+test('a stream named inside a path that ends in .mp4 is not cut off at the .mp4', () => {
+  // Wowza names streams `…/mp4:clip.mp4/playlist.m3u8`; stopping at the first
+  // `.mp4` makes an address that is not a file.
+  const found = scrapePage('<script>var src = "https://wowza.example/vod/mp4:clip.mp4/playlist.m3u8";</script>', 'https://site.example/');
+  assert.deepEqual(found.map((item) => item.url), ['https://wowza.example/vod/mp4:clip.mp4/playlist.m3u8']);
+  const plain = scrapePage('<script>{"file":"https://cdn.example/a.mp4?token=1"}</script>', 'https://site.example/');
+  assert.deepEqual(plain.map((item) => item.url), ['https://cdn.example/a.mp4?token=1']);
 });
 
 /* ------------------------------------------------------------------ planning */
@@ -225,6 +235,28 @@ test('when nothing fits the ceiling, the smallest available is used rather than 
   const plan = planDownload(from([videoOnly('v1080', 1080), audioOnly('a', 128000)]), 'video_480');
   assert.equal(plan.video.id, 'v1080');
   assert.equal(plan.op, 'copy');
+});
+
+test('a direct audio file under a video preset is handed over as it is, not rewrapped as M4A', () => {
+  // The default preset is "Best" video, and a link to an .mp3 is still the
+  // file. An .m4a cannot hold MP3, FLAC, Opus, Vorbis or PCM, so rewrapping
+  // failed outright for all of them, after loading the converter for nothing.
+  for (const [container, codecs] of [['mp3', ''], ['flac', ''], ['opus', ''], ['ogg', ''], ['wav', ''], ['m4a', '']]) {
+    const plan = planDownload(from([{ id: 'source', kind: 'audio', protocol: 'progressive', container, height: null, codecs }]), 'video_best');
+    assert.equal(plan.op, 'raw', container);
+    assert.equal(plan.ext, container);
+    assert.equal(plan.audio.id, 'source');
+  }
+});
+
+test('a portrait video meets the ceiling by its short side, as its label does', () => {
+  // A Short is 1080x1920 and labelled 1080p. Measured by height, a 1080p
+  // request was handed 480p, and a 720p one 360p.
+  const portrait = (id, width, height) => videoOnly(id, height, { width });
+  const formats = [portrait('1080p', 1080, 1920), portrait('720p', 720, 1280), portrait('480p', 480, 854), portrait('360p', 360, 640), audioOnly('a', 128000)];
+  assert.equal(planDownload(from(formats), 'video_1080').video.id, '1080p');
+  assert.equal(planDownload(from(formats), 'video_720').video.id, '720p');
+  assert.equal(planDownload(from(formats), 'video_480').video.id, '480p');
 });
 
 test('a link with no formats is an error the user can read', () => {
@@ -637,4 +669,138 @@ test('with no escape at all, a resolver\'s final answer is final', async () => {
 test('with nothing to ask and no escape, YouTube is refused in a sentence that names the cure', async () => {
   const net = { hasEscape: false, hasOpenEscape: false, hasBridge: false, escape: null };
   await assert.rejects(() => extract(WATCH, { net, resolvers: [] }), (error) => /helper|relay|bridge/i.test(error.hint) && error.retryable === false);
+});
+
+/* ------------------------------------------------------ pages and ladders */
+
+/**
+ * A `net` that serves documents and headers from tables, and records which
+ * candidates were asked what they are. A document answers as a web page.
+ */
+function pageNet({ documents = {}, heads = {} }) {
+  const peeked = [];
+  return {
+    peeked,
+    document: async (url) => {
+      const doc = documents[url];
+      if (!doc) throw new BackendError(`${url} answered 404.`, { retryable: false });
+      return typeof doc === 'string' ? { text: doc, url } : doc;
+    },
+    peek: async (url) => {
+      if (documents[url]) return { status: 200, type: 'text/html', length: null, filename: null, acceptsRanges: false };
+      peeked.push(url);
+      const head = heads[url];
+      if (!head) throw new BackendError(`${new URL(url).host} answered 404.`, { retryable: false });
+      return { status: 200, type: head, length: null, filename: null, acceptsRanges: true };
+    },
+  };
+}
+
+test('an og:video that is the site\'s player page is passed over for the file itself', async () => {
+  const net = pageNet({
+    documents: {
+      'https://site.example/watch/42': `<meta property="og:video" content="https://player.example/embed/42">
+        <title>A clip</title><video src="https://cdn.example/42.mp4"></video>`,
+    },
+    heads: { 'https://player.example/embed/42': 'text/html', 'https://cdn.example/42.mp4': 'video/mp4' },
+  });
+  const info = await extract('https://site.example/watch/42', { net });
+  assert.equal(info.formats[0].url, 'https://cdn.example/42.mp4');
+  assert.deepEqual(net.peeked, ['https://player.example/embed/42', 'https://cdn.example/42.mp4']);
+});
+
+test('an og:video on a dead CDN no longer sinks a page that also has a working <video>', async () => {
+  const net = pageNet({
+    documents: {
+      'https://site.example/watch/43': `<meta property="og:video" content="https://dead.example/43.mp4"><video src="https://cdn.example/43.mp4"></video>`,
+    },
+    heads: { 'https://cdn.example/43.mp4': 'video/mp4' },
+  });
+  const info = await extract('https://site.example/watch/43', { net });
+  assert.equal(info.formats[0].url, 'https://cdn.example/43.mp4');
+});
+
+test('a page with only a player to offer says so, rather than downloading the player', async () => {
+  const net = pageNet({
+    documents: { 'https://site.example/watch/44': '<meta property="og:video" content="https://player.example/embed/44">' },
+    heads: { 'https://player.example/embed/44': 'text/html' },
+  });
+  await assert.rejects(() => extract('https://site.example/watch/44', { net }), /player, not at a file/);
+});
+
+test('a page that was redirected is read relative to where it landed', async () => {
+  const net = pageNet({
+    documents: {
+      'https://site.example/watch/45': { text: '<video src="media/45.mp4"></video>', url: 'https://site.example/watch/45-a-slug/' },
+    },
+    heads: { 'https://site.example/watch/45-a-slug/media/45.mp4': 'video/mp4' },
+  });
+  const info = await extract('https://site.example/watch/45', { net });
+  assert.equal(info.formats[0].url, 'https://site.example/watch/45-a-slug/media/45.mp4');
+});
+
+test('a playlist that was redirected names its renditions relative to where it landed', async () => {
+  const net = pageNet({
+    documents: {
+      'https://short.example/master.m3u8': {
+        text: '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=640x360\nv360.m3u8\n',
+        url: 'https://cdn.example/path/master.m3u8',
+      },
+    },
+  });
+  const info = await extract('https://short.example/master.m3u8', { net });
+  assert.equal(info.formats[0].url, 'https://cdn.example/path/v360.m3u8');
+});
+
+const LADDER = (english) => `#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",DEFAULT=YES${english ? ',URI="en/audio.m3u8"' : ''}
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Espanol",LANGUAGE="es",DEFAULT=NO,URI="es/audio.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,AUDIO="aud"
+720/index.m3u8
+`;
+
+test('when the default audio is inside the variants, a dub beside it is not muxed in its place', async () => {
+  const net = pageNet({ documents: { 'https://cdn.example/show/master.m3u8': LADDER(false) } });
+  const info = await extract('https://cdn.example/show/master.m3u8', { net });
+  assert.deepEqual(info.formats.map((format) => `${format.id}:${format.kind}`), ['hls-0:muxed']);
+  const plan = planDownload(info, 'video_best');
+  assert.equal(plan.audio, null, 'the soundtrack comes with the video');
+});
+
+test('when the default audio is a rendition of its own, it is the one muxed with the video', async () => {
+  const net = pageNet({ documents: { 'https://cdn.example/show/master.m3u8': LADDER(true) } });
+  const info = await extract('https://cdn.example/show/master.m3u8', { net });
+  const plan = planDownload(info, 'video_best');
+  assert.equal(plan.video.kind, 'video');
+  assert.equal(plan.audio.url, 'https://cdn.example/show/en/audio.m3u8');
+  assert.equal(plan.audio.label, 'English');
+});
+
+test('a file on a host that refuses the page goes to a resolver that can take it, not to a download that will fail', async () => {
+  // A server that only resolves: its tunnel carries what it resolved, and so
+  // refuses a host it was never asked about. Taking the link as a direct
+  // file anyway sent the download into that refusal; the server is who has
+  // to be asked.
+  const real = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).startsWith('https://ytdl.example/api/tunnel')) return new Response('no', { status: 403 });
+    throw new TypeError('Failed to fetch');
+  };
+  try {
+    const net = new Fetcher({ escape: { name: 'tunnel', via: (url) => `https://ytdl.example/api/tunnel?url=${encodeURIComponent(url)}` } });
+    let asked = 0;
+    const server = {
+      name: 'server',
+      generic: true,
+      resolve: async (url) => {
+        asked += 1;
+        return { title: 'resolved', formats: [{ id: 'x', url, protocol: 'progressive', kind: 'muxed', container: 'mp4' }] };
+      },
+    };
+    const info = await extract('https://nocors.example/clip.mp4', { net, resolvers: [server] });
+    assert.equal(asked, 1);
+    assert.equal(info.title, 'resolved');
+  } finally {
+    globalThis.fetch = real;
+  }
 });

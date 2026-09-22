@@ -120,7 +120,12 @@ export class Fetcher {
     } catch (error) {
       if (signal?.aborted) throw error;
       if (!isBlocked(error)) throw error;
-      if (!escape) throw corsWall(origin);
+      // A browser gives the same TypeError for "not allowed" and for "no
+      // network", so which one this is depends on what the host has already
+      // shown. One that answered this page before has proved it allows it: the
+      // failure is the connection, and saying otherwise would stop a resume
+      // on a phone changing cells with a sentence about CORS.
+      if (!escape) throw known === 'direct' ? connectionLost(origin) : corsWall(origin);
       const response = escape === 'bridge'
         ? await this.bridge.request(url, { signal, ...init })
         : await this.#relayRequest(url, { signal, ...init });
@@ -157,6 +162,23 @@ export class Fetcher {
     const response = await this.request(url, options);
     if (!response.ok) throw httpError(response, url);
     return response.text();
+  }
+
+  /**
+   * A document, and the address the links inside it are relative to.
+   *
+   * A playlist or a page that was redirected is relative to where it landed,
+   * not to what was asked for: a short link to `/cdn/path/master.m3u8` names
+   * `v360.m3u8` meaning `/cdn/path/v360.m3u8`. Only a direct fetch can say
+   * where it landed. Through the bridge or a relay the address it reports is
+   * the escape's, not the host's, so there the one asked for is the best
+   * there is.
+   */
+  async document(url, options = {}) {
+    const response = await this.request(url, options);
+    if (!response.ok) throw httpError(response, url);
+    const direct = this.verdicts.get(this.#origin(url)) === 'direct';
+    return { text: await response.text(), url: direct && response.redirected && response.url ? response.url : url };
   }
 
   async json(url, options = {}) {
@@ -292,6 +314,9 @@ export class Fetcher {
 
 /* ------------------------------------------------------------------- bridge */
 
+/** Statuses whose response carries no body, by definition. */
+const NULL_BODY = new Set([204, 205, 304]);
+
 /**
  * The bridge: a userscript on this page that fetches on the page's behalf.
  *
@@ -327,13 +352,22 @@ function installBridge() {
     if (!waiting) return;
     if (message.siphon === 'response') {
       pending.delete(message.id);
-      waiting.resolve(
-        new Response(message.body, {
-          status: message.status,
-          statusText: message.statusText || '',
-          headers: message.headers || {},
-        }),
-      );
+      // A Response refuses a body alongside 204, 205 or 304, and any status
+      // outside 200–599 at all (a manager reports 0 for some failures). The
+      // constructor throwing here, inside a message listener, would leave the
+      // request waiting forever — so a bodiless status gets no body, and
+      // anything else it will not take is a failure the caller hears about.
+      try {
+        waiting.resolve(
+          new Response(NULL_BODY.has(message.status) ? null : message.body, {
+            status: message.status,
+            statusText: message.statusText || '',
+            headers: message.headers || {},
+          }),
+        );
+      } catch {
+        waiting.reject(new BackendError(`The bridge could not fetch that: it answered with status ${message.status}.`));
+      }
     } else if (message.siphon === 'error') {
       pending.delete(message.id);
       waiting.reject(new BackendError(`The bridge could not fetch that: ${message.message || 'unknown error'}`));
@@ -417,6 +451,13 @@ function cutShort(url, error, received, stated) {
 function httpError(response, url) {
   return new BackendError(`${hostOf(url)} answered ${response.status}.`, {
     retryable: response.status >= 500 || response.status === 429,
+  });
+}
+
+/** The network went, mid-conversation with a host that had been answering. Worth another try. */
+function connectionLost(origin) {
+  return new BackendError(`Lost the connection to ${hostOf(origin)}.`, {
+    hint: 'The network dropped part-way. Try again — a download resumes rather than starting over.',
   });
 }
 

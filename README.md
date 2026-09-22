@@ -111,7 +111,9 @@ extractor already here — direct, HLS, pages, YouTube through youtubei.js —
 works on hosts that refuse the page. Install it once; the app uses it
 automatically, ahead of any helper. Desktop Chrome and Firefox, and Firefox
 for Android. It runs on your IP, which YouTube treats far more gently than a
-datacentre's.
+datacentre's. It fetches public http(s) addresses only, with GET, HEAD or
+POST — never this machine or your network — because its `localhost:8000`
+match cannot tell siphon from anything else served on that port.
 
 ## 2. Your own server, with yt-dlp
 

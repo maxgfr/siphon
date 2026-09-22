@@ -133,7 +133,10 @@ export function safeFilename(name, extension) {
 
 /* ------------------------------------------------------------------ scraping */
 
-const MEDIA_IN_TEXT = /https?:\/\/[^\s"'<>\\)]+?\.(?:m3u8|mp4|webm|m4a|mp3)(?:\?[^\s"'<>\\)]*)?/gi;
+// The extension has to end the path — followed by a query, a quote or the
+// end — or `…/mp4:clip.mp4/playlist.m3u8`, how Wowza names its streams, is cut
+// off at the first `.mp4` into an address that is not a file.
+const MEDIA_IN_TEXT = /https?:\/\/[^\s"'<>\\)]+?\.(?:m3u8|mp4|webm|m4a|mp3)(?=[?#&"'\s<>\\),;]|$)(?:\?[^\s"'<>\\)]*)?/gi;
 
 /**
  * Pull media URLs out of a page's markup.
@@ -302,7 +305,14 @@ async function extractNative(url, context) {
 }
 
 async function extractDirect(url, context, shape, head = null) {
-  const headers = head || (await context.net.peek(url, { signal: context.signal }).catch(() => null));
+  // A host that is merely slow to say what the file is still gets its
+  // download. One that refuses — no cross-origin headers, a 404 — does not:
+  // that is an answer, and it has to reach extract() while there is still a
+  // resolver or an instance that could take the link instead.
+  const headers = head || (await context.net.peek(url, { signal: context.signal }).catch((error) => {
+    if (error instanceof BackendError && error.retryable === false) throw error;
+    return null;
+  }));
   const typed = headers ? sniffType(headers.type) : null;
   const container = typed?.container || shape.container;
   const kind = typed?.kind || shape.kind;
@@ -337,20 +347,32 @@ async function extractDirect(url, context, shape, head = null) {
 }
 
 async function extractHls(url, context, meta) {
-  const text = await context.net.text(url, { signal: context.signal });
+  // Relative to where the playlist landed, which a redirect moves.
+  const { text, url: base } = await context.net.document(url, { signal: context.signal });
   const formats = [];
 
   if (isMaster(text)) {
-    const { variants, audio } = parseMaster(text, url);
-    // A master with alternate audio means the video renditions carry no sound,
-    // so the audio group has to be downloaded and muxed alongside.
-    const defaultAudio = audio.find((track) => track.default) || audio[0] || null;
+    const { variants, audio } = parseMaster(text, base);
+    // The audio a player takes for a variant is its group's DEFAULT rendition
+    // (or the first). When that rendition has a URI, the variant carries no
+    // sound of its own and the two are muxed here. When it has none, the
+    // soundtrack is inside the variant, and a sibling with a URI is only an
+    // alternative — a dub — which taking would put in place of the original.
+    const audioFor = (variant) => {
+      const group = audio.filter((track) => variant.audioGroup && track.group === variant.audioGroup);
+      const chosen = group.find((track) => track.default) || group[0] || null;
+      return chosen?.url ? chosen : null;
+    };
+    // Best variant first, so the audio listed first is the one that goes with it.
+    const tracks = [];
     for (const [index, variant] of variants.entries()) {
+      const track = audioFor(variant);
+      if (track && !tracks.includes(track)) tracks.push(track);
       formats.push({
         id: `hls-${index}`,
         url: variant.url,
         protocol: 'hls',
-        kind: defaultAudio ? 'video' : 'muxed',
+        kind: track ? 'video' : 'muxed',
         container: 'mp4',
         height: variant.height,
         width: variant.width,
@@ -360,10 +382,10 @@ async function extractHls(url, context, meta) {
         label: variant.height ? `${variant.height}p` : 'stream',
       });
     }
-    if (defaultAudio) {
+    for (const [index, track] of tracks.entries()) {
       formats.push({
-        id: 'hls-audio',
-        url: defaultAudio.url,
+        id: index === 0 ? 'hls-audio' : `hls-audio-${index}`,
+        url: track.url,
         protocol: 'hls',
         kind: 'audio',
         container: 'm4a',
@@ -372,7 +394,7 @@ async function extractHls(url, context, meta) {
         bitrate: null,
         filesize: null,
         codecs: '',
-        label: defaultAudio.name || 'audio',
+        label: track.name || 'audio',
       });
     }
   }
@@ -409,8 +431,10 @@ async function extractHls(url, context, meta) {
 }
 
 async function extractPage(url, context) {
-  const html = await context.net.text(url, { signal: context.signal });
-  const candidates = scrapePage(html, url);
+  // Relative to where the page landed: `/watch/1` redirected to
+  // `/watch/1-some-slug/` names `media/clip.mp4` from there.
+  const { text: html, url: base } = await context.net.document(url, { signal: context.signal });
+  const candidates = scrapePage(html, base);
 
   if (candidates.length === 0) {
     throw new BackendError('No media found on that page.', {
@@ -426,17 +450,29 @@ async function extractPage(url, context) {
 
   // Try each candidate in order rather than trusting the first: an og:video
   // pointing at a dead CDN should not sink a page that also has a <video src>.
+  // That only works if a candidate is asked what it is before it is taken —
+  // a dead one answers 404, and an og:video is as often the site's player
+  // page as its file, which answers text/html. Taking either unasked would
+  // end the search with a download that fails, or one that is a web page.
   let failure = null;
   for (const candidate of candidates.slice(0, 6)) {
     try {
       const meta = { title, thumbnail, uploader: hostOf(url), extractor: 'page' };
       const shape = sniffUrl(candidate.url);
       if (shape?.protocol === 'hls') return await extractHls(candidate.url, context, meta);
-      const found = shape
-        ? await extractDirect(candidate.url, context, shape)
-        : await extractDirect(candidate.url, context, { container: 'mp4', kind: 'muxed' });
+      const head = await context.net.peek(candidate.url, { signal: context.signal });
+      const typed = sniffType(head.type);
+      if (typed?.protocol === 'hls') return await extractHls(candidate.url, context, meta);
+      if (!typed && /^(text\/html|application\/xhtml\+xml)$/.test(head.type)) {
+        throw new BackendError('That page points at a player, not at a file.', {
+          hint: 'The file is inside the player\'s own page, built by its JavaScript — that needs your own server.',
+          retryable: false,
+        });
+      }
+      const found = await extractDirect(candidate.url, context, shape || { container: 'mp4', kind: 'muxed' }, head);
       return { ...found, title, thumbnail, uploader: hostOf(url), extractor: 'page', url };
     } catch (error) {
+      if (context.signal?.aborted) throw error;
       failure = error;
     }
   }
@@ -1085,7 +1121,11 @@ export function planDownload(extraction, preset) {
   }
 
   const ceiling = PRESET_HEIGHT[preset] ?? null;
-  const fits = (format) => ceiling === null || !format.height || format.height <= ceiling;
+  // "1080p" names the short side. A Short or a Reel is 1080x1920 and labelled
+  // 1080p, and measuring its height against the ceiling would hand a 1080p
+  // request the 480p rendition.
+  const side = (format) => (format.width && format.height ? Math.min(format.width, format.height) : format.height);
+  const fits = (format) => ceiling === null || !side(format) || side(format) <= ceiling;
 
   const readyMade = muxed.filter(fits)[0] || null;
   const bestVideo = videoOnly.filter(fits)[0] || videoOnly[videoOnly.length - 1] || null;
@@ -1101,6 +1141,13 @@ export function planDownload(extraction, preset) {
   if (!readyMade) {
     if (bestVideo) return { video: bestVideo, audio: null, ext: 'mp4', mime: 'video/mp4', op: 'copy' };
     const fallback = audioOnly[0];
+    // A link to an .mp3 or a .flac with a video preset still selected: the
+    // file is the link, and it is handed over as it is. Rewrapping it as M4A
+    // would load the converter for nothing, and fail outright for everything
+    // but AAC — MP3, FLAC, Opus, Vorbis and PCM have no place in an .m4a.
+    if (fallback?.protocol === 'progressive') {
+      return { video: null, audio: fallback, ext: fallback.container, mime: MIME_FOR[fallback.container] || 'application/octet-stream', op: 'raw' };
+    }
     if (fallback) return { video: null, audio: fallback, ext: 'm4a', mime: 'audio/mp4', op: 'audio-copy' };
     throw new BackendError('That link offered no video to download.', { retryable: false });
   }
