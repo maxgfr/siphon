@@ -384,11 +384,11 @@ pip install -r server/requirements.txt pytest httpx       # yt-dlp[default] carr
 # and a JavaScript runtime beside it — Deno — which yt-dlp needs for YouTube since late 2025;
 # the Docker image ships one, and the settings sheet says when a server has none.
 WEB_DIR=web uvicorn server.app:app --reload --port 8000   # the server
-pytest server/tests -q                                    # 162
-npm test                                                  # 195 — the extractor, detection, the measurements
-npm run test:e2e        # the device, a fake Invidious, Piped and cobalt — 48; needs playwright, ffmpeg
-npm run test:deployed   # the app as a static deploy over HTTPS — 68; needs playwright, openssl
-npm run test:bridge     # the userscript against a host that refuses — 8
+pytest server/tests -q                                    # 194
+npm test                                                  # 221 — the extractor, detection, the measurements
+npm run test:e2e        # the device, a fake Invidious, Piped and cobalt — 64; needs playwright, ffmpeg
+npm run test:deployed   # the app as a static deploy over HTTPS — 75; needs playwright, openssl
+npm run test:bridge     # the userscript against a host that refuses — 13
 npm run test:split      # a server that only resolves, a device that downloads — 24
 npm run test:innertube  # what YouTube says to a bare request from this machine
 npm run test:youtube    # YouTube, for real, from the browser mode; CI, informative
