@@ -10,22 +10,27 @@ primary_region = "cdg"
   MAX_CONCURRENT_JOBS = "2"
   JOB_TTL_SECONDS = "1800"
   DOWNLOAD_DIR = "/data/downloads"
+  # On the volume, or every deploy signs YouTube out.
+  COOKIES_FILE = "/data/cookies.txt"
   PORT = "8080"
 
 [http_service]
   internal_port = 8080
   force_https = true
   # Downloads are long-lived requests and the job outlives them anyway, but a
-  # machine that stops mid-download loses the file — so keep one warm.
+  # machine that stops mid-download loses the file — so keep one warm. With
+  # none kept, the proxy suspended the machine as soon as nobody was polling,
+  # which is exactly while a long job runs on its own.
   auto_stop_machines = "suspend"
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
 
-  [http_service.checks]
-    [http_service.checks.health]
-      path = "/api/health"
-      interval = "30s"
-      timeout = "5s"
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval = "30s"
+    method = "GET"
+    path = "/api/health"
+    timeout = "5s"
 
 # Finished files live here until the TTL sweeps them. Without a volume they sit
 # in the container's writable layer and vanish on every restart.

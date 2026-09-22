@@ -47,8 +47,14 @@ VOLUME ["/tmp/siphon"]
 EXPOSE 8000
 
 # Non-root: this process runs a downloader against URLs strangers can supply.
-RUN useradd --create-home --uid 10001 app && mkdir -p /tmp/siphon && chown -R app /tmp/siphon
-USER app
+# The entrypoint starts as root only to hand the data directories to this user
+# — a volume mounted over them (Fly's /data) arrives owned by root — and then
+# drops to it for good with setpriv, which the build checks is there.
+RUN useradd --create-home --uid 10001 app && mkdir -p /tmp/siphon && chown -R app /tmp/siphon \
+ && command -v setpriv
+COPY server/entrypoint.sh /usr/local/bin/siphon-entrypoint
+RUN chmod 755 /usr/local/bin/siphon-entrypoint
+ENTRYPOINT ["siphon-entrypoint"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
   CMD python -c "import urllib.request,os;urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"PORT\",8000)}/api/health').read()" || exit 1

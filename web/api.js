@@ -272,8 +272,21 @@ export class PublicBackend {
       });
     }
     if (!body.url) throw new BackendError('That instance returned no file.');
+    // The address goes straight into a link this page clicks. An instance is
+    // someone else's server, and a `javascript:` URL from it would run as
+    // this page — with its settings, its keys and the bridge — so only a
+    // real download address is taken.
+    let link;
+    try {
+      link = new URL(body.url, `${this.base}/`);
+    } catch {
+      link = null;
+    }
+    if (!link || (link.protocol !== 'https:' && link.protocol !== 'http:')) {
+      throw new BackendError('That instance returned something that is not a download link.', { retryable: false });
+    }
 
-    return { kind: 'direct', url: body.url, filename: body.filename || null };
+    return { kind: 'direct', url: link.href, filename: body.filename || null };
   }
 }
 

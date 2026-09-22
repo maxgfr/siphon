@@ -89,3 +89,42 @@ test('a POST body is accepted by the bridge rather than rejected for lack of dup
   });
   assert.equal(response.status, 403);
 });
+
+test('an upstream that drops mid-body does not take the relay down with it', async () => {
+  // fetch is replaced before the relay loads: this one answers 64 KB and then
+  // breaks the stream, as a CDN connection reset does. With .pipe() that
+  // error had no handler and the whole process exited.
+  const stub = `data:text/javascript,${encodeURIComponent(`
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(65536));
+        setTimeout(() => controller.error(new TypeError('terminated')), 50);
+      },
+    }), { status: 200 });
+  `)}`;
+  const port = PORT + 1;
+  const dropping = spawn(process.execPath, ['--import', stub, 'relay/serve.mjs'], {
+    env: { ...process.env, PORT: String(port) },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      let seen = '';
+      dropping.stdout.on('data', (chunk) => {
+        seen += String(chunk);
+        if (seen.includes('relay listening')) resolve();
+      });
+      dropping.on('exit', (code) => reject(new Error(`relay exited with ${code}`)));
+    });
+    const target = encodeURIComponent('https://rr1---sn-x.googlevideo.com/videoplayback');
+    const response = await fetch(`http://127.0.0.1:${port}/?url=${target}`);
+    assert.equal(response.status, 200);
+    await assert.rejects(response.arrayBuffer());
+    await new Promise((r) => setTimeout(r, 200));
+    const after = await fetch(`http://127.0.0.1:${port}/`);
+    assert.equal(after.status, 400, 'still answering');
+    assert.equal(dropping.exitCode, null);
+  } finally {
+    dropping.kill();
+  }
+});

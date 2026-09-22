@@ -281,3 +281,75 @@ test('ALLOWED_HOSTS replaces the defaults rather than adding to them', async () 
     upstream.restore();
   }
 });
+
+/* ------------------------------------------------------------------ redirects */
+
+test('a redirect to a private address is refused, not followed', async () => {
+  // fetch used to follow redirects on its own, and the checks only ever saw
+  // the first URL: an allowed host answering 302 → 127.0.0.1 got the relay
+  // to fetch the LAN of whoever runs it.
+  const upstream = stubUpstream(() => new Response(null, { status: 302, headers: { Location: 'http://127.0.0.1:9102/secret' } }));
+  try {
+    const response = await call(relayUrl(YT), { headers: { Origin: ORIGIN } });
+    assert.equal(response.status, 403);
+    assert.equal((await response.json()).error, 'redirect refused: not a public address');
+    assert.equal(upstream.calls.length, 1);
+    assert.equal(upstream.calls[0].init.redirect, 'manual');
+  } finally {
+    upstream.restore();
+  }
+});
+
+test('a redirect off the allow-list is refused', async () => {
+  const upstream = stubUpstream(() => new Response(null, { status: 301, headers: { Location: 'https://elsewhere.example/x' } }));
+  try {
+    const response = await call(relayUrl(YT), { headers: { Origin: ORIGIN } });
+    assert.equal(response.status, 403);
+    assert.equal((await response.json()).error, 'redirect refused: host not allowed');
+  } finally {
+    upstream.restore();
+  }
+});
+
+test('a redirect between allowed hosts is followed, relative locations included', async () => {
+  let n = 0;
+  const upstream = stubUpstream((url) => {
+    n += 1;
+    if (n === 1) return new Response(null, { status: 302, headers: { Location: 'https://rr3---sn-abc.googlevideo.com/videoplayback?x=1' } });
+    if (n === 2) return new Response(null, { status: 307, headers: { Location: '/videoplayback?x=2' } });
+    return new Response(`final ${new URL(url).search}`, { status: 200 });
+  });
+  try {
+    const response = await call(relayUrl('https://www.youtube.com/watch?v=x'), { headers: { Origin: ORIGIN } });
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'final ?x=2');
+    assert.deepEqual(upstream.calls.map((c) => new URL(c.url).host), ['www.youtube.com', 'rr3---sn-abc.googlevideo.com', 'rr3---sn-abc.googlevideo.com']);
+  } finally {
+    upstream.restore();
+  }
+});
+
+test('a redirect loop ends with a 502', async () => {
+  const upstream = stubUpstream(() => new Response(null, { status: 302, headers: { Location: YT } }));
+  try {
+    const response = await call(relayUrl(YT), { headers: { Origin: ORIGIN } });
+    assert.equal(response.status, 502);
+    assert.equal((await response.json()).error, 'too many redirects');
+  } finally {
+    upstream.restore();
+  }
+});
+
+test('the shapes of a private address the first check missed are refused too', async () => {
+  const upstream = stubUpstream();
+  try {
+    for (const target of ['http://0.0.0.0:9102/x', 'http://100.100.100.100/', 'http://[::ffff:127.0.0.1]/', 'http://printer.local/', 'http://app.localhost/']) {
+      const response = await call(relayUrl(target), { env: { ALLOWED_HOSTS: '0.0.0.0,100.100.100.100,printer.local,app.localhost,[::ffff:7f00:1]' } });
+      assert.equal(response.status, 400, target);
+      assert.equal((await response.json()).error, 'not a public address', target);
+    }
+    assert.equal(upstream.calls.length, 0);
+  } finally {
+    upstream.restore();
+  }
+});

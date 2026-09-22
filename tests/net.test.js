@@ -134,6 +134,45 @@ test('a refusal is not repeated', async () => {
   }
 });
 
+test('a reconnect that fails outright is the network, not a refusal, and is tried again', async () => {
+  // A phone between cells: the stream breaks, and the first attempt to pick
+  // it up cannot connect at all. The browser reports that with the same
+  // TypeError it uses for a CORS refusal — but this host has just answered
+  // the page, so it is not refusing it, and the resume must go on.
+  const stub = stubFetch([
+    () => ok(WHOLE, { breakAfter: 128 }),
+    () => {
+      throw new TypeError('Failed to fetch');
+    },
+    () => ok(WHOLE.slice(128), { status: 206, from: 128 }),
+  ]);
+  try {
+    const out = await new Fetcher().bytes('https://cdn.example/clip.mp4', { attempts: 4 });
+    assert.deepEqual(out, WHOLE);
+    assert.equal(stub.asked.length, 3);
+    assert.equal(stub.asked[2].range, 'bytes=128-', 'and it still resumed from where it stopped');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('a host never heard from that the browser refuses is a refusal, said once', async () => {
+  const stub = stubFetch([
+    () => {
+      throw new TypeError('Failed to fetch');
+    },
+  ]);
+  try {
+    await assert.rejects(
+      () => new Fetcher().bytes('https://cdn.example/clip.mp4', { attempts: 3 }),
+      (error) => /does not let a web page/.test(error.message) && error.retryable === false,
+    );
+    assert.equal(stub.asked.length, 1);
+  } finally {
+    stub.restore();
+  }
+});
+
 test('a server error is repeated', async () => {
   let calls = 0;
   const stub = stubFetch([
@@ -225,6 +264,40 @@ test('a reset tells the writer to throw away what it has', async () => {
     });
     assert.equal(resets, 1);
     assert.equal(written, WHOLE.length, 'the file on disk is the file, not the file plus a prefix');
+  } finally {
+    stub.restore();
+  }
+});
+
+/** A response as fetch hands it back after following a redirect. */
+const redirected = (text, to) => {
+  const response = new Response(text);
+  Object.defineProperty(response, 'redirected', { value: true });
+  Object.defineProperty(response, 'url', { value: to });
+  return response;
+};
+
+test('a document that was redirected is relative to where it landed', async () => {
+  const stub = stubFetch([() => redirected('#EXTM3U', 'https://cdn.example/path/master.m3u8')]);
+  try {
+    const doc = await new Fetcher().document('https://short.example/master.m3u8');
+    assert.equal(doc.text, '#EXTM3U');
+    assert.equal(doc.url, 'https://cdn.example/path/master.m3u8');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('through a relay, the address reported is the relay\'s, so the one asked for is kept', async () => {
+  const stub = stubFetch([
+    () => {
+      throw new TypeError('Failed to fetch');
+    },
+    () => redirected('#EXTM3U', 'https://relay.example/?url=elsewhere'),
+  ]);
+  try {
+    const doc = await new Fetcher({ escape: relayEscape('https://relay.example') }).document('https://short.example/master.m3u8');
+    assert.equal(doc.url, 'https://short.example/master.m3u8');
   } finally {
     stub.restore();
   }

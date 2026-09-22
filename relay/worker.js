@@ -78,27 +78,40 @@ function hostAllowed(hostname, allowed) {
 }
 
 /**
- * Refuse anything that is not a public web address.
+ * Loopback, private, link-local, CGNAT (100.64/10) and "this host" (0.x), by
+ * name or number, plus every IPv6 literal: no media host is addressed by one,
+ * and each of them can spell a private address.
+ */
+const PRIVATE_HOST =
+  /^(localhost|.+\.localhost|.+\.local|0\.|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|\[)/i;
+
+/**
+ * Why a URL must not be fetched, or nothing.
  *
  * Workers cannot reach a private network, but they can reach other services on
- * the platform, and a hostname is free to resolve wherever it likes — so the
- * obvious shapes are refused here rather than assumed impossible.
+ * the platform, and the Node bridge runs on someone's own machine, where the
+ * LAN is right there — so the obvious shapes are refused rather than assumed
+ * impossible. Asked of the first URL and of every redirect after it.
  */
+function refusal(target, allowedHosts) {
+  if (target.protocol !== 'https:' && target.protocol !== 'http:') return 'only http(s)';
+  if (PRIVATE_HOST.test(target.hostname)) return 'not a public address';
+  if (!hostAllowed(target.hostname, allowedHosts)) return 'host not allowed';
+  return null;
+}
+
 function targetOf(request) {
   const raw = new URL(request.url).searchParams.get('url');
   if (!raw) return { error: 'no url parameter' };
-  let target;
   try {
-    target = new URL(raw);
+    return { target: new URL(raw) };
   } catch {
     return { error: 'unparseable url' };
   }
-  if (target.protocol !== 'https:' && target.protocol !== 'http:') return { error: 'only http(s)' };
-  if (/^(localhost|\[?::1\]?|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/i.test(target.hostname)) {
-    return { error: 'not a public address' };
-  }
-  return { target };
 }
+
+/** Enough for a CDN hand-off or two; a loop is refused rather than followed. */
+const MAX_REDIRECTS = 5;
 
 function corsHeaders(request, env) {
   const origin = request.headers.get('Origin');
@@ -150,7 +163,8 @@ export default {
     if (error) return deny(error, request, env, 400);
 
     const allowedHosts = list(env.ALLOWED_HOSTS, DEFAULT_HOSTS);
-    if (!hostAllowed(target.hostname, allowedHosts)) return deny('host not allowed', request, env);
+    const refused = refusal(target, allowedHosts);
+    if (refused) return deny(refused, request, env, refused === 'host not allowed' ? 403 : 400);
 
     const headers = new Headers();
     for (const [key, value] of request.headers) {
@@ -169,17 +183,38 @@ export default {
     // API answered every InnerTube call through the Node relay with a 400.
     // Nothing is lost: only API calls are POSTed through here, a few
     // kilobytes each; the media that must not be buffered is always a GET.
-    const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
+    //
+    // Redirects are followed by hand. Followed by fetch, they went wherever
+    // the first answer pointed — past both the allow-list and the private
+    // address check, which only ever saw the first URL.
+    let method = request.method;
+    let body = method !== 'GET' && method !== 'HEAD' ? await request.arrayBuffer() : undefined;
+    let url = target;
     let upstream;
-    try {
-      upstream = await fetch(target.toString(), {
-        method: request.method,
-        headers,
-        body: hasBody ? await request.arrayBuffer() : undefined,
-        redirect: 'follow',
-      });
-    } catch (failure) {
-      return deny(`upstream: ${failure?.message || failure}`, request, env, 502);
+    for (let hop = 0; ; hop += 1) {
+      try {
+        upstream = await fetch(url.toString(), { method, headers, body, redirect: 'manual' });
+      } catch (failure) {
+        return deny(`upstream: ${failure?.message || failure}`, request, env, 502);
+      }
+      const location = upstream.status >= 300 && upstream.status < 400 ? upstream.headers.get('location') : null;
+      if (!location) break;
+      await upstream.body?.cancel();
+      if (hop === MAX_REDIRECTS) return deny('too many redirects', request, env, 502);
+      let next;
+      try {
+        next = new URL(location, url);
+      } catch {
+        return deny('unparseable redirect', request, env, 502);
+      }
+      const why = refusal(next, allowedHosts);
+      if (why) return deny(`redirect refused: ${why}`, request, env, 403);
+      // As a browser does: a 303, or a 301/302 answering a POST, becomes a GET.
+      if (upstream.status === 303 || ((upstream.status === 301 || upstream.status === 302) && method === 'POST')) {
+        method = 'GET';
+        body = undefined;
+      }
+      url = next;
     }
 
     // The runtime's fetch has already decoded the body, so the upstream's

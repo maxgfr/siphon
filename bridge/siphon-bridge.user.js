@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         siphon bridge
 // @namespace    https://github.com/maxgfr/siphon
-// @version      1.0.0
+// @version      1.1.0
 // @description  Lets siphon fetch from hosts that refuse a web page — YouTube included — using your userscript manager's privileges. No server anywhere.
 // @author       siphon
 // @match        https://maxgfr.github.io/siphon/*
@@ -11,6 +11,7 @@
 // @grant        GM.xmlHttpRequest
 // @connect      *
 // @run-at       document-start
+// @noframes
 // ==/UserScript==
 
 /*
@@ -25,9 +26,20 @@
  * has — direct files, HLS, pages, YouTube — then works on hosts that refuse,
  * with nothing running anywhere.
  *
- * It only runs on siphon's own page (see @match), so no other site can use it,
- * and it only answers messages from that page's own window. The page decides
- * what to fetch; this script never chooses a URL itself.
+ * It only runs on siphon's own page (see @match), never inside a frame, and it
+ * only answers messages from that page's own window. The page decides what to
+ * fetch; this script never chooses a URL itself.
+ *
+ * What it will fetch is narrower than "anything", because @match cannot tell
+ * siphon apart from whatever else is served on localhost:8000 — the port
+ * `docker run` publishes the self-hosted UI on, and the default of half the
+ * development servers there are. So: http and https only, GET, HEAD and POST
+ * only, and never a host on this machine or this network — loopback,
+ * private, link-local and carrier-grade NAT addresses, `localhost` and
+ * `.local` names, and names with no dot, which only a local resolver knows.
+ * Media lives on the public internet; a router's admin page does not. A
+ * public name that resolves to a private address is the one case a script
+ * with no DNS cannot see, which is why the server does this check too.
  *
  * Add your own siphon address to @match if you host it elsewhere.
  */
@@ -51,7 +63,50 @@
     return out;
   };
 
-  const announce = () => window.postMessage({ siphon: 'ready', version: '1.0.0' }, '*');
+  const METHODS = new Set(['GET', 'HEAD', 'POST']);
+
+  /** An IPv4 address as its four numbers, or null for anything that is not one. */
+  const ipv4 = (host) => {
+    const parts = host.split('.');
+    return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part)) ? parts.map(Number) : null;
+  };
+
+  /** Not the public internet: this machine, this network, or nobody's. */
+  const privateV4 = ([a, b]) =>
+    a === 0 || a === 10 || a === 127 || a >= 224 || // this network, private, loopback, multicast and reserved
+    (a === 100 && b >= 64 && b <= 127) || // carrier-grade NAT
+    (a === 169 && b === 254) || // link-local, where cloud metadata lives
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168);
+
+  /**
+   * Whether the page may have this fetched. The URL parser has already
+   * turned `http://2130706433/` and `http://0x7f.1/` into `127.0.0.1`, so the
+   * dotted form is the only one left to read.
+   */
+  const allowed = (raw, method) => {
+    if (!METHODS.has(String(method).toUpperCase())) return false;
+    let url;
+    try {
+      url = new URL(raw);
+    } catch {
+      return false;
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    const host = url.hostname.toLowerCase().replace(/\.$/, '');
+    if (host.startsWith('[')) {
+      // IPv6: only global unicast (2000::/3) is the public internet. That
+      // leaves out loopback, unique-local, link-local, multicast and the
+      // IPv4-mapped form of every private address above.
+      const first = parseInt(host.slice(1).split(':')[0] || '0', 16);
+      return first >= 0x2000 && first <= 0x3fff;
+    }
+    const v4 = ipv4(host);
+    if (v4) return !privateV4(v4);
+    return host.includes('.') && !/(^|\.)(localhost|local|internal|lan|home\.arpa)$/.test(host);
+  };
+
+  const announce = () => window.postMessage({ siphon: 'ready', version: '1.1.0' }, '*');
 
   window.addEventListener('message', (event) => {
     if (event.source !== window || !event.data || event.data.siphon === undefined) return;
@@ -61,6 +116,10 @@
     if (message.siphon !== 'fetch') return;
 
     const { id, url, method = 'GET', headers = {}, body = null } = message;
+    if (!allowed(url, method)) {
+      window.postMessage({ siphon: 'error', id, message: 'the bridge only fetches public http(s) addresses, with GET, HEAD or POST' }, '*');
+      return;
+    }
     gm({
       method,
       url,

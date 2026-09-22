@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Iterator, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request as UrlRequest, urlopen
+from urllib.request import HTTPRedirectHandler, Request as UrlRequest, build_opener
 
 import yt_dlp
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -46,8 +46,14 @@ from pydantic import BaseModel, Field
 
 # Comma-separated origins, or "*". The frontend is served from GitHub Pages
 # while this runs somewhere else entirely, so cross-origin is the normal case,
-# not the exception.
-ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+# not the exception. The default names that page and nothing else: the image
+# serves its own interface from the same origin, which needs no entry here,
+# and "*" on a server with no key would let any site the owner happens to
+# visit drive it — their home IP, their YouTube session, their LAN.
+HOSTED_PAGE_ORIGIN = "https://maxgfr.github.io"
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get("ALLOWED_ORIGINS", HOSTED_PAGE_ORIGIN).split(",") if o.strip()
+]
 
 # Optional shared secret. Unset means open — fine on a LAN or behind Tailscale,
 # not fine on a public URL, and the health endpoint reports which one you are in
@@ -90,6 +96,31 @@ COOKIES_PATH = COOKIES_FILE or (DOWNLOAD_ROOT.parent / "siphon-cookies.txt")
 
 def have_cookies() -> bool:
     return COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 0
+
+
+def write_private(path: Path, text: str) -> None:
+    """Create or replace a file readable by this user only, from the first byte."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    path.chmod(0o600)
+
+
+def cookie_copy(directory: Path) -> str | None:
+    """
+    The uploaded session, as a private copy for one yt-dlp run.
+
+    yt-dlp writes its cookie jar back when it closes. Handed the canonical
+    file, that write-back resurrected a jar the owner had just deleted — with
+    the umask's permissions rather than owner-only. A copy per run means the
+    uploaded file is only ever written by the upload, and deleted by delete.
+    """
+    if not have_cookies():
+        return None
+    copy = directory / ".cookies.txt"
+    write_private(copy, COOKIES_PATH.read_text(encoding="utf-8"))
+    return str(copy)
 
 # Serve the frontend from the same origin when it is present. That is what makes
 # `docker run` a complete product rather than half of one — and it sidesteps
@@ -309,6 +340,77 @@ class UnsafeUrl(ValueError):
     """The URL is syntactically fine but must not be fetched."""
 
 
+def refused_address(raw: str) -> bool:
+    """
+    Whether an address is somewhere this server must not reach.
+
+    Anything that is not globally routable: private ranges, loopback,
+    link-local (where the cloud metadata endpoint lives), CGNAT's 100.64/10
+    (where a Tailscale network's other machines live), reserved and
+    unspecified — and multicast, which is "global" by the letter only.
+    """
+    address = ipaddress.ip_address(raw.split("%", 1)[0])
+    return not address.is_global or address.is_multicast
+
+
+class PrivateAddress(socket.gaierror):
+    """A name resolved, but only to somewhere this server must not reach."""
+
+
+PRIVATE_ADDRESS_MESSAGE = "That address is on a private network, so it will not be fetched."
+
+_REAL_GETADDRINFO = socket.getaddrinfo
+_AI_PASSIVE = socket.AI_PASSIVE
+_EAI_NONAME = socket.EAI_NONAME
+
+
+def _exempt_hosts() -> frozenset[str]:
+    """
+    The private addresses this server is meant to reach: its proof-of-origin
+    sidecar, and a proxy the operator configured. Both are named by whoever
+    runs the server, never by whoever calls it.
+    """
+    hosts = set()
+    names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+    for value in (POT_PROVIDER_URL, *(os.environ.get(name, "") for name in names)):
+        value = value.strip()
+        if not value:
+            continue
+        host = urlparse(value if "://" in value else f"http://{value}").hostname
+        if host:
+            hosts.add(host.lower())
+    return frozenset(hosts)
+
+
+EXEMPT_HOSTS = _exempt_hosts()
+
+
+def _guarded_getaddrinfo(host: Any, port: Any, family: int = 0, type: int = 0, proto: int = 0, flags: int = 0):
+    """
+    socket.getaddrinfo, refusing to hand back a private address.
+
+    assert_fetchable checks the URL a caller names, but that is only the first
+    hop: yt-dlp and the tunnel follow redirects, a page can point its video at
+    anything, and a name can resolve differently a second time. Checking where
+    a connection is actually about to go covers all of them at once, for every
+    socket this process opens — so it is installed process-wide. Lookups for
+    binding a listening socket (AI_PASSIVE) are not connections and pass.
+    """
+    infos = _REAL_GETADDRINFO(host, port, family, type, proto, flags)
+    if ALLOW_PRIVATE_HOSTS or host is None or flags & _AI_PASSIVE:
+        return infos
+    name = (host.decode() if isinstance(host, bytes) else str(host)).lower()
+    if name in EXEMPT_HOSTS:
+        return infos
+    for info in infos:
+        if refused_address(str(info[4][0])):
+            raise PrivateAddress(_EAI_NONAME, PRIVATE_ADDRESS_MESSAGE)
+    return infos
+
+
+socket.getaddrinfo = _guarded_getaddrinfo
+
+
 def assert_fetchable(raw: str) -> str:
     """
     Reject anything that is not a public http(s) URL.
@@ -336,20 +438,14 @@ def assert_fetchable(raw: str) -> str:
 
     try:
         infos = socket.getaddrinfo(parsed.hostname, None)
+    except PrivateAddress as exc:
+        raise UnsafeUrl(PRIVATE_ADDRESS_MESSAGE) from exc
     except socket.gaierror as exc:
         raise UnsafeUrl(f"Could not resolve {parsed.hostname}.") from exc
 
     for info in infos:
-        address = ipaddress.ip_address(info[4][0])
-        if (
-            address.is_private
-            or address.is_loopback
-            or address.is_link_local
-            or address.is_reserved
-            or address.is_multicast
-            or address.is_unspecified
-        ):
-            raise UnsafeUrl("That address is on a private network, so it will not be fetched.")
+        if refused_address(str(info[4][0])):
+            raise UnsafeUrl(PRIVATE_ADDRESS_MESSAGE)
     return url
 
 
@@ -398,6 +494,10 @@ class Job:
     clip_end: float | None = None
     rate_limit: int | None = None
     yt_client: str = ""
+    # Set by DELETE. The download thread checks it at every progress report
+    # and stops there; without it, a cancelled job kept downloading into a
+    # directory nothing would ever sweep.
+    cancelled: bool = False
 
     @property
     def directory(self) -> Path:
@@ -450,6 +550,27 @@ def sweep_expired() -> None:
         shutil.rmtree(job.directory, ignore_errors=True)
 
 
+JOB_DIR_NAME = re.compile(r"^[0-9a-f]{16}$")
+
+
+def sweep_orphans() -> None:
+    """
+    Remove job directories no job owns: what a previous run of this process
+    left on a volume that outlives it. Only names shaped like a job id are
+    touched — the directory may be shared with other things.
+    """
+    with JOBS_LOCK:
+        known = set(JOBS)
+    for child in DOWNLOAD_ROOT.iterdir() if DOWNLOAD_ROOT.is_dir() else []:
+        if child.is_dir() and JOB_DIR_NAME.match(child.name) and child.name not in known:
+            shutil.rmtree(child, ignore_errors=True)
+
+
+# How often the sweep runs on its own. It used to run only when a new job
+# was created, so an idle server kept every finished file forever.
+SWEEP_INTERVAL_SECONDS = max(30, min(300, JOB_TTL_SECONDS // 2))
+
+
 # ------------------------------------------------------------------ download
 
 
@@ -471,6 +592,8 @@ def media_files(directory: Path, include_subtitles: bool = False) -> list[Path]:
 
 def _hook(job: Job):
     def hook(status: dict[str, Any]) -> None:
+        if job.cancelled:
+            raise yt_dlp.utils.DownloadCancelled("Cancelled.")
         info = status.get("info_dict") or {}
         # yt-dlp reports these per item, so they also tell us where we are in a
         # playlist — there is no separate playlist-level progress callback.
@@ -498,10 +621,33 @@ def _hook(job: Job):
 
 def _postprocessor_hook(job: Job):
     def hook(status: dict[str, Any]) -> None:
+        if job.cancelled:
+            raise yt_dlp.utils.DownloadCancelled("Cancelled.")
         if status.get("status") == "started":
             job.stage = "processing"
 
     return hook
+
+
+class CheckMediaUrls(yt_dlp.postprocessor.PostProcessor):
+    """
+    Refuse, before a byte is fetched, a chosen format that lives on a private
+    address. The page's URL was checked on the way in, but the formats are
+    whatever the page named — and a clip is fetched by ffmpeg, which resolves
+    names on its own and never meets this process's guard.
+    """
+
+    def run(self, info: dict[str, Any]):
+        formats = info.get("requested_formats") or [info]
+        for fmt in formats:
+            for key in ("url", "manifest_url", "fragment_base_url"):
+                value = fmt.get(key)
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    try:
+                        assert_fetchable(value)
+                    except UnsafeUrl as exc:
+                        raise yt_dlp.utils.DownloadError(str(exc)) from exc
+        return [], info
 
 
 def outtmpl_for(job: Job) -> str:
@@ -545,6 +691,13 @@ def build_options(job: Job, client: str | None) -> dict[str, Any]:
         # file with no subtitles at all.
         options["writeautomaticsub"] = True
         options["subtitleslangs"] = [lang.strip() for lang in job.sub_langs.split(",") if lang.strip()]
+        if job.subs == "files":
+            # SubRip, as the settings promise: YouTube's own formats are VTT
+            # and its JSON variants, which fewer phone players open.
+            options["postprocessors"] = [
+                *options.get("postprocessors", []),
+                {"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"},
+            ]
         if job.subs == "embed":
             options.setdefault("postprocessors", [])
             options["postprocessors"] = [
@@ -556,8 +709,9 @@ def build_options(job: Job, client: str | None) -> dict[str, Any]:
         options["playlistend"] = PLAYLIST_LIMIT
         # One dead video must not abandon the other forty-nine.
         options["ignoreerrors"] = True
-    if have_cookies():
-        options["cookiefile"] = str(COOKIES_PATH)
+    cookies = cookie_copy(job.directory)
+    if cookies:
+        options["cookiefile"] = cookies
     if job.sponsorblock:
         # The community's segment list is fetched after the video is chosen,
         # and the cuts are made before anything else touches the file.
@@ -591,7 +745,20 @@ def run_job(job: Job) -> None:
     trying three more clients would just make the user wait three times as long
     for the same answer.
     """
+    try:
+        _run_job(job)
+    finally:
+        if job.cancelled:
+            shutil.rmtree(job.directory, ignore_errors=True)
+        else:
+            # The private cookie copy is for the run, not for the download.
+            (job.directory / ".cookies.txt").unlink(missing_ok=True)
+
+
+def _run_job(job: Job) -> None:
     with RUNNING:
+        if job.cancelled:
+            return
         job.state = "running"
         attempts = player_client_chain(have_cookies(), job.yt_client) if is_youtube(job.url) else [None]
         last_error: Exception | None = None
@@ -608,6 +775,7 @@ def run_job(job: Job) -> None:
 
             try:
                 with yt_dlp.YoutubeDL(build_options(job, client)) as ydl:
+                    ydl.add_post_processor(CheckMediaUrls(), when="before_dl")
                     info = ydl.extract_info(job.url, download=True)
                     if info.get("_type") == "playlist":
                         entries = [e for e in info.get("entries", []) if e]
@@ -657,6 +825,8 @@ def run_job(job: Job) -> None:
                 job.state = "done"
                 return
             except Exception as exc:  # noqa: BLE001 — surfaced to the user verbatim
+                if job.cancelled:
+                    return
                 last_error = exc
                 if index + 1 < len(attempts) and is_bot_wall(str(exc)):
                     job.attempts = index + 1
@@ -743,13 +913,33 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     that step happens elsewhere — so the warning belongs where the process can
     actually be seen starting, rather than in a README nobody re-reads.
     """
+    log = logging.getLogger("uvicorn.error")
     if not AUTH_TOKEN:
-        logging.getLogger("uvicorn.error").warning(
+        log.warning(
             "AUTH_TOKEN is not set: anyone who can reach this server can use it to download. "
             "That is fine on localhost or your own LAN. If you are putting this behind a tunnel "
             "or forwarding a port to it, set AUTH_TOKEN first."
         )
-    yield
+        if "*" in ALLOWED_ORIGINS:
+            log.warning(
+                "ALLOWED_ORIGINS is * and there is no AUTH_TOKEN: any website open in a browser "
+                "that can reach this server can use it. Name your page's origin, or set a key."
+            )
+
+    # What a previous run left behind is swept now, and finished files from
+    # then on — whether or not anyone starts another download.
+    await asyncio.to_thread(sweep_orphans)
+
+    async def keep_sweeping() -> None:
+        while True:
+            await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+            await asyncio.to_thread(sweep_expired)
+
+    sweeper = asyncio.create_task(keep_sweeping())
+    try:
+        yield
+    finally:
+        sweeper.cancel()
 
 
 app = FastAPI(
@@ -783,6 +973,10 @@ app.add_middleware(
 )
 
 
+# A language code, as YouTube names its tracks: en, fr, pt-BR, zh-Hans.
+SUB_LANG = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
+
+
 def check_auth(authorization: str | None) -> None:
     if not AUTH_TOKEN:
         return
@@ -790,7 +984,9 @@ def check_auth(authorization: str | None) -> None:
     # Constant-time: a plain == leaks the token one character at a time.
     import hmac
 
-    if not authorization or not hmac.compare_digest(authorization, expected):
+    # Bytes, not str: compare_digest raises on a non-ASCII str, which turned a
+    # wrong key into a 500.
+    if not authorization or not hmac.compare_digest(authorization.encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="This server needs an access key.")
 
 
@@ -811,7 +1007,8 @@ def lan_addresses() -> list[str]:
     found: list[str] = []
     try:
         hostname = socket.gethostname()
-        candidates = {info[4][0] for info in socket.getaddrinfo(hostname, None, socket.AF_INET)}
+        # The real lookup: these are private by definition, which is the point.
+        candidates = {info[4][0] for info in _REAL_GETADDRINFO(hostname, None, socket.AF_INET)}
     except socket.gaierror:
         candidates = set()
 
@@ -878,10 +1075,12 @@ async def probe(body: ProbeRequest, authorization: str | None = Header(default=N
             # applies to entries inside a playlist.
             "extract_flat": "in_playlist",
         }
-        if have_cookies():
-            options["cookiefile"] = str(COOKIES_PATH)
-        with yt_dlp.YoutubeDL(options) as ydl:
-            return ydl.extract_info(url, download=False)
+        with tempfile.TemporaryDirectory(dir=DOWNLOAD_ROOT) as scratch:
+            cookies = cookie_copy(Path(scratch))
+            if cookies:
+                options["cookiefile"] = cookies
+            with yt_dlp.YoutubeDL(options) as ydl:
+                return ydl.extract_info(url, download=False)
 
     try:
         info = await asyncio.wait_for(asyncio.to_thread(extract), timeout=60)
@@ -967,9 +1166,7 @@ async def put_cookies(body: CookiesRequest, authorization: str | None = Header(d
                 "exports the Netscape format, not a JSON export."
             ),
         )
-    COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    COOKIES_PATH.write_text(text + "\n", encoding="utf-8")
-    COOKIES_PATH.chmod(0o600)
+    write_private(COOKIES_PATH, text + "\n")
     return {"stored": True, "bytes": len(text)}
 
 
@@ -998,6 +1195,19 @@ async def create_job(body: JobRequest, authorization: str | None = Header(defaul
         raise HTTPException(status_code=400, detail=str(exc))
     if clip_start is not None and clip_end is not None and clip_end <= clip_start:
         raise HTTPException(status_code=400, detail="The clip has to end after it starts.")
+    if body.sponsorblock and (clip_start is not None or clip_end is not None):
+        # yt-dlp measures a clip's duration as the clip's, and SponsorBlock
+        # then drops every segment as belonging to a different video — so the
+        # pair would quietly return the sponsors. Better to say so.
+        raise HTTPException(
+            status_code=400,
+            detail="Sponsor removal and a clip cannot be combined. Turn one of them off.",
+        )
+    sub_langs = [lang.strip() for lang in body.sub_langs.split(",") if lang.strip()] or ["en"]
+    if len(sub_langs) > 10 or not all(SUB_LANG.match(lang) and lang.lower() != "all" for lang in sub_langs):
+        # yt-dlp reads each entry as a regular expression, and "all" as all,
+        # so ".*" or "all" would fetch every auto-translated language there is.
+        raise HTTPException(status_code=400, detail="Subtitle languages are codes like en, fr or pt-BR, comma-separated.")
 
     with JOBS_LOCK:
         active = sum(1 for job in JOBS.values() if job.state in ("queued", "running"))
@@ -1009,7 +1219,7 @@ async def create_job(body: JobRequest, authorization: str | None = Header(defaul
             preset=body.preset,
             is_playlist=body.playlist,
             subs=body.subs if body.subs in ("off", "embed", "files") else "off",
-            sub_langs=body.sub_langs.strip() or "en",
+            sub_langs=",".join(sub_langs),
             sponsorblock=body.sponsorblock,
             clip_start=clip_start,
             clip_end=clip_end,
@@ -1065,6 +1275,9 @@ async def delete_job(job_id: str, authorization: str | None = Header(default=Non
     with JOBS_LOCK:
         job = JOBS.pop(job_id, None)
     if job:
+        # A running download stops at its next progress report and removes
+        # its own directory then; this removes what is there already.
+        job.cancelled = True
         shutil.rmtree(job.directory, ignore_errors=True)
     return {"deleted": bool(job)}
 
@@ -1239,14 +1452,16 @@ def resolve_url(url: str) -> dict[str, Any]:
             # the page can show anything.
             "extract_flat": "in_playlist",
         }
-        if have_cookies():
-            options["cookiefile"] = str(COOKIES_PATH)
         args = extractor_args(client)
         if args:
             options["extractor_args"] = args
         try:
-            with yt_dlp.YoutubeDL(options) as ydl:
-                info = ydl.extract_info(url, download=False)
+            with tempfile.TemporaryDirectory(dir=DOWNLOAD_ROOT) as scratch:
+                cookies = cookie_copy(Path(scratch))
+                if cookies:
+                    options["cookiefile"] = cookies
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    info = ydl.extract_info(url, download=False)
             if info.get("_type") == "playlist":
                 entries = [e for e in info.get("entries", []) if e]
                 if not entries:
@@ -1320,6 +1535,41 @@ async def resolve(body: ProbeRequest, authorization: str | None = Header(default
         raise HTTPException(status_code=504, detail="The site took too long to answer.")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=humanize_error(exc, url))
+
+
+class TunnelRedirects(HTTPRedirectHandler):
+    """
+    Follow a media host's redirect, but not with its credentials.
+
+    CDNs redirect as a matter of course, so redirects are followed; where they
+    lead is checked like the first hop (a public address — the process-wide
+    guard refuses anything else at connect time). What must not follow is a
+    Cookie or Authorization the resolve granted to one host: urllib copies
+    every header onto the redirected request, which handed them to whichever
+    host the first one pointed at. On a new host, the headers are that host's
+    own grant, or none.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001 — urllib's signature
+        try:
+            assert_fetchable(newurl)
+        except UnsafeUrl as exc:
+            raise HTTPError(newurl, 403, str(exc), headers, fp) from exc
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        old_host = (urlparse(req.full_url).hostname or "").lower()
+        new_host = (urlparse(newurl).hostname or "").lower()
+        if new is not None and new_host != old_host:
+            for name in list(new.headers):
+                if name.lower() in ("cookie", "authorization"):
+                    new.remove_header(name)
+            for name, value in (_granted(new_host) or {}).items():
+                new.add_header(name, value)
+        return new
+
+
+def urlopen(request: UrlRequest, timeout: float = 30) -> Any:
+    """urllib's urlopen, with the tunnel's rules for redirects."""
+    return build_opener(TunnelRedirects()).open(request, timeout=timeout)
 
 
 def _iter_upstream(response: Any) -> Iterator[bytes]:

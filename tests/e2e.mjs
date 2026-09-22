@@ -78,6 +78,8 @@ function buildFixtures() {
     '-c:a', 'aac', '-shortest', at('clip.mp4'),
   ]);
   ffmpeg(['-i', at('clip.mp4'), '-vframes', '1', '-vf', 'scale=320:180', at('cover.jpg')]);
+  // A song as a site would link it: the file is the link, whatever preset is set.
+  ffmpeg(['-f', 'lavfi', '-i', 'sine=frequency=330:duration=3', '-c:a', 'libmp3lame', at('song.mp3')]);
 
   const rendition = (name, scale, prefix) =>
     ffmpeg([
@@ -129,12 +131,12 @@ const TYPES = {
   '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json',
   '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml', '.png': 'image/png',
   '.jpg': 'image/jpeg', '.mp4': 'video/mp4', '.ts': 'video/mp2t', '.m3u8': 'application/vnd.apple.mpegurl',
-  '.wasm': 'application/wasm', '.key': 'application/octet-stream',
+  '.wasm': 'application/wasm', '.key': 'application/octet-stream', '.mp3': 'audio/mpeg',
 };
 
 /** A static server that allows cross-origin reads, which is what the media host must do. */
 /** How many times the flaky route has been asked for, and with what. */
-const flaky = { asks: [], cut: false };
+const flaky = { asks: [], cut: false, downUntil: 0, refused: 0 };
 
 function serve(root, port, prefix) {
   const server = createServer((request, response) => {
@@ -173,8 +175,22 @@ function serve(root, port, prefix) {
         response.writeHead(200, { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': size });
         const third = Math.floor(size / 3);
         response.write(readFileSync(source).subarray(0, third), () => {
-          setTimeout(() => response.destroy(), 200);
+          setTimeout(() => {
+            response.destroy();
+            flaky.downUntil = Date.now() + 800;
+          }, 200);
         });
+        return undefined;
+      }
+      // Then, for a moment, the network is still gone: every connection is
+      // dropped before a byte of answer, which a browser reports with the
+      // same TypeError as a CORS refusal. A moment rather than one request,
+      // because Chromium quietly retries a request whose reused socket died.
+      // This host has already answered the page, so it is the network, and
+      // the resume has to carry on through it.
+      if (Date.now() < flaky.downUntil) {
+        flaky.refused += 1;
+        request.socket.destroy();
         return undefined;
       }
       if (from > 0) {
@@ -188,6 +204,23 @@ function serve(root, port, prefix) {
         response.writeHead(200, { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': size });
       }
       return createReadStream(source, { start: from }).pipe(response);
+    }
+
+    // A download slow enough to be interrupted: 64 KB every 200 ms.
+    if (path.endsWith('/slow.mp4')) {
+      const size = 4 * 1024 * 1024;
+      response.writeHead(200, { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': size });
+      if (request.method === 'HEAD') return response.end();
+      let sent = 0;
+      const timer = setInterval(() => {
+        if (response.destroyed || sent >= size) return clearInterval(timer);
+        const next = Math.min(65536, size - sent);
+        response.write(Buffer.alloc(next, 7));
+        sent += next;
+        if (sent >= size) response.end();
+      }, 200);
+      response.on('close', () => clearInterval(timer));
+      return undefined;
     }
 
     const file = join(root, path);
@@ -351,6 +384,9 @@ function serveCobalt(port) {
         let body = {};
         try { body = JSON.parse(raw); } catch { /* not JSON */ }
         cobalt.asks.push(body);
+        if (String(body.url || '').includes('scriptURL01')) {
+          return json(response, 200, { status: 'tunnel', url: 'javascript:window.__fromInstance=1;void 0', filename: 'x.mp4' });
+        }
         json(response, 200, { status: 'tunnel', url: `${COBALT}/tunnel?id=1`, filename: 'A clip through cobalt.mp4' });
       });
       return undefined;
@@ -392,7 +428,7 @@ page.on('console', (message) => {
   // says so. That one resource is excused by URL; every other console error,
   // including any other failed load, still counts.
   const at = message.location()?.url || '';
-  if (at.includes('/flaky.mp4')) return;
+  if (at.includes('/flaky.mp4') || at.includes('/slow.mp4')) return;
   // Working out what an address is means asking it things it is not: an
   // Invidious instance answers 404 to /api/health, / and /config before its
   // stats endpoint says what it is, and Chrome reports each miss here. Those
@@ -496,6 +532,15 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   check('direct mp4 never loads the converter', coreRequests === 0, `${coreRequests} core requests`);
 }
 
+/* A direct audio file with the default video preset: the file is the link. */
+{
+  coreRequests = 0;
+  const file = await download(`${MEDIA}/media/song.mp3`, 'video_best');
+  const song = readFileSync(join(MEDIA_DIR, 'song.mp3'));
+  check('a direct mp3 under "Best" arrives byte-identical, as an mp3', file.endsWith('.mp3') && Buffer.compare(song, readFileSync(file)) === 0, file.split('/').pop());
+  check('and never loads the converter to rewrap it', coreRequests === 0, `${coreRequests} core requests`);
+}
+
 /* A connection that dies mid-download is resumed, not restarted. */
 {
   const file = await download(`${MEDIA}/media/flaky.mp4`, 'video_best');
@@ -504,6 +549,8 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   const resumed = flaky.asks.filter((ask) => /^bytes=\d+-/.test(ask.range || ''));
   check('and it asked for the rest rather than starting over',
     resumed.length > 0 && resumed[0].range !== 'bytes=0-', JSON.stringify(flaky.asks.map((a) => a.range)));
+  check('a reconnect that could not connect at all was tried again, not taken for a refusal', flaky.refused > 0 && resumed.length >= 2,
+    JSON.stringify(flaky.asks.map((a) => a.range)));
 }
 
 /* An HLS ladder: pick a rendition, fetch its segments, remux to MP4. */
@@ -573,6 +620,54 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   const label = (await page.textContent('#queueList li .q-msg')) || '';
   const save = await page.locator('#queueList li a.q-act').count();
   check('a finished row comes back after a reload', save > 0 && !/no longer/i.test(label), label.slice(0, 60));
+}
+
+/* The Save button names the file — on a blob URL nothing else will. */
+{
+  await download(`${MEDIA}/media/clip.mp4`, 'video_best');
+  const tapped = page.waitForEvent('download', { timeout: 15_000 });
+  await page.click('#queueList li a.q-act');
+  const first = (await tapped).suggestedFilename();
+  check('tapping Save hands over the file under its name, not a UUID', first === 'clip.mp4', first);
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForSelector('#queueList li a.q-act', { timeout: 15_000 });
+  const again = page.waitForEvent('download', { timeout: 15_000 });
+  await page.click('#queueList li a.q-act');
+  const second = (await again).suggestedFilename();
+  check('and after a reload too, not a UUID ending in .txt', second === 'clip.mp4', second);
+
+  const stored = () => page.evaluate(async () => {
+    const folder = await (await navigator.storage.getDirectory()).getDirectoryHandle('downloads', { create: true });
+    const names = [];
+    for await (const [name] of folder.entries()) names.push(name);
+    return names;
+  });
+  // The rows' own files, by job id: earlier checks' files are still there,
+  // waiting for the sweep, because their rows were wiped by hand.
+  const ids = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:queue') || '[]').map((entry) => entry.id).filter(Boolean));
+  const before = (await stored()).filter((name) => ids.includes(name));
+  await page.click('#queueClear');
+  await page.waitForTimeout(500);
+  const after = (await stored()).filter((name) => ids.includes(name));
+  check('"Clear finished" lets go of the files, not just the rows', before.length > 0 && after.length === 0, `${before.length} → ${after.length} of the cleared rows' files in OPFS`);
+}
+
+/* A download cut off by a reload is not "Ready". */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.fill('#url', `${MEDIA}/media/slow.mp4`);
+  await page.click('#go');
+  await page.waitForFunction(() => /\d+%/.test(document.querySelector('#queueList li')?.textContent || ''), null, { timeout: 20_000 });
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForSelector('#queueList li', { timeout: 15_000 });
+  await page.waitForTimeout(1500);
+  const label = (await page.textContent('#queueList li .q-msg')) || '';
+  const save = await page.locator('#queueList li a.q-act').count();
+  const retry = await page.locator('#queueList li [data-retry]').count();
+  check('a download interrupted by a reload does not come back as a finished file', save === 0 && !/ready/i.test(label), label.slice(0, 60));
+  check('it says it was interrupted, and offers to try again', /interrupted/i.test(label) && retry === 1, label.slice(0, 60));
 }
 
 /* An Invidious instance, given as the one address, carries YouTube for the device. */
@@ -707,6 +802,21 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   check('a YouTube link is sent to the instance with the quality asked for', ask.url === 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' && ask.videoQuality === '480', JSON.stringify(ask));
   check("the finished file arrives from the instance's tunnel, byte-identical", cobalt.tunnel >= 1 && Buffer.compare(source, readFileSync(saved)) === 0, `${cobalt.tunnel} tunnel reads`);
   check('under the name the instance gave it', /clip through cobalt/i.test(event.suggestedFilename()), event.suggestedFilename());
+
+  // An instance is someone else's server. What it hands back goes into a
+  // link this page clicks by itself, so a script URL from it would run as
+  // this page, settings, keys and all.
+  await page.check('input[name="quality"][value="video_best"]');
+  await page.fill('#url', 'https://www.youtube.com/watch?v=scriptURL01');
+  await page.click('#go');
+  // Settled either way — refused, or taken as a finished file — so the
+  // check below reports what happened instead of timing out.
+  await page.waitForFunction(() => [...document.querySelectorAll('#queueList li')].some((li) =>
+    /scriptURL01/.test(li.textContent) && (li.classList.contains('q-error') || li.querySelector('a.q-act'))), null, { timeout: 20_000 });
+  await page.waitForTimeout(300);
+  const refused = (await page.textContent('#queueList li:first-child .q-msg')) || '';
+  check("a cobalt answer that is not a download link is refused, not clicked", /not a download link/i.test(refused), refused.slice(0, 70));
+  check('and nothing it sent ran in this page', (await page.evaluate(() => window.__fromInstance)) === undefined);
   check('the page itself never touched googlevideo or youtube.com', strangers.length === 0, strangers.slice(0, 2).join(' ; '));
 }
 

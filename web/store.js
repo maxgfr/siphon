@@ -133,7 +133,12 @@ export async function get(key) {
   if (!folder) return null;
   try {
     const handle = await folder.getFileHandle(safeKey(key));
-    return await handle.getFile();
+    const file = await handle.getFile();
+    // A writer creates its file before the first byte and commits the bytes
+    // only on close, so a download cut off by a reload leaves an empty file
+    // behind — which is not a finished one. Handing it back would redraw the
+    // row as "Ready" with a Save button for zero bytes.
+    return file.size > 0 ? file : null;
   } catch {
     return null;
   }

@@ -24,7 +24,7 @@
  * the Worker reads them from its bindings.
  */
 import { createServer } from 'node:http';
-import { Readable } from 'node:stream';
+import { Readable, pipeline } from 'node:stream';
 import worker from './worker.js';
 
 const PORT = Number(process.env.PORT) || 8787;
@@ -52,7 +52,10 @@ async function send(response, res) {
   for (const [key, value] of response.headers) headers[key] = value;
   res.writeHead(response.status, headers);
   if (!response.body) return res.end();
-  Readable.fromWeb(response.body).pipe(res);
+  // pipeline, not pipe: an upstream that drops mid-body is an error on the
+  // stream, and with pipe nothing handled it — the whole process exited, and
+  // every later request found nobody listening.
+  pipeline(Readable.fromWeb(response.body), res, () => {});
 }
 
 const server = createServer(async (req, res) => {
