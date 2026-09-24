@@ -1,17 +1,17 @@
 # What was verified
 
 Every claim here is checked by one of these suites, and the last section says
-plainly what is still unproven. How many checks each suite makes is counted in
-the README's [Development](../README.md#development) section and nowhere else:
-this file used to repeat the counts, and fell behind them.
+plainly what is still unproven. How many checks each suite makes is what the
+suite prints when it runs, and nowhere else: this file and the README used to
+repeat the counts, and fell behind them.
 
 | suite | what it is | in CI |
 |---|---|---|
-| `pytest server/tests` | the server, including two against real yt-dlp on loopback, the per-job yt-dlp options, the sweep that leaves a running job alone, the tunnel's answer for an upstream it cannot reach, the converter vendoring, and the deploy commands the README and the deploy files give — the Fly steps run against a stub, the compose ones checked against the files they read | gating — `fast` |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh and the daily measurement of which instances answer a page, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them, the links in a pasted or dropped text, the age of a server's yt-dlp, the access key checked before an address is saved, YouTube behind a tunnel answered by the server rather than by the tunnel's refusal, and the service worker's shell holding every module the app loads | gating — `fast` |
+| `pytest server/tests` | the server, including two against real yt-dlp on loopback, the per-job yt-dlp options, the sweep that leaves a running job alone, the tunnel's answer for an upstream it cannot reach and where its redirects ended, clip times typed as plain seconds, the converter vendoring, and the deploy commands the README and the deploy files give — the Fly steps run against a stub, the compose ones checked against the files they read, the Pages deploy's owner relay run as the workflow runs it, the README's `docker run` held to the guide's and its volume to the image's, the update given for both ways of starting the server, every link to the bridge the script itself | gating — `fast` |
+| `npm test` | the extractor, the relay and where its redirects ended, resuming, detection, instance finding, the list refresh and the daily measurement of which instances answer a page, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them, the links in a pasted or dropped text, the age of a server's yt-dlp, the owner's relay given its `https://` or refused before it is measured, the access key checked before an address is saved, YouTube behind a tunnel answered by the server rather than by the tunnel's refusal, and the service worker's shell holding every module the app loads | gating — `fast` |
 | `npm run test:e2e` | the device alone, real Chromium, two origins; a fake Invidious, a fake Piped and a fake cobalt each carrying a YouTube link; a pasted list of links; the bundled converter | gating — `browser` |
 | `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips from the measured list and none when it is empty, an instance whose video endpoint is shut, the yt-dlp options riding with a job, the guide and its bookmarklet, a dropped link, a paste with nothing focused, the site's relay taken and a cobalt instance in config.json left alone, Find offered on a day the measured list is empty | gating — `browser` |
-| `npm run test:bridge` | a userscript lifting CORS on a host that refuses | gating — `browser` |
+| `npm run test:bridge` | a userscript lifting CORS on a host that refuses, a window at a time, cancelled and redirected | gating — `browser` |
 | `npm run test:split` | a server that only resolves, a device that downloads | gating — `browser` |
 | `npm run test:youtube` | YouTube, for real, from the browser mode in CI — through the relay, Piped, and the bundled Invidious list | informative — see [youtube.md](youtube.md) |
 | `npm run test:server` | YouTube, for real, from `server/app.py` in CI — plain, then with the proof-of-origin provider | informative — the `server-youtube` job |
@@ -119,6 +119,28 @@ origin and the media on another, so the CORS path under test is the real one:
   from the instance's tunnel under the name it gave, byte-identical.
 - In every instance case the page itself contacts neither googlevideo nor
   youtube.com at any point — checked on the wire.
+- **Twenty-five links pasted are twenty-five rows**, and every one finishes:
+  none is dropped to keep the list short or cancelled to make room. A Save
+  in settings, or a change of helper, leaves a running download running, and
+  it finishes whole from the one request it started with.
+- A direct MP3 asked for as MP3 arrives byte-identical without loading the
+  converter; MP3 from an HLS ladder is real MP3, fetched from the audio-only
+  rendition alone; M4A through cobalt is a request the instance accepts.
+- A conversion cancelled part-way does not hold up the next. Cancel keeps the
+  keyboard on it across polls, the row moves on in place rather than being
+  drawn again, and a press held across a poll still cancels. A finished or
+  failed download is said to a screen reader by name, a failure with its
+  reason, and so is the settings sheet's verdict.
+- A private video is reported as private, asked of the instance once; Piped's
+  TTML caption is asked for as WebVTT and embedded with its words.
+- Your own server's key goes with it: a key typed before the address stays
+  for that address, typing another address lets go of it, typing the server
+  back brings it back, and a cobalt instance never sees it,
+  in a probe or with a download. An address typed without `http://` is given
+  it and never asked of the page's own host. The YouTube clients offered are
+  the ones the server's yt-dlp has, `tv_embedded` never among them, and a
+  server on this computer says how a phone reaches it and that plain http
+  will not install or take links from the share sheet.
 
 The settings sheet, the guide and the site's own config are driven in the
 deployed suite, in a real browser over HTTPS under a `/siphon/` subpath with
@@ -138,8 +160,10 @@ address with the cookie jar appearing beside it; **the Advanced section's
 yt-dlp options** are live with a server set, greyed and kept with none, and
 what is typed there — SponsorBlock, a clip, a speed limit, a client — rides
 with the job the page posts, in the server's vocabulary, and survives a
-reload; a first visit on a site whose owner set
-`SIPHON_RELAY_URL` takes the relay with nothing to do, is told whose it is,
+reload — greyed too, saying why, with a server that has no ffmpeg; the clip
+fields bring up a keyboard with a colon on it, and a client saved before
+yt-dlp retired it reads as no preference; a first visit on a site whose
+owner set `SIPHON_RELAY_URL` takes the relay with nothing to do, is told whose it is,
 and the header says "relay for YouTube"; a cobalt instance in `config.json`
 with no relay beside it is not adopted — the first visit stays on this device
 and never contacts it; the guide
@@ -151,7 +175,17 @@ one pasted with nothing focused, land in the field with the words around
 them stripped; a visitor
 who cleared the helper is not handed it again; a deploy landing under a
 returning visitor replaces the old worker and its cache; with the network cut
-the shell still opens; and nothing scrolls sideways at phone width. Nothing is
+the shell still opens; and nothing scrolls sideways at phone width, a row
+titled with a long link included, its Try again and Save on screen. Rows come
+back from a reload as they were: one saved before its job started offers Try
+again, a job the server missed a poll for is followed again, a finished one
+keeps its Save link, only the running job is counted as running, and Clear
+finished leaves it running on the server. The guide names a relay the visitor
+cleared and takes it back in one tap, links the relay deploy and the bridge
+script itself, says what Chrome needs before a userscript runs, and hands out
+a `docker run` with its container named. A title pasted with its link becomes
+just the link. A shared link is not kept in Cache Storage, and with the
+network cut it still opens the shell with the link in the field. Nothing is
 contacted off the machine in any of it.
 
 ## The split
@@ -208,7 +242,10 @@ qualify), and the loopback tests fail if any of it comes back.
 YouTube; with the shipped userscript injected and `GM_xmlhttpRequest` played by
 a Node fetch — which has no same-origin policy, like the real thing — a direct
 file arrives byte-identical, an HLS ladder is fetched and remuxed, and a page is
-scraped and converted to MP3.
+scraped and converted to MP3. A slow file comes through in windows, the bar
+moving while it arrives rather than jumping at the end; a cancel stops the
+host sending; and a playlist behind a redirect is read relative to where it
+landed, which the userscript reports.
 
 ## YouTube, and what is still unproven
 

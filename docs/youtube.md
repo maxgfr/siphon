@@ -53,7 +53,7 @@ browser tab making the request:
 
 | route | lifts CORS | what it costs |
 |---|---|---|
-| **[the bridge](../bridge/)** — a userscript on siphon's page | yes — the userscript manager lends its host permissions | installing one script in Tampermonkey or Violentmonkey |
+| **[the bridge](https://github.com/maxgfr/siphon/raw/main/bridge/siphon-bridge.user.js)** — a userscript on siphon's page | yes — the userscript manager lends its host permissions | installing one script in Tampermonkey or Violentmonkey |
 | [Termux](https://termux.dev) on Android | n/a — real yt-dlp, on the phone | a terminal app, and a build or two |
 | a WebView shell (Capacitor, Cordova) | yes — the native layer fetches | an APK to install and keep signed |
 | a browser extension | yes — host permissions bypass it | desktop, or Firefox for Android only |

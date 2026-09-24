@@ -146,16 +146,31 @@ export class Fetcher {
         hint: 'Check the address in settings, and that it is running.',
       });
     }
-    if (response.status === 403) {
-      throw new BackendError(`${what[0].toUpperCase()}${what.slice(1)} refused to fetch that address.`, {
-        hint:
-          this.escape.name === 'tunnel'
-            ? 'The server only carries hosts it resolved itself.'
-            : 'Relays carry an allow-list of hosts. Add this one to ALLOWED_HOSTS, or use your own server.',
-        retryable: false,
+    // A 403 may be the relay refusing, or the host refusing and the relay
+    // passing it on — googlevideo turning away a link bound to another
+    // address looks exactly like a host off the allow-list — and a 502 the
+    // host's, or the relay failing to reach it. Ours mark the answers they
+    // make themselves. Anything unmarked is the host's, and the caller says
+    // so, as it does for a public CORS proxy, which marks nothing.
+    const reason = response.headers.get(RELAY_ERROR_HEADER);
+    if (reason === null) return response;
+    const subject = `${what[0].toUpperCase()}${what.slice(1)}`;
+    if (response.status >= 500) {
+      throw new BackendError(`${subject} could not reach ${hostOf(url)}.`, {
+        hint: `It said: ${reason}. Try again — a download resumes rather than starting over.`,
       });
     }
-    return response;
+    throw new BackendError(`${subject} refused to fetch that address.`, {
+      hint:
+        this.escape.name === 'tunnel'
+          ? 'The server only carries hosts it resolved itself.'
+          : /origin not allowed/i.test(reason)
+            ? `It does not take requests from this page. Add ${pageOrigin()} to its ALLOWED_ORIGINS.`
+            : /host not allowed/i.test(reason)
+              ? 'Relays carry an allow-list of hosts. Add this one to ALLOWED_HOSTS, or use your own server.'
+              : `It said: ${reason}.`,
+      retryable: false,
+    });
   }
 
   async text(url, options = {}) {
@@ -346,6 +361,16 @@ export class Fetcher {
  * redirects by hand, so it knows the last hop.
  */
 export const FINAL_URL_HEADER = 'X-Siphon-Final-URL';
+
+/**
+ * On an answer our relay or a siphon server's tunnel made itself — a refusal,
+ * or a host it could not reach — rather than one it carried from the host.
+ * It holds the reason, and is never passed through from upstream.
+ */
+export const RELAY_ERROR_HEADER = 'X-Relay-Error';
+
+/** This page's origin, as an ALLOWED_ORIGINS entry would name it. */
+export const pageOrigin = () => (typeof location !== 'undefined' && location.origin !== 'null' ? location.origin : "this page's address");
 
 function reportedUrl(response) {
   try {

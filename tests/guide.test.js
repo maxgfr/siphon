@@ -48,4 +48,8 @@ test('Chrome\'s Allow User Scripts switch is named wherever the bridge is offere
 test('the docker command in the guide names its container, so the update advice can find it', () => {
   const command = /<code id="dockerCmd">([^<]*)<\/code>/.exec(INDEX)[1];
   assert.match(command, /^docker run -d --name siphon .*ghcr\.io\/maxgfr\/siphon$/);
+  // Named, a container left stopped by a reboot holds its name, and the same
+  // command pasted again is refused. Restarted with Docker, as compose's is,
+  // it is simply there again.
+  assert.match(command, / --restart unless-stopped /);
 });

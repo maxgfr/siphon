@@ -462,6 +462,31 @@ test('a subtitle that is not WebVTT is not handed to the muxer as one', async ()
   }
 });
 
+test('an SRT or ASS track a server resolved is embedded, and an error page under that name is not', async () => {
+  // A server's resolver hands back srt or ass when a site offers no WebVTT,
+  // and ffmpeg reads both into the same mov_text track. Only the check for
+  // WebVTT's own name would throw them away.
+  const answers = {
+    'https://s.example/srt': '1\r\n00:00:00,000 --> 00:00:01,500\r\nHello\r\n',
+    'https://s.example/ass': '﻿[Script Info]\nScriptType: v4.00+\n\n[Events]\nDialogue: 0,0:00:00.00,0:00:01.50,Default,,0,0,0,,Hello\n',
+    'https://s.example/html': '<!doctype html><title>404</title><p>Not found</p>',
+    'https://s.example/vtt': 'WEBVTT\n\n00:00:00.000 --> 00:00:01.500\nHello\n',
+  };
+  const real = globalThis.fetch;
+  globalThis.fetch = async (url) => new Response(answers[String(url)]);
+  try {
+    const net = new Fetcher();
+    assert.ok(await subtitleData(net, { url: 'https://s.example/srt', ext: 'srt' }), 'SRT is kept');
+    assert.ok(await subtitleData(net, { url: 'https://s.example/ass', ext: 'ass' }), 'ASS is kept');
+    assert.equal(await subtitleData(net, { url: 'https://s.example/html', ext: 'srt' }), null);
+    assert.equal(await subtitleData(net, { url: 'https://s.example/html', ext: 'ass' }), null);
+    assert.equal(await subtitleData(net, { url: 'https://s.example/srt', ext: 'vtt' }), null, 'SRT under a .vtt name is not WebVTT');
+    assert.equal(await subtitleData(net, { url: 'https://s.example/vtt', ext: 'ttml' }), null, 'nothing ffmpeg.wasm cannot read');
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
 /* ----------------------------------------------------------------- invidious */
 
 /** What a real instance answers to /api/v1/videos/{id}?local=true, trimmed. */
@@ -1079,6 +1104,21 @@ test('with no audio-only rendition, the sound is taken from the lightest rung', 
   assert.equal(planDownload(info, 'audio_mp3').audio.url, 'https://cdn.example/show/360/index.m3u8');
 });
 
+test('M4A still copies the AAC out of a progressive file when an HLS ladder is offered beside it', () => {
+  // A server's resolver keeps both an http file and an m3u8 ladder. The
+  // lightest rung is only a way to hold less in memory for a re-encode; it
+  // turned a lossless container change into a lossy one from the smallest rung.
+  const hls = (id, height, bitrate) => ({
+    id, kind: 'muxed', protocol: 'hls', container: 'mp4', height, bitrate, codecs: 'avc1.640028,mp4a.40.2',
+  });
+  const info = from([progressive('prog', 720, { bitrate: 3000000 }), hls('hls-0', 720, 3000000), hls('hls-1', 360, 800000)]);
+  const plan = planDownload(info, 'audio_m4a');
+  assert.equal(plan.op, 'audio-copy');
+  assert.equal(plan.audio.id, 'prog');
+  // MP3 re-encodes whatever it is given, so it still takes the lightest rung.
+  assert.equal(planDownload(info, 'audio_mp3').audio.id, 'hls-1');
+});
+
 test('a video preset below every rung takes the lowest one, never the sound-only rendition', async () => {
   // The audio-only rung has no height, so it "fitted" any ceiling: 480p on a
   // ladder starting at 540p saved sound alone as an .mp4, and on one starting
@@ -1099,7 +1139,7 @@ test('a file on a host that refuses the page goes to a resolver that can take it
   // to be asked.
   const real = globalThis.fetch;
   globalThis.fetch = async (url) => {
-    if (String(url).startsWith('https://ytdl.example/api/tunnel')) return new Response('no', { status: 403 });
+    if (String(url).startsWith('https://ytdl.example/api/tunnel')) return new Response('no', { status: 403, headers: { 'X-Relay-Error': 'not a host this server resolved' } });
     throw new TypeError('Failed to fetch');
   };
   try {

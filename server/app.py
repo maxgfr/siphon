@@ -16,12 +16,18 @@ request that started it.
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
+import http.server
 import ipaddress
 import logging
 import os
 import re
+import secrets
+import selectors
 import shutil
 import socket
+import socketserver
 import tempfile
 import threading
 import zipfile
@@ -32,10 +38,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator, Literal
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request as UrlRequest, build_opener
 
 import yt_dlp
+from yt_dlp.cookies import YoutubeDLCookieJar
+from yt_dlp.downloader import external as external_downloaders
 from yt_dlp.downloader.external import FFmpegFD
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -306,17 +314,23 @@ YT_CLIENTS = frozenset(name for name in YT_CLIENT_NAMES if name in _INSTALLED_CL
 SPONSOR_CATEGORIES = ["sponsor", "selfpromo", "interaction"]
 
 _TIMESTAMP = re.compile(r"^(?:(\d{1,3}):)?(?:(\d{1,2}):)?(\d{1,2}(?:\.\d{1,3})?)$")
+_SECONDS = re.compile(r"^\d+(?:\.\d{1,3})?$")
+_TIMESTAMP_SHAPE = "Clip times look like 1:23, 01:02:03, or seconds as 150."
 _RATE = re.compile(r"^(\d+(?:\.\d+)?)\s*([kmg]?)(?:i?b)?(?:/s)?$", re.I)
 
 
 def parse_timestamp(text: str) -> float | None:
-    """'1:23' → 83.0; '01:02:03.5' → 3723.5; '' → None; anything else raises."""
+    """'1:23' → 83.0; '01:02:03.5' → 3723.5; '150' → 150.0; '' → None; anything else raises."""
     value = (text or "").strip()
     if not value:
         return None
+    # Seconds alone are any length: someone who counts in seconds types 150,
+    # not 2:30, and only two digits used to be taken.
+    if _SECONDS.match(value):
+        return float(value)
     match = _TIMESTAMP.match(value)
     if not match:
-        raise ValueError("Clip times look like 1:23 or 01:02:03.")
+        raise ValueError(_TIMESTAMP_SHAPE)
     hours, minutes, seconds = match.groups()
     # Two prefixes mean h:m:s; one means m:s — the regex puts a lone prefix in
     # the first group, so move it over.
@@ -324,9 +338,9 @@ def parse_timestamp(text: str) -> float | None:
         hours, minutes = None, hours
     # Past the first colon the parts are clock digits: 1:99 is not a time.
     if minutes is not None and float(seconds) >= 60:
-        raise ValueError("Clip times look like 1:23 or 01:02:03.")
+        raise ValueError(_TIMESTAMP_SHAPE)
     if hours is not None and int(minutes) >= 60:
-        raise ValueError("Clip times look like 1:23 or 01:02:03.")
+        raise ValueError(_TIMESTAMP_SHAPE)
     return float(seconds) + 60 * int(minutes or 0) + 3600 * int(hours or 0)
 
 
@@ -399,6 +413,12 @@ _EAI_NONAME = socket.EAI_NONAME
 
 _DEFAULT_PORTS = {"http": 80, "https": 443, "socks4": 1080, "socks4a": 1080, "socks5": 1080, "socks5h": 1080}
 
+# Where an operator names a proxy of their own. yt-dlp sends its requests
+# through it, and past the link and its formats it is that proxy which has
+# to refuse private addresses.
+PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+BEHIND_A_PROXY = any(os.environ.get(name, "").strip() for name in PROXY_VARIABLES)
+
 
 def _exempt_hosts() -> frozenset[tuple[str, int]]:
     """
@@ -411,8 +431,7 @@ def _exempt_hosts() -> frozenset[tuple[str, int]]:
     else listening on 127.0.0.1 was followed.
     """
     exempt = set()
-    names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
-    for value in (POT_PROVIDER_URL, *(os.environ.get(name, "") for name in names)):
+    for value in (POT_PROVIDER_URL, *(os.environ.get(name, "") for name in PROXY_VARIABLES)):
         value = value.strip()
         if not value:
             continue
@@ -709,41 +728,378 @@ class CheckMediaUrls(yt_dlp.postprocessor.PostProcessor):
         return [], info
 
 
-# ffmpeg is the one downloader yt-dlp runs as a separate program: a playlist's
-# segments and keys, and every redirect, are fetched over ffmpeg's own
-# connections, which the guard above never sees — so a public playlist could
-# name a private address and have its answer delivered in the file. yt-dlp
-# hands ffmpeg a live stream, and any HLS its own downloader cannot read; with
-# the guard on, those are refused instead, and ffmpeg only ever works on files
-# already on disk.
+# ------------------------------------------------------ ffmpeg's connections
+
+# ffmpeg is the one downloader yt-dlp runs as a separate program, and its
+# sockets are its own: the guard above never sees where they go. yt-dlp
+# hands it a clip's span, a live stream, and any HLS its own downloader
+# cannot read — and a playlist's segments and keys, and every redirect,
+# went wherever the playlist or the redirect said, their answers delivered
+# in the file. So ffmpeg is pointed at a proxy inside this process, which
+# opens each connection it is asked for with socket.create_connection: the
+# name is resolved through the guard, once, and the connection goes to the
+# address that was checked, so a name cannot answer differently a second
+# time. A redirect is a new request to the proxy, and so a new check. What
+# the guard refuses, the proxy answers 403.
+
+# How long a connection through the proxy may take to open, and to go quiet.
+PROXY_CONNECT_SECONDS = 20
+PROXY_IDLE_SECONDS = 60
+# Read one chunk, send it on, read the next: nothing piles up in between.
+PROXY_CHUNK = 64 * 1024
+
+# What ffmpeg may open for a download: http and https, the pieces they are
+# made of (the proxy's CONNECT among them), and HLS's decryption and inline
+# keys. ffmpeg's http already gives what it opens a list of its own, which
+# leaves out file: — a file from this machine, another job's download among
+# them — but lets in rtp and udp, which would open sockets the proxy never
+# sees. This one drops those too, and holds whatever protocol the input
+# starts on, as ffmpeg's own does only for http.
+FFMPEG_PROTOCOLS = "http,https,tls,tcp,httpproxy,crypto,data"
+
+# Headers that describe one hop, not the request: not carried upstream.
+_HOP_BY_HOP = frozenset({
+    "connection", "keep-alive", "proxy-connection", "proxy-authorization", "proxy-authenticate",
+    "te", "trailer", "transfer-encoding", "upgrade", "content-length",
+})
+
+
+class ProxyRun:
+    """
+    One ffmpeg run's pass to the proxy. The proxy carries nothing for a
+    request without a live pass, so nothing else on this machine that finds
+    its port has a way out through it. A pass also says afterwards whether
+    anything was refused — the reason worth giving, where ffmpeg only says
+    it failed — and revoking it cuts the run's connections and refuses the
+    next, which is how a cancelled download stops ffmpeg.
+    """
+
+    def __init__(self, port: int) -> None:
+        self.token = secrets.token_hex(16)
+        self.url = f"http://siphon:{self.token}@127.0.0.1:{port}"
+        self.refused = False
+        self.revoked = False
+        self._open: set[socket.socket] = set()
+        self._lock = threading.Lock()
+
+    def adopt(self, connection: socket.socket) -> bool:
+        with self._lock:
+            if not self.revoked:
+                self._open.add(connection)
+            return not self.revoked
+
+    def release(self, connection: socket.socket) -> None:
+        with self._lock:
+            self._open.discard(connection)
+
+    def revoke(self) -> None:
+        with self._lock:
+            self.revoked = True
+            cut, self._open = self._open, set()
+        for connection in cut:
+            with contextlib.suppress(OSError):
+                connection.shutdown(socket.SHUT_RDWR)
+
+
+_PROXY_RUNS: dict[str, ProxyRun] = {}
+_PROXY_RUNS_LOCK = threading.Lock()
+
+
+def _relay(source: socket.socket, sink: socket.socket) -> None:
+    """One way, until the source is done or goes quiet."""
+    with contextlib.suppress(OSError):
+        while chunk := source.recv(PROXY_CHUNK):
+            sink.sendall(chunk)
+
+
+def _pipe(one: socket.socket, other: socket.socket) -> None:
+    """Both ways, until either side is done or both go quiet."""
+    with selectors.DefaultSelector() as selector, contextlib.suppress(OSError):
+        selector.register(one, selectors.EVENT_READ, other)
+        selector.register(other, selectors.EVENT_READ, one)
+        while ready := selector.select(timeout=PROXY_IDLE_SECONDS):
+            for key, _events in ready:
+                chunk = key.fileobj.recv(PROXY_CHUNK)
+                if not chunk:
+                    return
+                key.data.sendall(chunk)
+
+
+class GuardedProxy(http.server.BaseHTTPRequestHandler):
+    """
+    A forward proxy for ffmpeg, one request per connection: CONNECT for
+    https, which ffmpeg tunnels through an http proxy, and GET or HEAD with
+    an absolute http:// URL for the rest.
+    """
+
+    # Unbuffered: after CONNECT, what the client sends belongs to the
+    # tunnel, and must not wait in a buffer the pipe never reads.
+    rbufsize = 0
+    timeout = PROXY_IDLE_SECONDS
+
+    def log_message(self, *_args: Any) -> None:
+        return
+
+    def _answer(self, status: int, detail: str = "", *headers: tuple[str, str]) -> None:
+        body = detail.encode()
+        self.send_response(status)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def _run(self) -> ProxyRun | None:
+        scheme, _, credentials = self.headers.get("Proxy-Authorization", "").partition(" ")
+        token = ""
+        if scheme.lower() == "basic":
+            with contextlib.suppress(ValueError):
+                token = base64.b64decode(credentials, validate=True).decode().partition(":")[2]
+        with _PROXY_RUNS_LOCK:
+            run = _PROXY_RUNS.get(token) if token else None
+        if run is None:
+            # ffmpeg sends its pass only once it is asked for one.
+            self._answer(407, "This proxy is for this server's own ffmpeg.", ("Proxy-Authenticate", 'Basic realm="siphon"'))
+        elif run.revoked:
+            self._answer(403, "Cancelled.")
+            run = None
+        return run
+
+    def _open(self, run: ProxyRun, host: str, port: int) -> socket.socket | None:
+        try:
+            upstream = socket.create_connection((host, port), timeout=PROXY_CONNECT_SECONDS)
+        except PrivateAddress:
+            run.refused = True
+            self._answer(403, PRIVATE_ADDRESS_MESSAGE)
+            return None
+        except OSError as exc:
+            self._answer(502, f"Could not reach {host}: {exc}")
+            return None
+        upstream.settimeout(PROXY_IDLE_SECONDS)
+        if not run.adopt(upstream):
+            upstream.close()
+            self._answer(403, "Cancelled.")
+            return None
+        return upstream
+
+    def do_CONNECT(self) -> None:  # noqa: N802 — http.server's naming
+        run = self._run()
+        if run is None:
+            return
+        try:
+            target = urlsplit(f"//{self.path}")
+            host, port = target.hostname, target.port
+        except ValueError:
+            host = port = None
+        if not host or not port:
+            return self._answer(400, "CONNECT names a host and a port.")
+        upstream = self._open(run, host, port)
+        if upstream is None:
+            return
+        try:
+            self.connection.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            _pipe(self.connection, upstream)
+        finally:
+            run.release(upstream)
+            upstream.close()
+        self.close_connection = True
+
+    def do_GET(self) -> None:  # noqa: N802 — http.server's naming
+        run = self._run()
+        if run is None:
+            return
+        try:
+            target = urlsplit(self.path)
+            host, port = target.hostname, target.port or 80
+        except ValueError:
+            host = None
+        if not host or target.scheme != "http":
+            return self._answer(400, "Only http:// is fetched as a request; https goes through CONNECT.")
+        upstream = self._open(run, host, port)
+        if upstream is None:
+            return
+        # The request as the host expects it: its own path, this hop's
+        # headers left out, and closed after one answer — each request is
+        # a connection of its own, so each one is checked.
+        named = {token.strip().lower() for token in self.headers.get("Connection", "").split(",")}
+        lines = [f"{self.command} {urlunsplit(('', '', target.path or '/', target.query, ''))} HTTP/1.1"]
+        lines += [f"{name}: {value}" for name, value in self.headers.items() if name.lower() not in _HOP_BY_HOP | named]
+        if "Host" not in self.headers:
+            lines.append(f"Host: {target.netloc.rpartition('@')[2]}")
+        lines += ["Via: 1.1 siphon", "Connection: close"]
+        try:
+            upstream.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+            _relay(upstream, self.connection)
+        except OSError:
+            pass
+        finally:
+            run.release(upstream)
+            upstream.close()
+        self.close_connection = True
+
+    do_HEAD = do_GET
+
+
+class _ProxyServer(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    # Every running job's ffmpeg may be connecting at once, and each
+    # connection knocks twice: without its pass, and again with it.
+    request_queue_size = 64
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # Mostly ffmpeg hanging up mid-answer, which it does whenever it
+        # seeks. Not worth a traceback on the server's console.
+        logging.getLogger(__name__).debug("ffmpeg proxy: %s", client_address, exc_info=True)
+
+
+_PROXY: _ProxyServer | None = None
+_PROXY_LOCK = threading.Lock()
+
+
+def _proxy_port() -> int:
+    """The proxy's port on 127.0.0.1, starting it the first time it is wanted."""
+    global _PROXY
+    with _PROXY_LOCK:
+        if _PROXY is None:
+            _PROXY = _ProxyServer(("127.0.0.1", 0), GuardedProxy)
+            threading.Thread(target=_PROXY.serve_forever, name="siphon-ffmpeg-proxy", daemon=True).start()
+        return _PROXY.server_address[1]
+
+
+@contextlib.contextmanager
+def proxy_run() -> Iterator[ProxyRun]:
+    """A pass for one ffmpeg run, good until the run is over."""
+    run = ProxyRun(_proxy_port())
+    with _PROXY_RUNS_LOCK:
+        _PROXY_RUNS[run.token] = run
+    try:
+        yield run
+    finally:
+        with _PROXY_RUNS_LOCK:
+            _PROXY_RUNS.pop(run.token, None)
+        run.revoke()
+
+
+class _ProxiedPopen(yt_dlp.utils.Popen):
+    """
+    How yt-dlp's external downloaders start their program, minus no_proxy
+    when that program is ffmpeg on a pass to the proxy. ffmpeg connects
+    straight to every host no_proxy names — loopback, in many a container's
+    environment, and everything, in some — and a playlist can name any host.
+    """
+
+    def __init__(self, args: Any, *remaining: Any, env: dict[str, str] | None = None, **kwargs: Any) -> None:
+        with _PROXY_RUNS_LOCK:
+            proxied = bool(env) and urlsplit(env.get("http_proxy", "")).password in _PROXY_RUNS
+        if proxied:
+            env = {name: value for name, value in env.items() if name.lower() != "no_proxy"}
+        super().__init__(args, *remaining, env=env, **kwargs)
+
+
+external_downloaders.Popen = _ProxiedPopen
+
+# What cannot go through the proxy at all, with the guard on.
 FFMPEG_FETCH_REFUSED = (
-    "This stream is live, or uses a feature only ffmpeg can fetch, and ffmpeg's connections "
-    "go around this server's check for private addresses, so it is refused."
+    "This stream uses a protocol other than http(s), which ffmpeg would fetch over connections "
+    "of its own, around this server's check for private addresses, so it is refused."
+)
+FFMPEG_BEHIND_A_PROXY = (
+    "A clip, a live stream, or HLS only ffmpeg can read is fetched by ffmpeg, and behind the proxy "
+    "this server is configured with, its connections would go around either that proxy or this "
+    "server's check for private addresses, so it is refused."
 )
 _REAL_FFMPEG_DOWNLOAD = FFmpegFD.real_download
 
 
+def _stop_when_cancelled(downloader: FFmpegFD, run: ProxyRun, info_dict: dict[str, Any], done: threading.Event) -> None:
+    """
+    yt-dlp learns that a download was cancelled from its progress hooks,
+    which its own downloaders call as the bytes arrive and ffmpeg's calls
+    only once ffmpeg is done — hours, for a live stream. So they are asked
+    here, twice a second, with a report of no progress in particular; the
+    job's hook raises once the job is cancelled, and the run's pass is
+    revoked, which leaves ffmpeg nothing to read.
+    """
+    while not done.wait(0.5):
+        try:
+            downloader._hook_progress({"status": "running"}, info_dict)
+        except yt_dlp.utils.DownloadCancelled:
+            run.revoke()
+            return
+        except Exception:  # noqa: BLE001 — a hook's own fault is its own; stop asking it
+            return
+
+
 def _guarded_ffmpeg_download(self: FFmpegFD, filename: str, info_dict: dict[str, Any]) -> bool:
-    if not ALLOW_PRIVATE_HOSTS:
+    # A copy of its own: the params are the YoutubeDL's, shared with every
+    # other download it runs. The protocols hold with or without the guard:
+    # ALLOW_PRIVATE_HOSTS lifts the address checks, not the ban on file:.
+    self.params = {**self.params, "external_downloader_args": {"ffmpeg_i": ["-protocol_whitelist", FFMPEG_PROTOCOLS]}}
+    if ALLOW_PRIVATE_HOSTS:
+        return _REAL_FFMPEG_DOWNLOAD(self, filename, info_dict)
+    urls = [str(fmt.get("url") or "") for fmt in info_dict.get("requested_formats") or [info_dict]]
+    if not all(url.startswith(("http://", "https://")) for url in urls):
         self.report_error(FFMPEG_FETCH_REFUSED)
         return False
-    return _REAL_FFMPEG_DOWNLOAD(self, filename, info_dict)
+    if BEHIND_A_PROXY:
+        # As it was before this proxy: sent through it, ffmpeg would go
+        # around the operator's proxy; sent through theirs, around the
+        # guard, since ffmpeg's destinations are then resolved there.
+        self.report_error(FFMPEG_BEHIND_A_PROXY)
+        return False
+    with proxy_run() as run:
+        # yt-dlp gives ffmpeg the proxy as http_proxy, which ffmpeg uses for
+        # http, and for https through its tls protocol, with CONNECT.
+        self.params = {**self.params, "proxy": run.url}
+        done = threading.Event()
+        watcher = threading.Thread(target=_stop_when_cancelled, args=(self, run, info_dict, done), daemon=True)
+        watcher.start()
+        try:
+            fetched = _REAL_FFMPEG_DOWNLOAD(self, filename, info_dict)
+        except yt_dlp.utils.DownloadError:
+            if not (run.refused or run.revoked):
+                raise
+            fetched = False
+        finally:
+            done.set()
+            watcher.join()
+        if run.revoked:
+            raise yt_dlp.utils.DownloadCancelled("Cancelled.")
+        if not fetched and run.refused:
+            self.report_error(PRIVATE_ADDRESS_MESSAGE)
+        return fetched
 
 
 FFmpegFD.real_download = _guarded_ffmpeg_download
 
+# The rest of what runs ffmpeg — the merge, the audio extraction, the tags,
+# the cover, the subtitles — are yt-dlp's postprocessors, and they only ever
+# read files already in the job's directory: every path they are given is
+# built from outtmpl, which is a path under DOWNLOAD_ROOT. That matters
+# because yt-dlp hands ffmpeg an http(s) name as it is, and so a URL given
+# to one would be fetched, around both the guard and this proxy. A test
+# watches every name they pass.
 
-class CutClip(yt_dlp.postprocessor.FFmpegPostProcessor):
+
+def _on_the_clips_clock(first: float, last: float, start: float, end: float | None) -> tuple[float, float] | None:
+    """A span of the video, as the same span of the clip, or None when it is outside it."""
+    if last <= start or (end is not None and first >= end):
+        return None
+    return max(first, start) - start, (last if end is None else min(last, end)) - start
+
+
+class FitToClip(yt_dlp.postprocessor.PostProcessor):
     """
-    Cut a clip out of the downloaded file, on this machine.
-
-    yt-dlp's own way, download_ranges, gives the remote URL to ffmpeg to
-    fetch, which is exactly what the guard cannot allow. So the whole file is
-    fetched the ordinary way and the span is cut here — last, so the chapters
-    and any embedded subtitles are cut with it. The streams are copied, not
-    re-encoded: the clip starts on the keyframe at or before the time asked
-    for, so its first second is not a smear of grey, and cutting costs no
-    more than a copy on a small server's CPU.
+    Put what comes whole with a clip on the clip's clock. download_ranges
+    fetches only the span, which starts at 0:00, but yt-dlp fetches the
+    subtitles whole, and the chapters are the video's: a clip from 0:02 had
+    the cues of 0:00 as separate files, and a .srt the length of the video.
+    Before the download, and after the subtitles are SubRip (see
+    build_options), so what is embedded and what is kept alike are the
+    clip's.
     """
 
     def __init__(self, start: float | None, end: float | None) -> None:
@@ -752,22 +1108,18 @@ class CutClip(yt_dlp.postprocessor.FFmpegPostProcessor):
         self._end = end
 
     def run(self, info: dict[str, Any]):
-        path = info["filepath"]
-        cut = yt_dlp.utils.prepend_extension(path, "clip")
-        before = ["-ss", str(self._start)] if self._start else []
-        after = list(self.stream_copy_opts(ext=yt_dlp.utils.determine_ext(path)))
-        if self._end is not None:
-            after += ["-t", str(self._end - self._start)]
-        self.real_run_ffmpeg([(path, before)], [(cut, after)])
-        os.replace(cut, path)
-        # Subtitles asked for as files are still beside the video, whole, and
-        # would start at the video's 0:00 rather than the clip's. They are
-        # SubRip by now (see build_options); embedded ones went into the file
-        # before this step, and were cut with it.
         for track in (info.get("requested_subtitles") or {}).values():
             subtitle = track.get("filepath") or ""
             if subtitle.endswith(".srt") and os.path.exists(subtitle):
                 clip_srt(Path(subtitle), self._start, self._end)
+        if info.get("chapters"):
+            chapters = []
+            for chapter in info["chapters"]:
+                last = chapter.get("end_time")
+                span = _on_the_clips_clock(chapter.get("start_time") or 0.0, float("inf") if last is None else last, self._start, self._end)
+                if span:
+                    chapters.append({**chapter, "start_time": span[0], "end_time": None if span[1] == float("inf") else span[1]})
+            info["chapters"] = chapters
         return [], info
 
 
@@ -803,11 +1155,10 @@ def clip_srt(path: Path, start: float, end: float | None) -> None:
             continue
         first, _, last = lines[timing].partition("-->")
         cue_start, cue_end = _srt_seconds(first), _srt_seconds(last)
-        if cue_start is None or cue_end is None or cue_end <= start or (end is not None and cue_start >= end):
+        span = None if cue_start is None or cue_end is None else _on_the_clips_clock(cue_start, cue_end, start, end)
+        if span is None:
             continue
-        cue_start = max(cue_start, start) - start
-        cue_end = (cue_end if end is None else min(cue_end, end)) - start
-        kept.append("\n".join([str(len(kept) + 1), f"{_srt_time(cue_start)} --> {_srt_time(cue_end)}", *lines[timing + 1:]]))
+        kept.append("\n".join([str(len(kept) + 1), f"{_srt_time(span[0])} --> {_srt_time(span[1])}", *lines[timing + 1:]]))
     if kept:
         path.write_text("\n\n".join(kept) + "\n", encoding="utf-8")
     else:
@@ -875,7 +1226,7 @@ def job_postprocessors(job: Job) -> list[tuple[yt_dlp.postprocessor.PostProcesso
         # Before anything is fetched, after yt-dlp's own choice is made.
         steps.append((PickSubtitle([lang.strip() for lang in job.sub_langs.split(",") if lang.strip()]), "pre_process"))
     if job.clip_start is not None or job.clip_end is not None:
-        steps.append((CutClip(job.clip_start, job.clip_end), "post_process"))
+        steps.append((FitToClip(job.clip_start, job.clip_end), "before_dl"))
     return steps
 
 
@@ -894,6 +1245,7 @@ def outtmpl_for(job: Job) -> str:
 
 def build_options(job: Job, client: str | None) -> dict[str, Any]:
     preset = PRESETS[job.preset]
+    clipped = job.clip_start is not None or job.clip_end is not None
     options: dict[str, Any] = {
         # %(title).150B truncates on BYTES, not characters — a CJK title that
         # fits 150 characters can still blow past a 255-byte filesystem limit.
@@ -906,10 +1258,10 @@ def build_options(job: Job, client: str | None) -> dict[str, Any]:
         "restrictfilenames": False,
         "windowsfilenames": True,
         "concurrent_fragment_downloads": 4,
-        # yt-dlp's own HLS downloader fetches through this process, and so
-        # through the guard. An extractor that marks its stream for ffmpeg
-        # would otherwise be refused outright (see _guarded_ffmpeg_download);
-        # the native one hands ffmpeg only what it cannot read itself.
+        # yt-dlp's own HLS downloader fetches in this process, where the
+        # guard sees it, reports progress and keeps to a speed limit; ffmpeg,
+        # through the guarded proxy (see _guarded_ffmpeg_download), does
+        # neither, so it gets only what the native one cannot read.
         "hls_prefer_native": True,
         "retries": 5,
         "fragment_retries": 5,
@@ -927,9 +1279,11 @@ def build_options(job: Job, client: str | None) -> dict[str, Any]:
         # yt-dlp's own choice, which PickSubtitle then replaces before
         # anything is fetched: see job_postprocessors.
         options["subtitleslangs"] = [lang.strip() for lang in job.sub_langs.split(",") if lang.strip()]
-        if job.subs == "files":
+        if job.subs == "files" or clipped:
             # SubRip, as the settings promise: YouTube's own formats are VTT
-            # and its JSON variants, which fewer phone players open.
+            # and its JSON variants, which fewer phone players open. And for
+            # a clip, embedded or not, the one format FitToClip can move onto
+            # the clip's clock.
             options["postprocessors"] = [
                 *options.get("postprocessors", []),
                 {"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"},
@@ -956,7 +1310,16 @@ def build_options(job: Job, client: str | None) -> dict[str, Any]:
             {"key": "ModifyChapters", "remove_sponsor_segments": SPONSOR_CATEGORIES, "force_keyframes": False},
             *options.get("postprocessors", []),
         ]
-    # A clip is cut after the download, by CutClip: see job_postprocessors.
+    if clipped:
+        # Only the span asked for is fetched: yt-dlp hands it to ffmpeg,
+        # which reads what it needs through the guarded proxy, and re-encodes
+        # it so the clip starts and ends where it was asked to rather than on
+        # the keyframes around it. What comes whole with it is moved onto the
+        # clip's clock by FitToClip: see job_postprocessors.
+        options["download_ranges"] = yt_dlp.utils.download_range_func(
+            None, [(job.clip_start or 0.0, job.clip_end if job.clip_end is not None else float("inf"))]
+        )
+        options["force_keyframes_at_cuts"] = True
     if job.rate_limit:
         options["ratelimit"] = job.rate_limit
         # yt-dlp holds each fragment download to the limit on its own, so
@@ -1292,16 +1655,17 @@ def answers(address: str, port: int) -> bool:
         probe.close()
 
 
-def lan_urls(scheme: str, port: int, proxied: bool) -> list[str]:
+def lan_urls(scheme: str, port: int | None, proxied: bool) -> list[str]:
     """
     Where a phone on the same Wi-Fi can open this server, or nothing when
     there is no telling. In a container every address is the bridge's
     (172.17.0.x), which only the host can reach; a request that came through
     a proxy or over TLS came from somewhere a LAN address means nothing to.
+    With no port to go by, nothing is tried.
     """
     if LAN_URLS:
         return LAN_URLS
-    if proxied or scheme == "https" or in_container():
+    if proxied or scheme == "https" or in_container() or not port:
         return []
     return [f"http://{address}:{port}" for address in lan_addresses() if answers(address, port)]
 
@@ -1347,7 +1711,11 @@ def lan_addresses() -> list[str]:
 
 @app.get("/api/health")
 async def health(request: Request) -> dict[str, Any]:
-    port = request.url.port or (443 if request.url.scheme == "https" else 80)
+    # The port this server took the connection on, as uvicorn says it, and
+    # not the Host header's, which is the caller's to write: health asks for
+    # no key, and trying a port the caller named told anyone which ports this
+    # machine listens on at its own private addresses.
+    port = (request.scope.get("server") or (None, None))[1]
     proxied = any(name in request.headers for name in ("x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "forwarded"))
     # A lookup of this machine's own name, which can hang as long as any other.
     urls = await asyncio.to_thread(lan_urls, request.url.scheme, port, proxied)
@@ -1781,14 +2149,27 @@ def resolve_url(url: str) -> dict[str, Any]:
                 if cookies:
                     options["cookiefile"] = cookies
                 with yt_dlp.YoutubeDL(options) as ydl:
+                    # The jar holds the uploaded cookies.txt too, and those
+                    # must never reach the tunnel: a grant is for a whole
+                    # host, and anyone who can resolve a page with a video on
+                    # a host the owner is signed in to could then read any
+                    # page there as the owner. So what the jar held before
+                    # extraction is noted by name, and a cookie the site
+                    # rotated under that name is kept back with it.
+                    uploaded = {(cookie.domain, cookie.path, cookie.name) for cookie in ydl.cookiejar}
                     info = ydl.extract_info(url, download=False)
                     # yt-dlp keeps cookies out of a format's http_headers, so
                     # a redirect cannot carry them to another host, and sends
                     # them from its jar instead. A host that set one during
                     # extraction answers the tunnel 403 without it, so each
-                    # format's is read now, while the jar is open.
+                    # format's is read now, while the jar is open, from the
+                    # cookies this extraction set and no others.
+                    fresh = YoutubeDLCookieJar()
+                    for cookie in ydl.cookiejar:
+                        if (cookie.domain, cookie.path, cookie.name) not in uploaded:
+                            fresh.set_cookie(cookie)
                     jar = {
-                        raw["url"]: ydl.cookiejar.get_cookie_header(raw["url"])
+                        raw["url"]: fresh.get_cookie_header(raw["url"])
                         for raw in (*(info.get("formats") or []), info)
                         if str(raw.get("url") or "").startswith(("http://", "https://"))
                     }
@@ -1977,6 +2358,11 @@ async def tunnel(url: str, request: Request, key: str | None = None, authorizati
         detail = f"{host} answered {status}."
         upstream.close()
         raise HTTPException(status_code=status if status in (403, 404, 410, 416, 429) else 502, detail=detail)
+    # Where the redirects ended, as the relay says it. The answer's own address
+    # is this server's, so a redirected playlist's relative links would be
+    # resolved against the address the page asked for, not the one the
+    # playlist lives at. The CORS headers expose it with the rest.
+    passed["X-Siphon-Final-URL"] = getattr(upstream, "url", None) or target
     return StreamingResponse(_iter_upstream(upstream), status_code=status, headers=passed)
 
 

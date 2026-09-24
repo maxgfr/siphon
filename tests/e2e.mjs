@@ -456,6 +456,13 @@ function serveCobalt(port) {
 const OWN_KEY = 'MY-AUTH-TOKEN';
 
 /**
+ * What it says in health: no address for a phone, as in a container, and the
+ * YouTube clients its yt-dlp has — which, as with a real one, is not every
+ * name a page has ever offered.
+ */
+const ownHealth = { lanUrls: [], ytClients: ['android_vr', 'mweb', 'tv', 'web', 'web_safari'] };
+
+/**
  * Your own server, started with AUTH_TOKEN, as far as the settings sheet can
  * tell: health answers everyone and says a key is wanted, and the gated
  * check takes only the right one. Nothing is downloaded through it here.
@@ -468,7 +475,7 @@ function serveSiphon(port) {
     const url = new URL(request.url, 'http://x');
     if (request.method === 'OPTIONS') return response.writeHead(204, cors).end();
     if (url.pathname === '/api/health') {
-      return json(response, 200, { service: 'siphon', ytDlpVersion: '2026.09.01', ffmpeg: true, requiresKey: true, capabilities: ['jobs', 'resolve', 'tunnel'], lanUrls: [] });
+      return json(response, 200, { service: 'siphon', ytDlpVersion: '2026.09.01', ffmpeg: true, requiresKey: true, capabilities: ['jobs', 'resolve', 'tunnel'], lanUrls: ownHealth.lanUrls, ytClients: ownHealth.ytClients });
     }
     if (request.headers.authorization !== `Bearer ${OWN_KEY}`) return json(response, 401, { detail: 'This server needs an access key.' });
     return json(response, 404, { detail: 'No such download.' });
@@ -1110,14 +1117,51 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   // Your own server first, saved with its key. The key field is a password
   // field, so a key left in it is invisible — and the instance typed in next
   // is someone else's.
+  // The key is typed before the address, as a password manager fills it:
+  // with nothing saved it belongs to the address typed next, not to this
+  // page's own origin, which the first letter of that address left behind.
   await page.click('#openSettings');
-  await page.fill('#endpoint', OWN);
+  await page.fill('#endpoint', '');
   await page.fill('#endpointKey', OWN_KEY);
+  await page.locator('#endpoint').pressSequentially(OWN);
+  const typedFirst = await page.inputValue('#endpointKey');
+  check('a key typed before the address is kept for the address typed after it', typedFirst === OWN_KEY, JSON.stringify(typedFirst));
   await page.click('#saveSettings');
   await page.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 15_000 });
   check('your own server is saved with its access key', /your server/.test((await page.textContent('#backendLabel')) || ''), await page.textContent('#backendLabel'));
   await page.click('#openSettings');
   const kept = await page.inputValue('#endpointKey');
+
+  // On your phone. This server is on this computer and could not name its
+  // address on the network — a container cannot see it — so the sheet says
+  // how to find it rather than saying nothing.
+  const phone = () => page.evaluate(() => ({ shown: !document.getElementById('phoneHint').hidden, text: document.getElementById('phoneHintBody').textContent || '' }));
+  const unnamed = await phone();
+  check('a server on this computer that cannot name its network address still says how to reach it from a phone',
+    unnamed.shown && /network address/.test(unnamed.text) && /port 8794/.test(unnamed.text) && /LAN_URL/.test(unnamed.text), unnamed.shown ? unnamed.text.slice(0, 90) : 'hidden');
+  check('and that plain http will not install or take links from the share sheet, and what will',
+    /install/.test(unnamed.text) && /share sheet/.test(unnamed.text) && /HTTPS helper/.test(unnamed.text) && /tailscale serve/.test(unnamed.text), unnamed.text.slice(-120));
+
+  // YouTube clients: the ones this server's yt-dlp has, and no others. A
+  // client yt-dlp dropped is skipped without a word, so offering it would
+  // be a choice that does nothing.
+  const clients = () => page.evaluate(() => [...document.getElementById('optClient').options].filter((option) => option.value && !option.hidden && !option.disabled).map((option) => option.value));
+  const offered = await clients();
+  check('the YouTube clients offered are the ones your server has', JSON.stringify(offered) === JSON.stringify(['tv', 'web_safari', 'android_vr', 'mweb', 'web']), offered.join(', '));
+  check('and tv_embedded, which yt-dlp retired, is not one of them anywhere', (await page.locator('#optClient option[value="tv_embedded"]').count()) === 0);
+
+  // A server that does name its address: shown as it is, with the same word on http.
+  ownHealth.lanUrls = ['http://192.168.1.42:8794'];
+  ownHealth.ytClients = ['android_vr', 'ios', 'mweb', 'tv', 'web', 'web_safari'];
+  await page.click('#testConnection');
+  await page.waitForFunction(() => !/checking|not checked/i.test(document.getElementById('statusText').textContent || ''), null, { timeout: 15_000 });
+  const named = await phone();
+  check('a server that names its address on the network is shown with it, and the same note on plain http',
+    named.shown && named.text.includes('http://192.168.1.42:8794') && !/LAN_URL/.test(named.text) && /share sheet/.test(named.text), named.text.slice(0, 90));
+  check('and a server whose yt-dlp has another client offers it', (await clients()).includes('ios'), (await clients()).join(', '));
+  ownHealth.lanUrls = [];
+  ownHealth.ytClients = ['android_vr', 'mweb', 'tv', 'web', 'web_safari'];
+
   await page.fill('#endpoint', COBALT);
   check("typing another address lets go of the last server's key", kept === OWN_KEY && (await page.inputValue('#endpointKey')) === '', `${kept ? 'key shown on reopening' : 'no key on reopening'}, then ${JSON.stringify(await page.inputValue('#endpointKey'))}`);
   await page.fill('#endpoint', `${OWN}/`);
@@ -1129,6 +1173,7 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   await page.waitForFunction(() => !/checking|not checked/i.test(document.getElementById('statusText').textContent || ''), null, { timeout: 15_000 });
   const verdict = (await page.textContent('#statusText')) || '';
   check('a cobalt instance is recognised from its address alone', /cobalt 11\.0 instance/.test(verdict), verdict.slice(0, 70));
+  check('and there is nothing to say about phones for it, nor clients to hide', (await phone()).shown === false && (await clients()).join() === 'tv,web_safari,android_vr,mweb,web,ios', (await clients()).join(', '));
   await page.click('#saveSettings');
   await page.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 15_000 });
   check('and the header names it', /cobalt 11\.0 for the rest/.test((await page.textContent('#backendLabel')) || ''), await page.textContent('#backendLabel'));

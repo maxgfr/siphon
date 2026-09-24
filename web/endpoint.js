@@ -18,12 +18,14 @@
  * The fetch is injectable so the classification can be tested with no network.
  */
 
+import { RELAY_ERROR_HEADER, pageOrigin } from './net.js';
+
 const trimSlash = (value) => String(value || '').trim().replace(/\/+$/, '');
 
 /** Public, tiny, unmistakable: a 200 whose body names a User-agent came from YouTube. */
 const ROBOTS = 'https://www.youtube.com/robots.txt';
 
-/** @typedef {{ kind: 'none'|'siphon'|'cobalt'|'piped'|'invidious'|'relay', label: string, ffmpeg?: boolean, lanUrls?: string[], hasCookies?: boolean, requiresKey?: boolean, keyAccepted?: boolean }} Endpoint */
+/** @typedef {{ kind: 'none'|'siphon'|'cobalt'|'piped'|'invidious'|'relay', label: string, ffmpeg?: boolean, lanUrls?: string[], ytClients?: string[]|null, hasCookies?: boolean, requiresKey?: boolean, keyAccepted?: boolean }} Endpoint */
 
 const NONE = Object.freeze({ kind: 'none', label: 'this device only' });
 
@@ -115,7 +117,7 @@ export async function detectEndpoint(address, key = '', fetchImpl = globalThis.f
       } catch {
         /* not JSON */
       }
-      return { status: response.status, ok: response.ok, text, json };
+      return { status: response.status, ok: response.ok, text, json, relayError: response.headers.get(RELAY_ERROR_HEADER) };
     } catch {
       return null;
     }
@@ -145,6 +147,9 @@ export async function detectEndpoint(address, key = '', fetchImpl = globalThis.f
       jsRuntime: body.jsRuntime !== false,
       capabilities: Array.isArray(body.capabilities) ? body.capabilities : ['jobs'],
       lanUrls: Array.isArray(body.lanUrls) ? body.lanUrls : [],
+      // The YouTube clients its yt-dlp has. An older server does not say,
+      // and then every one the page knows is offered, as before.
+      ytClients: Array.isArray(body.ytClients) ? body.ytClients.map(String) : null,
       hasCookies: body.hasCookies === true,
       requiresKey: body.requiresKey === true,
     };
@@ -177,9 +182,10 @@ export async function detectEndpoint(address, key = '', fetchImpl = globalThis.f
   if (relay?.status === 200 && /user-agent/i.test(relay.text)) {
     return { kind: 'relay', label: 'relay' };
   }
-  if (relay?.status === 403 && /origin not allowed/i.test(relay.text)) {
-    throw new Error('That relay does not allow this page. Add this origin to its ALLOWED_ORIGINS.');
-  }
+  // Ours marks the answers it makes itself, so the mark says it; a relay from
+  // before the mark says it only in its body.
+  const refusedOrigin = relay?.relayError != null ? /^origin not allowed$/i.test(relay.relayError) : relay?.status === 403 && /origin not allowed/i.test(relay.text);
+  if (refusedOrigin) throw new Error(`That relay does not allow this page. Add ${pageOrigin()} to its ALLOWED_ORIGINS.`);
 
   if (!health && !cobalt && !piped && !invidious && !relay) {
     const page = typeof location !== 'undefined' ? location : null;
@@ -199,6 +205,39 @@ export async function detectEndpoint(address, key = '', fetchImpl = globalThis.f
     );
   }
   throw new Error('That address answers, but not as a siphon server, a cobalt, Piped or Invidious instance, or a relay.');
+}
+
+/**
+ * How a phone on the same Wi-Fi reaches your server, for the settings sheet.
+ *
+ * The addresses the server named, when it could tell. When it could not — in
+ * a container, behind a proxy, bound to this computer only — a server here
+ * still has an answer: one on this network is opened at the address it
+ * already has, and one on this computer at the computer's network address,
+ * which the page cannot see, with the port it can. A server anywhere else is
+ * deployed, and reachable from the phone as it is; there is nothing to say.
+ *
+ * @param {Endpoint|null} helper
+ * @param {string} address  the helper's address; '' is this page's own origin
+ * @param {string} [page]  this page's address
+ * @returns {{ urls: string[] } | { port: string } | null}
+ */
+export function phoneRoute(helper, address, page = typeof location !== 'undefined' ? location.href : '') {
+  if (helper?.kind !== 'siphon') return null;
+  if (helper.lanUrls?.length) return { urls: helper.lanUrls };
+  let url;
+  try {
+    url = new URL(address || page, page || undefined);
+  } catch {
+    return null;
+  }
+  // Over https it is behind a proxy or a tunnel, and already has an address
+  // a phone can use; a LAN address would not match its certificate.
+  if (url.protocol !== 'http:') return null;
+  const host = bareHost(url.hostname);
+  if (loopbackHost(host)) return { port: url.port };
+  if (LOCAL.some((pattern) => pattern.test(host))) return { urls: [url.origin] };
+  return null;
 }
 
 /** The sentence under the link box: where a pasted link goes. */
@@ -250,7 +289,11 @@ export function describeEndpoint(endpoint, now = new Date()) {
       if (age !== null && age > STALE_AFTER_DAYS) {
         // Both ways of starting it: the guide's one docker run has no compose
         // file to pull with, and a pull alone leaves the old container running.
-        text += ` Its yt-dlp is ${age} days old, and YouTube changes often: the image is rebuilt every week, so when a download fails, take the new one — docker compose pull && docker compose up -d, or docker pull ghcr.io/maxgfr/siphon, then docker rm -f siphon and the same docker run.`;
+        // Compose needs the files it was started with, or an overlay drops
+        // out; and a server old enough to be warned about was likely started
+        // before the guide's command named its container, so it is found by
+        // the name docker ps shows rather than by siphon.
+        text += ` Its yt-dlp is ${age} days old, and YouTube changes often: the image is rebuilt every week, so when a download fails, take the new one — docker compose pull && docker compose up -d, with the same -f files you started with; or docker pull ghcr.io/maxgfr/siphon, then remove the running container (docker ps shows its name) and start it again with the same docker run.`;
       }
       return text;
     }

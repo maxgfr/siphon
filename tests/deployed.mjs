@@ -476,6 +476,20 @@ for (const [old, expected] of [
   }));
   check('and survive a reload', back.sponsor && back.clip === '0:10-1:00' && back.rate === '2M' && back.client === 'tv', JSON.stringify(back));
 
+  // tv_embedded was offered until yt-dlp retired it. Saved then, it is not
+  // one of the options now; the server takes it as no preference, and the
+  // sheet says the same rather than showing an empty choice.
+  await page.evaluate(() => {
+    const saved = JSON.parse(localStorage.getItem('siphon:settings'));
+    localStorage.setItem('siphon:settings', JSON.stringify({ ...saved, ytdlp: { ...saved.ytdlp, client: 'tv_embedded' } }));
+  });
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForTimeout(1200);
+  await page.click('#openSettings');
+  await page.waitForTimeout(300);
+  const retired = await page.evaluate(() => ({ value: document.getElementById('optClient').value, index: document.getElementById('optClient').selectedIndex }));
+  check('a client saved before yt-dlp retired it reads as no preference, not as a blank', retired.value === '' && retired.index === 0, JSON.stringify(retired));
+
   // With no helper the options wait, greyed but kept, and say for whom.
   await page.fill('#endpoint', '');
   await setApi(false);
@@ -629,12 +643,26 @@ for (const [old, expected] of [
   const offered = (await page.textContent('#tourYoutube')) || '';
   check('the guide names the relay the visitor cleared, rather than saying to clear the helper', offered.includes('127.0.0.1:8443') && !/clear the helper/i.test(offered) && (await page.locator('#tourYoutube button').count()) === 1,
     offered.replace(/\s+/g, ' ').slice(0, 100));
+  check('and says the site runs it, since it is the owner\'s own', /This site runs a relay/.test(offered), offered.replace(/\s+/g, ' ').slice(0, 60));
   await page.click('#tourYoutube button', { timeout: 3000 }).catch(() => {});
   await page.waitForFunction(() => /relay for YouTube/.test(document.getElementById('backendLabel').textContent || ''), null, { timeout: 10_000 }).catch(() => {});
   const retaken = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:settings') || '{}'));
   check('and one tap on it makes it the helper again', retaken.helper?.kind === 'relay' && retaken.endpoint === `${BASE}/relay` && /relay for YouTube/.test((await page.textContent('#backendLabel')) || ''),
     `${JSON.stringify({ helper: retaken.helper?.kind, endpoint: retaken.endpoint })} ${await page.textContent('#backendLabel')}`);
   check('and the guide says it is ready', /Ready/.test((await page.textContent('#tourYoutube')) || ''), ((await page.textContent('#tourYoutube')) || '').slice(0, 60));
+
+  // A relay the daily measurement took from the public CORS proxies is a
+  // stranger's, not the site's: offered again, the guide says so before the
+  // tap, not only after it.
+  overrides.set('/siphon/config.json', JSON.stringify({ relay: `${BASE}/relay`, relayKind: 'public', instance: '' }));
+  await page.evaluate(() => localStorage.setItem('siphon:settings', JSON.stringify({ endpoint: '', key: '', helper: { kind: 'none', label: 'this device only' }, preset: 'video_best', subs: 'off', autoInstance: false })));
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForTimeout(1500);
+  await page.click('#openTour');
+  await page.waitForTimeout(300);
+  const stranger = (await page.textContent('#tourYoutube')) || '';
+  check("a public proxy in config.json is offered as one, not as the site's own", stranger.includes('127.0.0.1:8443') && /public proxy/.test(stranger) && /sees the links/.test(stranger) && !/runs a relay/.test(stranger),
+    stranger.replace(/\s+/g, ' ').slice(0, 100));
   check('nothing was contacted off this machine', context.__offsite.length === 0, context.__offsite.slice(0, 3).join(', '));
   await context.close();
   overrides.delete('/siphon/config.json');

@@ -124,7 +124,7 @@
             In Chrome, turn on <em>Allow User Scripts</em> in the manager's extension details too, or no userscript runs.
             <a href="https://github.com/maxgfr/siphon/raw/main/bridge/siphon-bridge.user.js" target="_blank" rel="noopener">Install the bridge</a></p>
           <p><strong>Your own server</strong> — the most capable: playlists, subtitles, your cookies.
-            <code id="dockerCmd">docker run -d --name siphon -p 8000:8000 -v siphon:/tmp/siphon ghcr.io/maxgfr/siphon</code>
+            <code id="dockerCmd">docker run -d --name siphon --restart unless-stopped -p 8000:8000 -v siphon:/tmp/siphon ghcr.io/maxgfr/siphon</code>
             <button class="chip-btn" type="button" id="copyDocker">Copy</button></p>
           <p class="tour-owner">Running this site? Set the repository variable <code>SIPHON_RELAY_URL</code> to your relay once, and every visitor gets it by default.</p>
         </div>
@@ -234,7 +234,7 @@
 
         <label class="lbl" for="optRate">Speed limit <span style="font-weight:400;color:var(--muted)">— optional</span></label>
         <input type="text" id="optRate" inputmode="text" spellcheck="false" autocapitalize="off" placeholder="e.g. 2M" />
-        <p class="hint">Bytes per second, as <code>500K</code> or <code>2M</code>, so a download does not eat the connection.</p>
+        <p class="hint">Bytes per second, as <code>500K</code> or <code>2M</code>, so a download does not eat the connection. Not applied to a clip or a live stream, which ffmpeg fetches.</p>
 
         <label class="lbl" for="optClient">YouTube client</label>
         <select id="optClient">
@@ -245,7 +245,6 @@
           <option value="mweb">mweb</option>
           <option value="web">web</option>
           <option value="ios">ios</option>
-          <option value="tv_embedded">tv_embedded</option>
         </select>
         <p class="hint">
           Which of YouTube's clients to try first. The others still follow when it is turned away.

@@ -449,6 +449,32 @@ test('a redirect between allowed hosts is followed, relative locations included'
   }
 });
 
+test('where the redirects ended is sent back, since a playlist is relative to that', async () => {
+  // Through the relay, the answer's address is the relay's own, so a page
+  // resolving a redirected playlist's relative links had only the address it
+  // asked for — the short link, not the CDN directory the playlist lives in.
+  let n = 0;
+  const upstream = stubUpstream(() => {
+    n += 1;
+    if (n === 1) return new Response(null, { status: 302, headers: { Location: 'https://rr3---sn-abc.googlevideo.com/hls/42/master.m3u8' } });
+    return new Response('#EXTM3U\nv360.m3u8\n', { status: 200, headers: { 'X-Siphon-Final-URL': 'https://elsewhere.example/' } });
+  });
+  try {
+    const response = await call(relayUrl('https://youtu.be/x'), { headers: { Origin: ORIGIN } });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('x-siphon-final-url'), 'https://rr3---sn-abc.googlevideo.com/hls/42/master.m3u8');
+    // Readable by the page: the request carries no credentials, so '*' exposes every header.
+    assert.equal(response.headers.get('access-control-expose-headers'), '*');
+    assert.equal(response.headers.get('access-control-allow-credentials'), null);
+
+    // With no redirect it is simply the address asked for.
+    const plain = await call(relayUrl(YT), { headers: { Origin: ORIGIN } });
+    assert.equal(plain.headers.get('x-siphon-final-url'), YT);
+  } finally {
+    upstream.restore();
+  }
+});
+
 test('a redirect loop ends with a 502', async () => {
   const upstream = stubUpstream(() => new Response(null, { status: 302, headers: { Location: YT } }));
   try {

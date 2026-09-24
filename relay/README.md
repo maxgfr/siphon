@@ -95,6 +95,9 @@ does not stop the worker making the request.
 A refusal of the worker's own — this origin, that host — carries an
 `X-Relay-Error` header naming it, which a status the host sent never does: a
 403 from googlevideo is the host's answer, carried, not the allow-list's.
+What it carries says where the redirects it followed ended, in
+`X-Siphon-Final-URL`, since the answer's own address is the worker's: the
+page resolves a redirected playlist's relative links against it.
 
 Cookies are never forwarded in either direction, so the relay cannot act as a
 signed-in user of anything it fetches, and cannot hand one page another page's

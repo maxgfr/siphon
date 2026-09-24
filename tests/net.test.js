@@ -394,6 +394,92 @@ test('a relay and the bridge reach any host; a tunnel reaches only what its serv
   assert.equal(tunnel.hasOpenEscape, false, 'but not for YouTube\'s own API, which no resolve names');
 });
 
+/** A host that refuses the page, then whatever the escape answers. */
+const throughEscape = (answer) => stubFetch([
+  () => {
+    throw new TypeError('Failed to fetch');
+  },
+  answer,
+]);
+const TUNNEL = { name: 'tunnel', via: (url) => `https://ytdl.example/api/tunnel?url=${encodeURIComponent(url)}` };
+
+test('a 403 the host sent through the relay is the host\'s answer, not the relay refusing', async () => {
+  // googlevideo refusing a link bound to another IP, carried as it came. The
+  // relay went there as asked; ALLOWED_HOSTS has nothing to do with it.
+  for (const escape of [relayEscape('https://relay.example'), TUNNEL]) {
+    const stub = throughEscape(() => new Response('denied', { status: 403 }));
+    try {
+      const error = await new Fetcher({ escape }).text('https://cdn.example/clip.mp4').catch((e) => e);
+      assert.equal(error.message, 'cdn.example answered 403.', escape.name);
+      assert.doesNotMatch(`${error.message} ${error.hint}`, /refused|ALLOWED_HOSTS|resolved itself/, escape.name);
+      assert.equal(stub.asked.length, 2);
+    } finally {
+      stub.restore();
+    }
+  }
+});
+
+test('the relay\'s own refusal, which it marks as its own, says what to change', async () => {
+  const marked = (reason) => () =>
+    new Response(JSON.stringify({ error: reason }), { status: 403, headers: { 'X-Relay-Error': reason } });
+  let stub = throughEscape(marked('host not allowed'));
+  try {
+    const error = await new Fetcher({ escape: relayEscape('https://relay.example') }).text('https://cdn.example/clip.mp4').catch((e) => e);
+    assert.equal(error.message, 'The relay refused to fetch that address.');
+    assert.match(error.hint, /ALLOWED_HOSTS/);
+    assert.equal(error.retryable, false);
+  } finally {
+    stub.restore();
+  }
+  // A relay that no longer takes this page is fixed in another list.
+  stub = throughEscape(marked('origin not allowed'));
+  try {
+    const error = await new Fetcher({ escape: relayEscape('https://relay.example') }).text('https://cdn.example/clip.mp4').catch((e) => e);
+    assert.equal(error.message, 'The relay refused to fetch that address.');
+    assert.match(error.hint, /ALLOWED_ORIGINS/);
+    assert.doesNotMatch(error.hint, /ALLOWED_HOSTS/);
+  } finally {
+    stub.restore();
+  }
+  stub = throughEscape(marked('not a host this server resolved'));
+  try {
+    const error = await new Fetcher({ escape: TUNNEL }).text('https://cdn.example/clip.mp4').catch((e) => e);
+    assert.equal(error.message, 'The server refused to fetch that address.');
+    assert.match(error.hint, /hosts it resolved itself/);
+    assert.equal(error.retryable, false);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('a 502 the relay marks as its own is the host out of its reach, and worth another try', async () => {
+  const unreachable = () => new Response('{"error":"upstream: connect ECONNREFUSED"}', { status: 502, headers: { 'X-Relay-Error': 'upstream: connect ECONNREFUSED' } });
+  let stub = throughEscape(unreachable);
+  try {
+    const error = await new Fetcher({ escape: relayEscape('https://relay.example') }).text('https://cdn.example/clip.mp4').catch((e) => e);
+    assert.equal(error.message, 'The relay could not reach cdn.example.');
+    assert.doesNotMatch(error.message, /answered 502/);
+    assert.equal(error.retryable, true);
+  } finally {
+    stub.restore();
+  }
+  // And a download through it is tried again rather than given up.
+  stub = stubFetch([
+    () => {
+      throw new TypeError('Failed to fetch');
+    },
+    unreachable,
+    () => ok(WHOLE),
+  ]);
+  try {
+    const out = await new Fetcher({ escape: relayEscape('https://relay.example') }).bytes('https://cdn.example/clip.mp4', { attempts: 3 });
+    assert.deepEqual(out, WHOLE);
+    assert.equal(stub.asked.length, 3);
+  } finally {
+    stub.restore();
+  }
+});
+
 /* ------------------------------------------------------------- the bridge */
 
 const USERSCRIPT = readFileSync(new URL('../bridge/siphon-bridge.user.js', import.meta.url), 'utf8');

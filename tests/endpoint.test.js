@@ -8,7 +8,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { detectEndpoint, privacyNote, describeEndpoint, ytdlpAge, STALE_AFTER_DAYS, withScheme } from '../web/endpoint.js';
+import { detectEndpoint, privacyNote, describeEndpoint, ytdlpAge, STALE_AFTER_DAYS, withScheme, phoneRoute } from '../web/endpoint.js';
 
 /** A fetch that answers from a table of path → response, and records what was asked. */
 function stub(table) {
@@ -20,7 +20,7 @@ function stub(table) {
     if (!hit) throw new TypeError('Failed to fetch');
     const [, answer] = hit;
     const body = typeof answer.body === 'string' ? answer.body : JSON.stringify(answer.body);
-    return new Response(body, { status: answer.status ?? 200 });
+    return new Response(body, { status: answer.status ?? 200, headers: answer.headers });
   };
   return { fetchImpl, asked };
 }
@@ -39,6 +39,35 @@ test('a siphon server is known by its health, ffmpeg and all', async () => {
   assert.equal(helper.ytDlpVersion, '2026.09.01');
   // One request was enough, and the trailing slash did not double up.
   assert.deepEqual(asked, ['https://ytdl.example/api/health']);
+});
+
+test('a server says which YouTube clients its yt-dlp has, and one that does not say offers them all', async () => {
+  const listed = stub({ '/api/health': { body: { service: 'siphon', ytDlpVersion: '2026.09.01', ytClients: ['mweb', 'tv', 'web'] } } });
+  assert.deepEqual((await detectEndpoint('https://ytdl.example', '', listed.fetchImpl)).ytClients, ['mweb', 'tv', 'web']);
+  const older = stub({ '/api/health': { body: { service: 'siphon', ytDlpVersion: '2026.09.01' } } });
+  assert.equal((await detectEndpoint('https://ytdl.example', '', older.fetchImpl)).ytClients, null);
+});
+
+test('how a phone reaches your server: what it named, or what can be said from here', () => {
+  const server = (lanUrls = []) => ({ kind: 'siphon', lanUrls });
+  const page = 'http://127.0.0.1:8000/';
+  // Named by the server: shown as named.
+  assert.deepEqual(phoneRoute(server(['http://192.168.1.42:8000']), 'http://127.0.0.1:8000', page), { urls: ['http://192.168.1.42:8000'] });
+  // On this computer, unnamed — a container, a server bound to loopback: its port, and the rest is the person's.
+  assert.deepEqual(phoneRoute(server(), 'http://127.0.0.1:8000', page), { port: '8000' });
+  assert.deepEqual(phoneRoute(server(), 'http://localhost:9000', page), { port: '9000' });
+  assert.deepEqual(phoneRoute(server(), '', page), { port: '8000' }, 'the page\'s own server');
+  assert.deepEqual(phoneRoute(server(), 'http://[::1]', page), { port: '' }, 'port 80 is no port to type');
+  // On this network already: that address is one a phone there can open.
+  assert.deepEqual(phoneRoute(server(), '', 'http://192.168.1.42:8000/'), { urls: ['http://192.168.1.42:8000'] });
+  assert.deepEqual(phoneRoute(server(), 'http://nas.local:8000', page), { urls: ['http://nas.local:8000'] });
+  // Deployed, proxied or over HTTPS: reachable from anywhere already, or not a LAN matter.
+  assert.equal(phoneRoute(server(), 'https://ytdl.example', page), null);
+  assert.equal(phoneRoute(server(), 'https://127.0.0.1:8443', page), null);
+  assert.equal(phoneRoute(server(), 'http://ytdl.example:8000', page), null);
+  // Not your server at all.
+  assert.equal(phoneRoute({ kind: 'relay' }, 'http://127.0.0.1:8787', page), null);
+  assert.equal(phoneRoute(null, '', page), null);
 });
 
 test('a server that wants a key says so rather than looking like something else', async () => {
@@ -159,6 +188,23 @@ test('a relay that refuses this origin says what to change', async () => {
     '/': { status: 400, body: {} },
   });
   await assert.rejects(() => detectEndpoint('https://relay.example', '', fetchImpl), /ALLOWED_ORIGINS/);
+});
+
+test('a relay that refuses this page is known by the mark on its answer, and names the origin to add', async () => {
+  // Ours refuses every request from an origin it does not list, probes and
+  // all, and marks the refusal as its own. The body is not the relay's to
+  // promise; the mark is what says it.
+  const refused = { status: 403, body: 'Forbidden', headers: { 'X-Relay-Error': 'origin not allowed' } };
+  const { fetchImpl } = stub({ '/api/health': refused, '/config': refused, '/?url=': refused, '/': refused });
+  await onPage('https://you.github.io', async () => {
+    const error = await detectEndpoint('https://relay.example', '', fetchImpl).catch((e) => e);
+    assert.match(error.message, /does not allow this page/);
+    assert.match(error.message, /Add https:\/\/you\.github\.io to its ALLOWED_ORIGINS/);
+  });
+  // Marked for another reason, it is not this page being refused.
+  const other = stub({ '/?url=': { status: 403, body: { error: 'origin not allowed' }, headers: { 'X-Relay-Error': 'host not allowed' } } });
+  const error = await detectEndpoint('https://relay.example', '', other.fetchImpl).catch((e) => e);
+  assert.doesNotMatch(error.message, /ALLOWED_ORIGINS/);
 });
 
 test('an address that answers as none of them is refused with the list', async () => {
@@ -324,7 +370,12 @@ test('a server with a months-old yt-dlp is told to pull the image; a current one
   // a pull alone replaces no running container.
   assert.match(stale, /docker compose pull && docker compose up -d/);
   assert.match(stale, /docker pull ghcr\.io\/maxgfr\/siphon/);
-  assert.match(stale, /docker rm -f siphon/);
+  // With the files it was started with, or an overlay — the PO token
+  // provider — drops out. And by the name docker ps shows: a server started
+  // before the guide's command named its container is not called siphon.
+  assert.match(stale, /with the same -f files you started with/);
+  assert.match(stale, /docker ps shows its name/);
+  assert.doesNotMatch(stale, /docker rm -f siphon/);
   assert.match(stale, /^Your server — yt-dlp 2026\.05\.01, with ffmpeg\./, 'the rest of the sentence is unchanged');
   const fresh = describeEndpoint({ kind: 'siphon', ffmpeg: true, label: 'yt-dlp 2026.09.01', ytDlpVersion: '2026.09.01' }, today);
   assert.doesNotMatch(fresh, /days old/);

@@ -20,7 +20,7 @@ import { pipedResolver, invidiousResolver, invidiousWalk } from './extract.js';
 import { invidiousInstances } from './instances.js';
 import { relayEscape } from './net.js';
 import { isLoopback } from './endpoint.js';
-export { detectEndpoint, privacyNote, describeEndpoint, withScheme } from './endpoint.js';
+export { detectEndpoint, privacyNote, describeEndpoint, withScheme, phoneRoute } from './endpoint.js';
 export { bundledInfo, findInstance, invidiousInstances, looksUnreachable, openInstances, servesPages } from './instances.js';
 
 /** The qualities the UI offers. The server validates against its own copy. */

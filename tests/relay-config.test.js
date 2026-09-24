@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 
 import { spawnSync } from 'node:child_process';
 
-import { through, evaluate, choose, candidates, cobaltCandidates, evaluateCobalt, chooseCobalt, fromSource, sourceEntries, ORIGIN, PUBLIC_RELAYS, COBALT_DIRECTORY, COBALT_DIRECTORIES, COBALT_SOURCE, USER_AGENT, ROBOTS, VIDEO_ID, WATCH } from '../scripts/relay-config.mjs';
+import { through, evaluate, choose, candidates, ownRelay, cobaltCandidates, evaluateCobalt, chooseCobalt, fromSource, sourceEntries, ORIGIN, PUBLIC_RELAYS, COBALT_DIRECTORY, COBALT_DIRECTORIES, COBALT_SOURCE, USER_AGENT, ROBOTS, VIDEO_ID, WATCH } from '../scripts/relay-config.mjs';
 
 const STREAMS = { formatStreams: [{ url: '/videoplayback?itag=18', type: 'video/mp4' }] };
 
@@ -94,6 +94,48 @@ test("when the owner's relay is down, the first public one that passes is taken,
   const found = await choose({ own: 'https://mine.workers.dev', fetchImpl, instances: ['https://inv.example'] });
   assert.equal(found.relay, PUBLIC_RELAYS[1]);
   assert.equal(found.relayKind, 'public');
+});
+
+test("the owner's relay typed without a scheme is given https://, since the page refuses a bare host", async () => {
+  // The page probes an address with no scheme as a path under its own host,
+  // so it refuses one: a relay written into config.json as "you.workers.dev"
+  // was never adopted. The hosted page is https, and a relay it can call
+  // from every visitor's browser is too.
+  assert.equal(ownRelay('mine.workers.dev'), 'https://mine.workers.dev');
+  assert.equal(ownRelay('  mine.workers.dev/ '), 'https://mine.workers.dev/');
+  assert.equal(ownRelay('//mine.workers.dev'), 'https://mine.workers.dev');
+  assert.equal(ownRelay('corsproxy.example/?url={url}'), 'https://corsproxy.example/?url={url}');
+  // One with a scheme is left as it is, and nothing is nothing.
+  assert.equal(ownRelay('https://mine.workers.dev'), 'https://mine.workers.dev');
+  assert.equal(ownRelay('HTTP://127.0.0.1:8787'), 'HTTP://127.0.0.1:8787');
+  assert.equal(ownRelay(''), '');
+  assert.equal(ownRelay(undefined), '');
+
+  const { fetchImpl, asked } = world({ instances: { 'inv.example': STREAMS } });
+  const found = await choose({ own: ' mine.workers.dev ', fetchImpl, instances: ['https://inv.example'] });
+  assert.deepEqual([found.relay, found.relayKind], ['https://mine.workers.dev', 'own']);
+  assert.ok(asked[0].startsWith('https://mine.workers.dev/?url='), asked[0]);
+  assert.equal(candidates('mine.workers.dev')[0], 'https://mine.workers.dev');
+});
+
+test("an owner's relay that is not an http(s) address is refused, saying what to set instead", () => {
+  for (const bad of ['ftp://mine.example', 'javascript:alert(1)', 'https://mine example.dev', 'https://', 'mine.workers.dev:port']) {
+    assert.throws(() => ownRelay(bad), (error) => {
+      assert.match(error.message, /^SIPHON_RELAY_URL /, bad);
+      assert.match(error.message, /https:\/\/you\.workers\.dev/, bad);
+      return true;
+    }, bad);
+  }
+  // Run as the workflow runs it, the refusal is the whole output, before
+  // anything is measured or written.
+  const run = spawnSync(process.execPath, ['scripts/relay-config.mjs'], {
+    env: { ...process.env, SIPHON_RELAY_URL: 'ftp://mine.example' },
+    encoding: 'utf8',
+    timeout: 20_000,
+  });
+  assert.equal(run.status, 1, run.stdout);
+  assert.match(run.stderr, /SIPHON_RELAY_URL "ftp:\/\/mine\.example" is not/);
+  assert.equal(run.stdout, '');
 });
 
 test('nothing passing is no relay, never a dead one', async () => {

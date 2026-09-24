@@ -985,7 +985,8 @@ export function pipedFormats(body) {
  * them from — and ffmpeg has no TTML reader to embed them with. The URL is
  * YouTube's timedtext, proxied, which names its format in `fmt` and answers
  * WebVTT when asked for `vtt`, so that is what is asked for. A track with no
- * such parameter stays what it says it is; the runner embeds only WebVTT.
+ * such parameter stays what it says it is; the runner embeds only WebVTT,
+ * SRT and ASS.
  */
 export function pipedSubtitles(body) {
   return (body.subtitles || [])
@@ -1322,9 +1323,13 @@ export function planDownload(extraction, preset) {
   const videoOnly = formats.filter((format) => format.kind === 'video').sort(better);
 
   if (preset === 'audio_mp3' || preset === 'audio_m4a') {
-    const source = audioOnly[0] || lightestHls(muxed) || muxed[0] || videoOnly[0];
-    if (!source) throw new BackendError('That link has no audio to take.', { retryable: false });
     const wantM4a = preset === 'audio_m4a';
+    // The lightest rung only saves memory on a re-encode. Where a progressive
+    // file carries AAC, M4A can copy it instead, and that is worth holding a
+    // larger file for.
+    const progressiveAac = wantM4a && muxed.find((format) => format.protocol === 'progressive' && /mp4a|aac/i.test(format.codecs || ''));
+    const source = audioOnly[0] || progressiveAac || lightestHls(muxed) || muxed[0] || videoOnly[0];
+    if (!source) throw new BackendError('That link has no audio to take.', { retryable: false });
     // An MP3 asked for as MP3 is already the file. Decoding and encoding it
     // again would load the converter to make a second lossy copy of it.
     if (!wantM4a && source.kind === 'audio' && source.protocol === 'progressive' && source.container === 'mp3') {

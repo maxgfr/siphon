@@ -355,28 +355,68 @@ export async function chooseCobalt({ fetchImpl = globalThis.fetch, say = () => {
   return '';
 }
 
+/**
+ * The owner's relay (SIPHON_RELAY_URL) as the page will take it.
+ *
+ * The page refuses an address with no scheme rather than probing it as a
+ * path under its own host, so a relay written into config.json as
+ * "you.workers.dev" was measured, passed, and never adopted. A bare address
+ * is given https://: the page that reads config.json is the hosted one, on
+ * https, and a relay every visitor's browser can call from there is https
+ * too.
+ * One with a scheme is kept as typed, templates included; anything that is
+ * still not an http(s) address is refused with what to set instead.
+ */
+export function ownRelay(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return '';
+  const address = /^[a-z][a-z\d+.-]*:\/\//i.test(text) ? text : `https://${text.replace(/^\/+/, '')}`;
+  let parsed = null;
+  try {
+    parsed = new URL(address.replace(/\{(url|raw)\}/g, ''));
+  } catch {
+    /* refused below */
+  }
+  if (!parsed || (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') || !parsed.hostname) {
+    throw new Error(`SIPHON_RELAY_URL "${text}" is not an http(s) address. Set it to the relay's full address, like https://you.workers.dev.`);
+  }
+  return address;
+}
+
 /** The candidates in order: the owner's relay, then the public ones. */
 export function candidates(own = '') {
-  const mine = String(own || '').trim();
+  const mine = ownRelay(own);
   return mine ? [mine, ...PUBLIC_RELAYS] : [...PUBLIC_RELAYS];
 }
 
 /** Try each until one passes; say what every one said. */
 export async function choose({ own = '', fetchImpl = globalThis.fetch, instances = [], say = () => {} } = {}) {
-  for (const relay of candidates(own)) {
+  const mine = ownRelay(own);
+  for (const relay of candidates(mine)) {
     const report = await evaluate(relay, { fetchImpl, instances });
     say(`${report.ok ? 'ok  ' : 'no  '} ${relay}\n       robots: ${report.robots}\n       instance: ${report.instance || '-'}\n       media: ${report.media || '-'}`);
-    if (report.ok) return { relay, relayKind: relay === own.trim() ? 'own' : 'public', instance: report.instance };
+    if (report.ok) return { relay, relayKind: relay === mine ? 'own' : 'public', instance: report.instance };
   }
   return { relay: '', relayKind: '', instance: '' };
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
+  // Settled before anything is measured: a variable that cannot be an
+  // address stops the run with the reason, rather than a day's log of it
+  // failing to answer.
+  let own = '';
+  try {
+    own = ownRelay(process.env.SIPHON_RELAY_URL);
+  } catch (error) {
+    console.error(error.message);
+    process.exit(1);
+  }
   const instances = JSON.parse(readFileSync(INSTANCES, 'utf8')).invidious || [];
   const say = (line) => console.log(line);
+  if (own && own !== process.env.SIPHON_RELAY_URL.trim()) console.log(`SIPHON_RELAY_URL has no scheme; measured as ${own}\n`);
   console.log('relays:');
-  const found = await choose({ own: process.env.SIPHON_RELAY_URL || '', instances, say });
+  const found = await choose({ own, instances, say });
   console.log('\ncobalt instances:');
   const cobalt = await chooseCobalt({ say });
   const next = {

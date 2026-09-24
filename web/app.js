@@ -11,7 +11,7 @@
  * primary action pinned within thumb reach, and no interaction that needs a
  * hover or a precise tap.
  */
-import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, bundledInfo, privacyNote, describeEndpoint, servesPages, withScheme } from './api.js';
+import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, bundledInfo, privacyNote, describeEndpoint, servesPages, withScheme, phoneRoute } from './api.js';
 import { looksLikeUrl, urlsIn } from './links.js';
 
 const SETTINGS_KEY = 'siphon:settings';
@@ -895,7 +895,9 @@ async function runProbe(url) {
 function openSettings() {
   $('endpoint').value = settings.endpoint;
   $('endpointKey').value = settings.key;
-  keyOrigin = originOf(settings.endpoint);
+  // Nothing saved, nothing to keep from another address: a key that turns
+  // up in the field, typed or filled in, is for the address that follows.
+  keyOrigin = settings.endpoint || settings.key ? originOf(settings.endpoint) : null;
   keyHeld = '';
   const options = { ...DEFAULT_SETTINGS.ytdlp, ...(settings.ytdlp || {}) };
   $('optSponsor').checked = options.sponsorblock === true;
@@ -903,7 +905,11 @@ function openSettings() {
   $('optClipEnd').value = options.clipEnd;
   $('optRate').value = options.rateLimit;
   $('optClient').value = options.client;
-  reflectHelper(settings.helper, hostOf(settings.endpoint));
+  // A client no longer offered — tv_embedded, saved before yt-dlp retired
+  // it — would leave the list showing nothing. The server takes it as no
+  // preference, and so does the sheet.
+  if ($('optClient').selectedIndex < 0) $('optClient').value = '';
+  reflectHelper(settings.helper, settings.endpoint);
   renderSuggested();
   $('settings').showModal();
 }
@@ -934,6 +940,24 @@ function scopeYtdlp(helper) {
     : thin
       ? 'Your server has no ffmpeg, so it only resolves links and this device downloads: these need the server to make the download. They are kept until it does.'
       : 'These apply when the helper is your own siphon server, which runs yt-dlp. They are kept until then.';
+  offerClients(helper);
+}
+
+/**
+ * Offer the YouTube clients your server's yt-dlp has, and only those. yt-dlp
+ * drops the ones YouTube retires, and asked for one it no longer knows it
+ * skips it without a word: a choice that does nothing. A server that does
+ * not say which it has, and any other helper, leaves them all.
+ */
+function offerClients(helper) {
+  const has = helper?.kind === 'siphon' && Array.isArray(helper.ytClients) ? new Set(helper.ytClients) : null;
+  const select = $('optClient');
+  for (const option of select.options) {
+    const gone = Boolean(option.value) && has !== null && !has.has(option.value);
+    option.hidden = gone;
+    option.disabled = gone;
+  }
+  if (select.selectedOptions[0]?.disabled) select.value = '';
 }
 
 /** How many instances to offer as chips; the rest are one "Find" away. */
@@ -976,12 +1000,12 @@ async function renderSuggested() {
  * the same description otherwise, and switching from one to the other then
  * reads as the sheet not having noticed.
  */
-function reflectHelper(helper, host = '') {
-  setStatus(helper.kind === 'none' ? '' : 'ok', named(host, describeEndpoint(helper)));
+function reflectHelper(helper, address = '') {
+  setStatus(helper.kind === 'none' ? '' : 'ok', named(address ? hostOf(address) : '', describeEndpoint(helper)));
   // Only our own server has a cookie store to write to.
   $('cookiesBlock').hidden = helper.kind !== 'siphon';
   if (helper.kind === 'siphon') setCookieState(helper.hasCookies === true);
-  showPhoneHint(helper.lanUrls || []);
+  showPhoneHint(helper, address);
   scopeYtdlp(helper);
 }
 
@@ -1011,6 +1035,11 @@ function draftSettings() {
  * perhaps, with every probe and every download. So it goes with the address
  * it was entered for: an address on another origin empties it, as a chip or
  * Find already did, and the same origin typed back brings it back.
+ *
+ * A key typed while the address box is empty and nothing is saved was
+ * entered for no address yet, as a password manager fills it: it is null
+ * then, and the key stays for whatever address is typed after it. Bound to
+ * this page's own origin, the first letter of that address took it away.
  */
 let keyOrigin = '';
 /** That origin's key, while the field is emptied for another. */
@@ -1026,6 +1055,7 @@ const originOf = (address) => {
 
 function guardKey() {
   const field = $('endpointKey');
+  if (keyOrigin === null) return;
   if (originOf($('endpoint').value) === keyOrigin) {
     if (!field.value) field.value = keyHeld;
   } else if (field.value) {
@@ -1065,11 +1095,11 @@ async function probeDraft() {
         named(host, draft.key ? 'Your server, but it rejected that access key. It is the AUTH_TOKEN the server was started with.' : 'Your server, and it wants an access key — the AUTH_TOKEN it was started with.'),
       );
       $('cookiesBlock').hidden = true;
-      showPhoneHint(helper.lanUrls || []);
+      showPhoneHint(helper, draft.endpoint);
       scopeYtdlp(null);
       return null;
     }
-    reflectHelper(helper, host);
+    reflectHelper(helper, draft.endpoint);
     // Recognising an instance is its stats endpoint answering, which every
     // public one still does. The endpoint a download needs is another door,
     // shut to pages on most of them now — so it is asked here, once, and the
@@ -1093,7 +1123,7 @@ async function probeDraft() {
     if (seq !== probeSeq) return null;
     setStatus('bad', named(host, error?.message || 'Could not reach it.'));
     $('cookiesBlock').hidden = true;
-    showPhoneHint([]);
+    showPhoneHint(null);
     scopeYtdlp(null);
     return null;
   }
@@ -1104,21 +1134,37 @@ const testConnection = probeDraft;
 /**
  * Answer "how do I use this from my phone?" with the actual address, rather
  * than sending the user off to find their own IP. Only shown for a server on
- * this network — a deployed one is already reachable from anywhere.
+ * this network — a deployed one is already reachable from anywhere. When the
+ * server could not tell its address (a container sees only its own network),
+ * it says how to find it and how to have it named here.
+ *
+ * Plain http on a phone is not a secure context: the page works there, but
+ * installs as no app and takes no links from the share sheet. That takes
+ * HTTPS, so it says where HTTPS is.
  */
-function showPhoneHint(urls) {
+function showPhoneHint(helper, address = '') {
   const host = $('phoneHint');
   const body = $('phoneHintBody');
-  if (!urls.length) {
-    host.hidden = true;
-    return;
-  }
-  host.hidden = false;
-  body.innerHTML =
-    'On the same Wi-Fi, open this in the phone\'s browser — it serves the app itself, ' +
-    'so there is nothing else to set up:<br>' +
-    urls.map((url) => `<strong style="font-family:var(--mono)">${escapeHtml(url)}</strong>`).join('<br>') +
-    '<br>Away from home, put it behind a tunnel or a VPN — see the README.';
+  const route = phoneRoute(helper, address);
+  host.hidden = !route;
+  if (!route) return;
+  const code = (text) => `<strong style="font-family:var(--mono)">${escapeHtml(text)}</strong>`;
+  const port = route.port ? `:${route.port}` : '';
+  const where = route.urls
+    ? 'On the same Wi-Fi, open this in the phone\'s browser — it serves the app itself, ' +
+      `so there is nothing else to set up:<br>${route.urls.map(code).join('<br>')}`
+    : `On the same Wi-Fi, open this computer's network address${port && ` with port ${route.port}`} in the phone's browser, ` +
+      `something like <code>http://192.168.1.42${port}</code>. The server could not tell which it is: set ` +
+      '<code>LAN_URL</code> on it and Test names it here. Started by hand, it also needs <code>--host 0.0.0.0</code>.';
+  const plain = !route.urls || route.urls.some((url) => /^http:/i.test(url));
+  const https = location.protocol === 'https:'
+    ? 'this page'
+    : '<a href="https://maxgfr.github.io/siphon/" target="_blank" rel="noopener">the hosted page</a>';
+  body.innerHTML = `${where}<br>${
+    plain
+      ? `Plain http works, but will not install as an app or appear in the share sheet. For that, and away from home, use ${https} with an HTTPS helper — a tunnel or tailscale serve; see the README.`
+      : 'Away from home, put it behind a tunnel or a VPN — see the README.'
+  }`;
 }
 
 /* ------------------------------------------------------------------ cookies */
@@ -1415,7 +1461,8 @@ function init() {
   $('closeSettings').addEventListener('click', () => $('settings').close());
   $('endpoint').addEventListener('input', guardKey);
   $('endpointKey').addEventListener('input', () => {
-    keyOrigin = originOf($('endpoint').value);
+    const unbound = !$('endpoint').value.trim() && !settings.endpoint && !settings.key;
+    keyOrigin = unbound ? null : originOf($('endpoint').value);
     keyHeld = '';
   });
   $('useLocalhost').addEventListener('click', () => {
@@ -1577,10 +1624,14 @@ async function fillTour() {
     // Nothing is set. On a site with a relay, that is someone who cleared it
     // (it is never adopted twice) or one it has not reached yet: either way
     // the relay is named, and taken with one tap rather than an address to
-    // find and type.
-    const { relay } = await siteConfig();
+    // find and type. Whose it is is said before the tap, as the notice after
+    // it says: the owner's own, or a public proxy that sees the links.
+    const { relay, relayKind } = await siteConfig();
+    const at = `at <strong>${escapeHtml(hostOf(relay))}</strong>`;
     text = relay
-      ? `This site runs a relay for YouTube, at <strong>${escapeHtml(hostOf(relay))}</strong>, and it is not in use. ` +
+      ? (relayKind === 'own'
+        ? `This site runs a relay for YouTube, ${at}, and it is not in use. `
+        : `This site offers a public proxy for YouTube, ${at}, which sees the links it carries, and it is not in use. `) +
         '<button class="chip-btn" type="button" id="useSiteRelay">Use it</button> Or one of these, each about a minute:'
       : 'YouTube refuses web pages, so it needs one thing that is yours. Each takes about a minute:';
   }

@@ -7,13 +7,14 @@ for a service the default compose file does not define, an update that
 quietly dropped the provider overlay, a Fly access key generated straight
 into a secret nobody could read back, a Render deploy whose uploaded cookies
 vanished at the first sleep with nothing saying so, a phone promised a share
-sheet over plain http, and test counts in docs/verified.md that no run had
-produced. Commands are run where they can be, against stubs; where the check
-can only be a reading of the prose, it says exactly what it reads.
+sheet over plain http. Commands are run where they can be, against stubs;
+where the check can only be a reading of the prose, it says exactly what it
+reads.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -124,6 +125,25 @@ def test_compose_file_in_dot_env_makes_the_bare_update_keep_the_provider(tmp_pat
         assert run.returncode == 0, run.stderr
         if "docker-compose.potoken.yml" in value:
             assert "POT_PROVIDER_URL: http://potoken:4416" in run.stdout, run.stdout
+        if "docker-compose.tunnel.yml" in value:
+            assert re.search(r"^  cloudflared:$", run.stdout, re.M), run.stdout
+
+
+def test_the_compose_file_advice_says_an_explicit_f_replaces_it() -> None:
+    # Compose reads COMPOSE_FILE only when no -f is given, and the README's
+    # own tunnel and build commands pass -f: run after step 3, they brought
+    # siphon back without the provider. So wherever COMPOSE_FILE is offered —
+    # step 3 and the overlay's own comment — it is also said that an -f
+    # replaces it, and a value with the tunnel in it is given. A reading of
+    # the prose: a sentence naming both -f and COMPOSE_FILE says "replaces".
+    step = readme().split("3. **A proof-of-origin provider.**", 1)[1].split("If all three fail", 1)[0]
+    comment = "\n".join(
+        line.lstrip("# ") for line in (ROOT / "docker-compose.potoken.yml").read_text().splitlines() if line.startswith("#")
+    )
+    for name, text in (("README step 3", step), ("docker-compose.potoken.yml", comment)):
+        said = [s for s in sentences(text) if "-f" in s and "COMPOSE_FILE" in s and "replaces" in s]
+        assert said, f"{name} does not say that an -f replaces COMPOSE_FILE"
+    assert any("docker-compose.tunnel.yml" in value for value in compose_file_values()), "no COMPOSE_FILE with the tunnel is given"
 
 
 def run_with_stub_fly(script: str, tmp_path: Path) -> tuple[str, str]:
@@ -214,32 +234,6 @@ def test_a_plain_http_lan_address_is_not_promised_the_share_sheet() -> None:
     assert found, "the README no longer gives a LAN address to test against"
 
 
-def suite_counts(lines: list[tuple[str, str]]) -> dict[str, int]:
-    counts = {}
-    for suite, text in lines:
-        match = re.search(r"(?:^|— )(\d+)\b", text.strip())
-        if match:
-            counts[suite] = int(match.group(1))
-    return counts
-
-
-def test_verified_md_gives_no_test_count_the_readme_contradicts() -> None:
-    # verified.md once carried a table of counts from an old run while the
-    # README carried newer ones. The counts now live in the README's
-    # Development block alone; a count verified.md gives again has to agree.
-    block = readme().split("## Development", 1)[1].split("```sh\n", 1)[1].split("```", 1)[0]
-    readme_counts = suite_counts(
-        re.findall(r"^((?:pytest server/tests|npm test|npm run test:\w+))\b[^#\n]*#(.*)$", block, re.M)
-    )
-    assert readme_counts.get("pytest server/tests"), block
-    verified = (ROOT / "docs" / "verified.md").read_text()
-    verified_counts = {
-        suite: int(count) for suite, count in re.findall(r"^\| `([^`]+)` \|.*\| (\d+) pass \|$", verified, re.M)
-    }
-    for suite, count in verified_counts.items():
-        assert readme_counts.get(suite) == count, f"{suite}: verified.md says {count}, the README {readme_counts.get(suite)}"
-
-
 def test_allowed_origins_is_given_an_origin_not_a_page_address() -> None:
     # A browser's Origin has no path. "Set ALLOWED_ORIGINS to your page's URL"
     # put https://you.github.io/siphon/ there, which the relay and the server
@@ -303,3 +297,92 @@ def test_the_daily_measurements_ask_as_this_repositorys_page() -> None:
         for step in runs:
             origin = step.get("env", {}).get("SIPHON_ORIGIN", "")
             assert "vars.SIPHON_ORIGIN" in origin and "github.repository_owner" in origin, f"{name}: {origin!r}"
+
+
+def test_the_pages_deploy_gives_the_owners_relay_a_scheme(tmp_path: Path) -> None:
+    # The deploy writes SIPHON_RELAY_URL into config.json itself, so the
+    # variable takes effect before the next measurement. The page refuses an
+    # address with no scheme, and "you.workers.dev" as typed there was never
+    # adopted: the deploy has to give it one, as the measurement does.
+    node = shutil.which("node")
+    if node is None or shutil.which("bash") is None:
+        pytest.skip("needs node and bash")
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "pages.yml").read_text())
+    steps = [step for job in workflow["jobs"].values() for step in job["steps"] if "SIPHON_RELAY_URL" in step.get("run", "")]
+    assert len(steps) == 1, "pages.yml no longer writes the owner's relay into config.json"
+    # Run where the step runs, the repository root, with a config.json of its own.
+    (tmp_path / "scripts").symlink_to(ROOT / "scripts")
+    (tmp_path / "web").mkdir()
+    config = tmp_path / "web" / "config.json"
+    measured = {"relay": "https://public.example/?url={url}", "relayKind": "public", "instance": "", "cobalt": "", "checked": "2026-01-01"}
+
+    def deploy(value: str) -> subprocess.CompletedProcess:
+        config.write_text(json.dumps(measured, indent=2) + "\n")
+        env = {**os.environ, "SIPHON_RELAY_URL": value}
+        return subprocess.run(["bash", "-e", "-c", steps[0]["run"]], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+
+    for value, relay in (("mine.workers.dev", "https://mine.workers.dev"), ("https://mine.workers.dev", "https://mine.workers.dev")):
+        run = deploy(value)
+        assert run.returncode == 0, run.stderr
+        assert json.loads(config.read_text()) == {**measured, "relay": relay, "relayKind": "own"}, value
+    # Unset, the measured relay stays.
+    assert deploy("").returncode == 0
+    assert json.loads(config.read_text()) == measured
+    # And one that is no address stops the deploy saying so, not a site
+    # whose default relay is nothing the page will take.
+    run = deploy("ftp://mine.example")
+    assert run.returncode != 0
+    assert 'SIPHON_RELAY_URL "ftp://mine.example" is not' in run.stderr, run.stderr
+    assert json.loads(config.read_text()) == measured
+
+
+def guide_command() -> str:
+    """The docker run the in-app guide hands out, with its Copy button."""
+    match = re.search(r'<code id="dockerCmd">([^<]*)</code>', (ROOT / "web" / "index.html").read_text())
+    assert match, "the guide no longer offers a docker command"
+    return match.group(1)
+
+
+def test_the_readme_starts_the_server_with_the_guides_command() -> None:
+    # The README's command had no --name, so the update advice the app gives
+    # (docker rm -f siphon, then the same docker run) found no container to
+    # remove. The two now start it one way.
+    section = readme().split("## 2. Your own server", 1)[1]
+    assert shell_blocks(section)[0].strip() == guide_command()
+
+
+def test_the_command_keeps_what_the_image_keeps_on_its_volume() -> None:
+    # A volume anywhere else leaves the downloads and the uploaded cookies in
+    # the container, and an update that replaces the container loses them.
+    volume = re.search(r"-v\s+\S+?:(\S+)", guide_command())
+    assert volume, guide_command()
+    assert f'VOLUME ["{volume.group(1)}"]' in (ROOT / "server" / "Dockerfile").read_text()
+    for name in ("DOWNLOAD_DIR", "COOKIES_FILE"):
+        value = dockerfile_env(name)
+        assert value == volume.group(1) or under(value, volume.group(1)), f"{name}={value} is not on {volume.group(1)}"
+
+
+def test_the_update_advice_covers_a_server_started_with_docker_run() -> None:
+    # The update was given for compose alone, and a server started with the
+    # guide's one command has no compose project to pull: the same paragraph
+    # gives the docker run path, with the same command, so the same volume.
+    update = [p for p in paragraphs(readme()) if "docker compose pull" in p]
+    assert update, "the README no longer gives the update command"
+    for paragraph in update:
+        text = " ".join(paragraph.split())
+        assert f"docker pull ghcr.io/maxgfr/siphon && docker rm -f siphon && {guide_command()}" in text, paragraph
+
+
+def test_every_link_to_the_bridge_in_the_docs_is_the_script_itself() -> None:
+    # A userscript manager offers to install only an address ending in
+    # .user.js; the folder is a page to go looking on. tests/guide.test.js
+    # holds the guide and the README to this; docs/ is checked here.
+    raw = "https://github.com/maxgfr/siphon/raw/main/bridge/siphon-bridge.user.js"
+    links = [
+        (path.name, link)
+        for path in sorted((ROOT / "docs").glob("*.md"))
+        for link in re.findall(r"\]\(((?:[^)]*/)?bridge(?:/[^)]*)?)\)", path.read_text())
+    ]
+    assert links, "docs/ no longer links the bridge"
+    for name, link in links:
+        assert link == raw, f"{name}: {link}"

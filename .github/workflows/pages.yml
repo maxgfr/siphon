@@ -50,10 +50,13 @@ jobs:
       # web/config.json is what the relay-config workflow measured and
       # committed. The owner's own relay (the SIPHON_RELAY_URL variable)
       # overrides it here, so setting the variable is enough to take effect on
-      # the next deploy without waiting for the daily measurement.
+      # the next deploy without waiting for the daily measurement. It is
+      # written as the measurement writes it: an address typed with no scheme
+      # is given https://, which the page needs, and one that is no address
+      # stops the deploy with the reason.
       - run: |
           if [ -n "${SIPHON_RELAY_URL}" ]; then
-            node -e 'const f="web/config.json";const c=JSON.parse(require("fs").readFileSync(f,"utf8"));c.relay=process.env.SIPHON_RELAY_URL;c.relayKind="own";require("fs").writeFileSync(f,JSON.stringify(c,null,2)+"\n")'
+            node --input-type=module -e 'import { readFileSync, writeFileSync } from "node:fs";import { ownRelay } from "./scripts/relay-config.mjs";let relay;try{relay=ownRelay(process.env.SIPHON_RELAY_URL)}catch(error){console.error(error.message);process.exit(1)}const f="web/config.json";const c=JSON.parse(readFileSync(f,"utf8"));c.relay=relay;c.relayKind="own";writeFileSync(f,JSON.stringify(c,null,2)+"\n")'
           fi
         env:
           SIPHON_RELAY_URL: ${{ vars.SIPHON_RELAY_URL }}

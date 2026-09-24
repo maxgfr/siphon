@@ -486,10 +486,12 @@ export function pickSubtitle(tracks, langs = 'en') {
  * video is what was asked for — so this swallows its own failure the way the
  * cover art does, and says so in the row.
  *
- * What is embedded is WebVTT, and only that is let through. ffmpeg handed
- * anything else under a .vtt name — TTML, an error page — makes an empty
- * track of it without complaint, and the video would carry a subtitle menu
- * entry that never shows a word.
+ * What is embedded is what the muxer can read: WebVTT, and the SRT and ASS a
+ * server's resolver hands back when a site offers no WebVTT. Each is let
+ * through only if it looks like what its name says. ffmpeg handed anything
+ * else under one of those names — TTML, an error page — makes an empty track
+ * of it without complaint, and the video would carry a subtitle menu entry
+ * that never shows a word.
  */
 export async function subtitleData(net, subtitle, signal) {
   let data;
@@ -498,8 +500,14 @@ export async function subtitleData(net, subtitle, signal) {
   } catch {
     return null;
   }
-  // The decoder drops a byte-order mark, which WebVTT allows before its name.
-  return new TextDecoder().decode(data.subarray(0, 16)).startsWith('WEBVTT') ? data : null;
+  // The decoder drops a byte-order mark, which all three allow before their
+  // first line. An unnamed track is WebVTT, as the muxer names it.
+  const head = new TextDecoder().decode(data.subarray(0, 512));
+  const ext = String(subtitle.ext || 'vtt').toLowerCase();
+  if (ext === 'vtt') return head.startsWith('WEBVTT') ? data : null;
+  if (ext === 'srt') return /\d+:\d\d:\d\d[,.]\d+\s*-->/.test(head) ? data : null;
+  if (ext === 'ass') return /^\s*\[Script Info\]/i.test(head) ? data : null;
+  return null;
 }
 
 async function coverArt(net, info, signal) {

@@ -15,9 +15,13 @@
 # bare `docker compose up -d` recreates siphon without POT_PROVIDER_URL and
 # leaves the provider running for nothing; compose only mentions an orphan
 # container. Naming the files once in a .env beside them makes every command
-# read them (on Windows the separator is ; rather than :):
+# without -f read them (on Windows the separator is ; rather than :):
 #
 #   echo COMPOSE_FILE=docker-compose.yml:docker-compose.potoken.yml >> .env
+#
+# An explicit -f replaces COMPOSE_FILE, so a command with one, the tunnel's or
+# the build's, drops the provider again: put every overlay you use in
+# COMPOSE_FILE instead, and give later commands no -f.
 services:
   potoken:
     image: brainicism/bgutil-ytdlp-pot-provider:latest

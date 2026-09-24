@@ -285,6 +285,12 @@ export default {
       out.set(key, value);
     }
     for (const [key, value] of Object.entries(corsHeaders(request, env))) out.set(key, value);
+    // Where the redirects ended. The answer's own address is this relay's, so
+    // a redirected playlist's relative links would otherwise be resolved
+    // against the address that was asked for, not the one it lives at. Set
+    // over whatever upstream sent under that name, as the other headers here
+    // are; exposed by the '*' above, since nothing here carries credentials.
+    out.set('X-Siphon-Final-URL', url.toString());
 
     // The body is passed straight through rather than buffered: a two-hour
     // video must not have to fit in the worker before it reaches the browser.

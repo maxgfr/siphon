@@ -12,19 +12,22 @@ the host's cloud credentials for anyone who can reach it".
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import functools
 import http.server
 import importlib
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -692,8 +695,8 @@ class TestResolvedFormat:
 class _FakeJar:
     """yt-dlp's cookie jar, empty."""
 
-    def get_cookie_header(self, _url: str) -> None:
-        return None
+    def __iter__(self) -> Iterator[object]:
+        return iter(())
 
 
 class _FakeYdl:
@@ -1151,7 +1154,12 @@ class TestJobOptions:
     def test_timestamps_are_read_as_a_clock(self, text: str, seconds: float | None) -> None:
         assert server_app.parse_timestamp(text) == seconds
 
-    @pytest.mark.parametrize("text", ["abc", "1:99", "1:60:00", "1:2:3:4", "-5", "1h"])
+    @pytest.mark.parametrize(("text", "seconds"), [("150", 150.0), ("90.5", 90.5), ("7200", 7200.0), ("0.25", 0.25)])
+    def test_plain_seconds_are_read_whatever_their_length(self, text: str, seconds: float) -> None:
+        """Someone typing seconds types 150, not 2:30; only two digits were taken."""
+        assert server_app.parse_timestamp(text) == seconds
+
+    @pytest.mark.parametrize("text", ["abc", "1:99", "1:60:00", "1:2:3:4", "-5", "1h", "150.", ".5", "1.2345", "1:150"])
     def test_a_non_time_is_refused_with_the_shape_to_use(self, text: str) -> None:
         with pytest.raises(ValueError, match="1:23"):
             server_app.parse_timestamp(text)
@@ -1183,23 +1191,46 @@ class TestJobOptions:
         assert any(pp["key"] == "FFmpegMetadata" for pp in pps[2:])
         assert "SponsorBlock" not in [pp["key"] for pp in server_app.build_options(self._job(), None)["postprocessors"]]
 
-    def test_a_clip_is_cut_from_the_download_not_fetched_by_ffmpeg(self) -> None:
+    def test_a_clip_fetches_only_its_span(self) -> None:
         """
-        yt-dlp's download_ranges hands the remote URL to ffmpeg, whose
-        connections the guard never sees; the clip is cut on this machine.
+        A clip was cut from a download of the whole video — gigabytes, for
+        half a minute of a long one — because yt-dlp's download_ranges hands
+        the URL to ffmpeg, whose connections the guard never saw. ffmpeg now
+        connects through the guarded proxy, so the span is all that is
+        fetched, re-encoded to start and end where it was asked to.
         """
         clipped = self._job(clip_start=83.0, clip_end=100.0)
         options = server_app.build_options(clipped, None)
-        assert "download_ranges" not in options and "force_keyframes_at_cuts" not in options
+        assert list(options["download_ranges"]({}, None)) == [{"start_time": 83.0, "end_time": 100.0}]
+        assert options["force_keyframes_at_cuts"] is True
+        # What comes whole with it — subtitles, chapters — is put on the
+        # clip's clock before anything embeds it.
         steps = server_app.job_postprocessors(clipped)
-        cuts = [step for step, when in steps if isinstance(step, server_app.CutClip) and when == "post_process"]
-        assert len(cuts) == 1
+        assert [when for step, when in steps if isinstance(step, server_app.FitToClip)] == ["before_dl"]
         # The guard on the formats runs for every download, clip or not.
         assert [when for step, when in server_app.job_postprocessors(self._job()) if isinstance(step, server_app.CheckMediaUrls)] == ["before_dl"]
-        assert not any(isinstance(step, server_app.CutClip) for step, _ in server_app.job_postprocessors(self._job()))
+        assert "download_ranges" not in server_app.build_options(self._job(), None)
+        assert not any(isinstance(step, server_app.FitToClip) for step, _ in server_app.job_postprocessors(self._job()))
+
+    def test_a_clips_chapters_are_the_clips(self) -> None:
+        chapters = [
+            {"start_time": 0.0, "end_time": 60.0, "title": "Intro"},
+            {"start_time": 60.0, "end_time": 120.0, "title": "Middle"},
+            {"start_time": 120.0, "end_time": 180.0, "title": "End"},
+        ]
+        _, info = server_app.FitToClip(90.0, 130.0).run({"chapters": chapters})
+        assert info["chapters"] == [
+            {"start_time": 0.0, "end_time": 30.0, "title": "Middle"},
+            {"start_time": 30.0, "end_time": 40.0, "title": "End"},
+        ]
+        _, info = server_app.FitToClip(None, 30.0).run({"chapters": chapters})
+        assert info["chapters"] == [{"start_time": 0.0, "end_time": 30.0, "title": "Intro"}]
 
     def test_hls_goes_to_yt_dlps_own_downloader_first(self) -> None:
-        """It fetches through this process, and so through the guard; ffmpeg does not."""
+        """
+        It fetches through this process, reports progress and keeps to a
+        speed limit; ffmpeg, through the proxy, gets only what it cannot read.
+        """
         assert server_app.build_options(self._job(), None)["hls_prefer_native"] is True
 
     def test_a_speed_limit_is_handed_to_yt_dlp_in_bytes(self) -> None:
@@ -1418,6 +1449,66 @@ class TestTunnelRedirects:
             for server in (target, first):
                 server.shutdown()
 
+    def test_the_page_is_told_where_the_redirects_ended(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        """
+        Through the tunnel, the answer's address is the server's, so a
+        redirected playlist's relative links were resolved against the short
+        link the page asked for rather than the directory it landed in.
+        """
+        import http.server
+        import threading as _threading
+
+        class Target(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = b"#EXTM3U\nv360.m3u8\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Siphon-Final-URL", "https://elsewhere.example/")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Target)
+        landed = f"http://127.0.0.1:{target.server_address[1]}/hls/42/master.m3u8"
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                self.send_response(302)
+                self.send_header("Location", landed)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        first = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirector)
+        for server in (target, first):
+            _threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", True)
+            monkeypatch.setattr(server_app, "TUNNEL_HOSTS", {})
+            server_app._grant_host("http://127.0.0.1/", {})
+            response = client.get(
+                "/api/tunnel",
+                params={"url": f"http://127.0.0.1:{first.server_address[1]}/short"},
+                headers={"Origin": server_app.HOSTED_PAGE_ORIGIN},
+            )
+            assert response.status_code == 200
+            assert response.content == b"#EXTM3U\nv360.m3u8\n"
+            # The last hop, and never a header of that name the host sent.
+            assert response.headers.get("x-siphon-final-url") == landed
+            # And the page can read it: its fetch carries no credentials, so
+            # '*' exposes every header.
+            assert response.headers.get("access-control-allow-origin") == server_app.HOSTED_PAGE_ORIGIN
+            assert response.headers.get("access-control-expose-headers") == "*"
+            assert "access-control-allow-credentials" not in response.headers
+        finally:
+            for server in (target, first):
+                server.shutdown()
+
 
 class TestCookiesStayDeleted:
     def test_each_run_gets_a_private_copy(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1542,15 +1633,17 @@ class _Quiet(http.server.SimpleHTTPRequestHandler):
 
 
 @contextlib.contextmanager
-def _serving(handler: type, host: str = "127.0.0.1") -> Iterator[str]:
-    """A throwaway HTTP server; yields its base URL."""
+def _serving(handler: type, host: str = "127.0.0.1", tls: "ssl.SSLContext | None" = None) -> Iterator[str]:
+    """A throwaway HTTP server, or HTTPS given a context; yields its base URL."""
     try:
         server = http.server.ThreadingHTTPServer((host, 0), handler)
     except OSError:
         pytest.skip(f"cannot listen on {host}")
+    if tls:
+        server.socket = tls.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        yield f"http://{host}:{server.server_address[1]}"
+        yield f"{'https' if tls else 'http'}://{host}:{server.server_address[1]}"
     finally:
         server.shutdown()
         server.server_close()
@@ -1585,27 +1678,186 @@ def sample_mp4(tmp_path_factory: pytest.TempPathFactory) -> bytes:
     return path.read_bytes()
 
 
-@needs_ffmpeg
-class TestFfmpegNeverFetches:
+def _ask_proxy(run: "server_app.ProxyRun", first_line: str, then: bytes = b"", credentials: bool = True) -> bytes:
     """
-    ffmpeg opens its own connections, so the connect-time guard never sees
-    where they go. A clip was fetched by ffmpeg, and yt-dlp hands ffmpeg a
-    live stream and any HLS its own downloader cannot read — and each of those
+    One request to the guarded proxy, as ffmpeg makes it, and everything the
+    proxy answers. `then` is spoken through a tunnel once CONNECT is granted.
+    """
+    parts = urlsplit(run.url)
+    lines = [first_line, "Host: siphon.test"]
+    if credentials:
+        token = base64.b64encode(f"{parts.username}:{parts.password}".encode()).decode()
+        lines.append(f"Proxy-Authorization: Basic {token}")
+    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    conn.settimeout(10)
+    # A number: nothing for the guard to look up.
+    conn.connect(("127.0.0.1", parts.port))
+    try:
+        conn.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        answer = b""
+        if then:
+            while b"\r\n\r\n" not in answer and (chunk := conn.recv(4096)):
+                answer += chunk
+            conn.sendall(then)
+        while chunk := conn.recv(65536):
+            answer += chunk
+        return answer
+    finally:
+        conn.close()
+
+
+class TestTheGuardedProxy:
+    """
+    What ffmpeg is pointed at. Every connection it asks for is opened the
+    way this process opens its own — through the guard — and one the guard
+    refuses is a 403, whether it is a tunnel for https or a plain request.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _guarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", False)
+        monkeypatch.setattr(server_app, "EXEMPT_HOSTS", frozenset())
+
+    @pytest.fixture()
+    def local(self) -> Iterator[tuple[str, list[tuple[str, str | None]]]]:
+        """Something listening on loopback, and what it was asked for."""
+        hits: list[tuple[str, str | None]] = []
+
+        class Local(_Quiet):
+            def do_GET(self) -> None:  # noqa: N802
+                hits.append((self.path, self.headers.get("Via")))
+                if self.path == "/away":
+                    self.send_response(302)
+                    self.send_header("Location", "http://127.0.0.3:9/secret")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", "6")
+                self.end_headers()
+                self.wfile.write(b"local!")
+
+        with _serving(Local) as base:
+            yield base, hits
+
+    @pytest.mark.parametrize(
+        "ask",
+        [
+            "CONNECT {loopback} HTTP/1.1",
+            "GET http://{loopback}/x HTTP/1.1",
+            "CONNECT 169.254.169.254:80 HTTP/1.1",
+            "GET http://169.254.169.254/latest/meta-data/ HTTP/1.1",
+            "CONNECT 10.0.0.1:443 HTTP/1.1",
+            "GET http://192.168.1.1/ HTTP/1.1",
+            "CONNECT [::1]:443 HTTP/1.1",
+        ],
+    )
+    def test_a_private_address_is_refused_either_way(self, local, ask: str) -> None:  # noqa: ANN001
+        base, hits = local
+        with server_app.proxy_run() as run:
+            answer = _ask_proxy(run, ask.format(loopback=urlsplit(base).netloc))
+            assert run.refused
+        assert answer.split(b"\r\n", 1)[0].split()[1] == b"403", answer
+        assert hits == []
+
+    def test_an_exempt_address_is_reachable_on_its_port_and_no_other(self, local, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+        """The provider and the operator's proxy, as everywhere else in the server."""
+        base, hits = local
+        port = urlsplit(base).port
+        monkeypatch.setattr(server_app, "EXEMPT_HOSTS", frozenset({("127.0.0.1", port)}))
+        with server_app.proxy_run() as run:
+            plain = _ask_proxy(run, f"GET {base}/plain HTTP/1.1")
+            tunnelled = _ask_proxy(run, f"CONNECT 127.0.0.1:{port} HTTP/1.1", then=b"GET /tunnelled HTTP/1.0\r\n\r\n")
+            other = _ask_proxy(run, f"CONNECT 127.0.0.1:{port + 1 if port < 65535 else port - 1} HTTP/1.1")
+        assert plain.startswith(b"HTTP/1.0 200") and plain.endswith(b"local!"), plain
+        assert tunnelled.startswith(b"HTTP/1.1 200") and tunnelled.endswith(b"local!"), tunnelled
+        assert other.split()[1] == b"403", other
+        # A proxy says so on what it forwards; through a tunnel it cannot.
+        assert hits == [("/plain", "1.1 siphon"), ("/tunnelled", None)]
+
+    def test_a_redirect_is_carried_back_and_its_hop_checked(self, local, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+        """ffmpeg follows it with a request of its own, and that is checked like the first."""
+        base, hits = local
+        monkeypatch.setattr(server_app, "EXEMPT_HOSTS", frozenset({("127.0.0.1", urlsplit(base).port)}))
+        with server_app.proxy_run() as run:
+            redirect = _ask_proxy(run, f"GET {base}/away HTTP/1.1")
+            assert not run.refused
+            location = next(line for line in redirect.decode().split("\r\n") if line.lower().startswith("location:")).split(" ", 1)[1]
+            hop = _ask_proxy(run, f"GET {location} HTTP/1.1")
+            assert run.refused
+        assert redirect.startswith(b"HTTP/1.0 302"), redirect
+        assert hop.split()[1] == b"403", hop
+        assert [path for path, _via in hits] == ["/away"]
+
+    def test_nothing_is_carried_for_a_run_it_did_not_start(self, local, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+        """
+        ffmpeg sends its pass once asked for it. Anything else on this
+        machine that finds the port has none, and is not a way out.
+        """
+        base, hits = local
+        monkeypatch.setattr(server_app, "EXEMPT_HOSTS", frozenset({("127.0.0.1", urlsplit(base).port)}))
+        with server_app.proxy_run() as run:
+            answer = _ask_proxy(run, f"GET {base}/x HTTP/1.1", credentials=False)
+        assert answer.split()[1] == b"407", answer
+        assert b'proxy-authenticate: basic realm="siphon"' in answer.lower()
+        with server_app.proxy_run() as run:
+            pass
+        assert _ask_proxy(run, f"GET {base}/x HTTP/1.1").split()[1] == b"407"
+        assert hits == []
+
+    def test_a_revoked_run_is_cut_off(self, local, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+        """How a cancelled download stops an ffmpeg that is still going."""
+        base, _hits = local
+        port = urlsplit(base).port
+        monkeypatch.setattr(server_app, "EXEMPT_HOSTS", frozenset({("127.0.0.1", port)}))
+        with server_app.proxy_run() as run:
+            parts = urlsplit(run.url)
+            token = base64.b64encode(f"{parts.username}:{parts.password}".encode()).decode()
+            tunnel = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tunnel.settimeout(10)
+            tunnel.connect(("127.0.0.1", parts.port))
+            try:
+                tunnel.sendall(f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\nProxy-Authorization: Basic {token}\r\n\r\n".encode())
+                assert tunnel.recv(4096).startswith(b"HTTP/1.1 200")
+                run.revoke()
+                assert tunnel.recv(4096) == b""
+            finally:
+                tunnel.close()
+            assert _ask_proxy(run, f"GET {base}/x HTTP/1.1").split()[1] == b"403"
+
+
+@needs_ffmpeg
+class TestFfmpegFetchesThroughTheGuard:
+    """
+    ffmpeg opens its own connections, so the connect-time guard never saw
+    where they went. A clip is fetched by ffmpeg, and yt-dlp hands it a live
+    stream and any HLS its own downloader cannot read — and each of those
     went wherever the playlist or a redirect said, into a finished file.
+    Now ffmpeg is pointed at the guarded proxy, and every connection it
+    makes, each redirect's included, is checked there.
 
     127.0.0.3 stands for the private network here, and the rest of loopback
-    for the internet.
+    for the internet. What the public host is asked through the proxy
+    carries its Via header, which is how these know the proxy was used.
     """
 
     PRIVATE = "127.0.0.3"
 
     @pytest.fixture()
-    def network(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sample_mp4: bytes) -> Iterator[tuple[str, list[str]]]:
+    def network(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sample_mp4: bytes) -> Iterator[tuple[str, list[str], list[str]]]:
         monkeypatch.setattr(server_app, "refused_address", lambda raw: str(raw) == self.PRIVATE)
         monkeypatch.setattr(server_app, "EXEMPT_HOSTS", frozenset())
         monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", False)
-        monkeypatch.setattr(server_app, "DOWNLOAD_ROOT", tmp_path)
+        monkeypatch.setattr(server_app, "BEHIND_A_PROXY", False)
+        monkeypatch.setattr(server_app, "DOWNLOAD_ROOT", tmp_path / "jobs")
+        (tmp_path / "jobs").mkdir()
+        # A file on this machine, where another job's download would be.
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "sample.mp4").write_bytes(sample_mp4)
+        _ffmpeg("-i", str(elsewhere / "sample.mp4"), "-c", "copy", "-f", "mpegts", str(elsewhere / "secret.ts"))
         hits: list[str] = []
+        proxied: list[str] = []
 
         class Private(_Quiet):
             def do_GET(self) -> None:  # noqa: N802
@@ -1620,15 +1872,30 @@ class TestFfmpegNeverFetches:
             playlists = {
                 "/vod.m3u8": f"{head}#EXTINF:2.0,\n{private}/vod.ts\n#EXT-X-ENDLIST\n",
                 "/sample-aes.m3u8": f'{head}#EXT-X-KEY:METHOD=SAMPLE-AES,URI="{private}/key"\n#EXTINF:2.0,\n{private}/sample-aes.ts\n#EXT-X-ENDLIST\n',
-                "/live.m3u8": f"{head}#EXTINF:2.0,\n{private}/live.ts\n",
+                "/local.m3u8": f"{head}#EXTINF:2.0,\nfile://{elsewhere / 'secret.ts'}\n#EXT-X-ENDLIST\n",
             }
+            segment = (elsewhere / "secret.ts").read_bytes()
+            on_air = time.monotonic()
+
+            def live() -> str:
+                # A stream that does not end: a new segment every two
+                # seconds, and every other one on the private network.
+                first = int((time.monotonic() - on_air) / 2)
+                listed = "".join(f"#EXTINF:2.0,\n{private if n % 2 else ''}/live/{n}.ts\n" for n in range(first, first + 3))
+                return head.replace("SEQUENCE:0", f"SEQUENCE:{first}") + listed
 
             class Public(_Quiet):
                 def do_GET(self) -> None:  # noqa: N802
-                    if self.path in playlists:
+                    if self.headers.get("Via"):
+                        proxied.append(self.path)
+                    if self.path == "/live.m3u8":
+                        body, kind = live().encode(), "application/vnd.apple.mpegurl"
+                    elif self.path.startswith("/live/"):
+                        body, kind = segment, "video/mp2t"
+                    elif self.path in playlists:
                         body, kind = playlists[self.path].encode(), "application/vnd.apple.mpegurl"
-                    elif self.headers.get("Icy-MetaData"):
-                        # Only ffmpeg asks for Icy metadata; this host sends
+                    elif self.path == "/redirects.mp4" and self.headers.get("Icy-MetaData"):
+                        # Only ffmpeg asks for Icy metadata; this file sends
                         # ffmpeg, and only ffmpeg, somewhere else.
                         self.send_response(302)
                         self.send_header("Location", f"{private}/progressive.mp4")
@@ -1643,30 +1910,106 @@ class TestFfmpegNeverFetches:
                     self.wfile.write(body)
 
             with _serving(Public) as public:
-                yield public, hits
+                yield public, hits, proxied
 
     @pytest.mark.parametrize(
-        ("path", "clip", "state"),
+        ("path", "clip"),
         [
-            ("/vod.m3u8", (0.0, 1.0), "error"),
-            ("/sample-aes.m3u8", None, "error"),
-            ("/live.m3u8", None, "error"),
-            ("/v.mp4", (0.0, 1.0), "done"),
+            ("/vod.m3u8", (0.0, 1.0)),
+            ("/sample-aes.m3u8", None),
+            ("/redirects.mp4", (0.0, 1.0)),
         ],
-        ids=["clip-of-hls", "sample-aes", "live", "clip-of-a-file-that-redirects-ffmpeg"],
+        ids=["clip-of-hls", "sample-aes", "clip-of-a-file-that-redirects-ffmpeg"],
     )
-    def test_nothing_reaches_the_private_network(self, network, path: str, clip, state: str) -> None:  # noqa: ANN001
-        public, hits = network
+    def test_nothing_reaches_the_private_network(self, network, path: str, clip) -> None:  # noqa: ANN001
+        public, hits, proxied = network
         start, end = clip or (None, None)
         job = _run(public + path, clip_start=start, clip_end=end)
         assert hits == []
-        assert job.state == state, job.error
+        assert path in proxied, "ffmpeg did not go through the proxy"
+        # ffmpeg only says it failed; the proxy knows why.
+        assert (job.state, job.error) == ("error", server_app.PRIVATE_ADDRESS_MESSAGE)
 
-    @pytest.mark.parametrize("path", ["/sample-aes.m3u8", "/live.m3u8"])
-    def test_what_only_ffmpeg_could_fetch_is_refused_with_the_reason(self, network, path: str) -> None:  # noqa: ANN001
-        public, _hits = network
-        job = _run(public + path)
-        assert job.error == server_app.FFMPEG_FETCH_REFUSED
+    @pytest.mark.parametrize("no_proxy", ["*", "localhost,127.0.0.1,127.0.0.3"])
+    def test_no_proxy_is_no_way_around_the_proxy(self, network, monkeypatch: pytest.MonkeyPatch, no_proxy: str) -> None:  # noqa: ANN001
+        """
+        ffmpeg connects straight to every host no_proxy names, and a
+        container's names loopback often enough, or everything.
+        """
+        public, hits, proxied = network
+        monkeypatch.setenv("no_proxy", no_proxy)
+        monkeypatch.setenv("NO_PROXY", no_proxy)
+        job = _run(public + "/redirects.mp4", clip_start=0.0, clip_end=1.0)
+        assert hits == []
+        assert "/redirects.mp4" in proxied
+        assert (job.state, job.error) == ("error", server_app.PRIVATE_ADDRESS_MESSAGE)
+
+    @pytest.mark.parametrize("private_hosts", [False, True], ids=["guarded", "private-hosts-allowed"])
+    def test_a_playlist_cannot_name_a_file_on_this_machine(self, network, monkeypatch: pytest.MonkeyPatch, private_hosts: bool) -> None:  # noqa: ANN001
+        """
+        ffmpeg is told which protocols it may open, before every input.
+
+        A playlist from http already cannot name file: — ffmpeg's http gives
+        what it opens a list of its own without it — so the job failing says
+        nothing about the list this server passes. That list is what drops
+        rtp and udp, which ffmpeg's own allows and which would open sockets
+        the proxy never sees, and it holds whatever protocol the input starts
+        on. So it is the command that is checked. Allowing private hosts is
+        about addresses, and lifts none of it.
+        """
+        public, _hits, proxied = network
+        monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", private_hosts)
+        started: list[list[str]] = []
+
+        class Recording(server_app._ProxiedPopen):
+            def __init__(self, args: Any, *remaining: Any, **kwargs: Any) -> None:
+                started.append([str(arg) for arg in args])
+                super().__init__(args, *remaining, **kwargs)
+
+        monkeypatch.setattr(server_app.external_downloaders, "Popen", Recording)
+        job = _run(public + "/local.m3u8", clip_start=0.0, clip_end=1.0)
+        assert ("/local.m3u8" in proxied) is not private_hosts
+        assert job.state == "error"
+        commands = [args for args in started if "-i" in args]
+        assert commands, "ffmpeg was never started"
+        for args in commands:
+            for index in (n for n, arg in enumerate(args) if arg == "-i"):
+                assert args[index - 2 : index] == ["-protocol_whitelist", server_app.FFMPEG_PROTOCOLS], args
+
+    def test_a_live_stream_goes_through_the_proxy_and_stops_when_cancelled(self, network) -> None:  # noqa: ANN001
+        """
+        Refused while ffmpeg's connections went unchecked; recorded now,
+        with its private segments refused. ffmpeg tells yt-dlp nothing until
+        it is done, which for a live stream is whenever the stream ends, so
+        a cancelled one kept recording — holding a download slot throughout.
+        """
+        public, hits, proxied = network
+        job = server_app.Job(id=uuid.uuid4().hex[:16], url=public + "/live.m3u8", preset="video_best")
+        worker = threading.Thread(target=server_app.run_job, args=(job,), daemon=True)
+        worker.start()
+        deadline = time.monotonic() + 20
+        while not any(path.startswith("/live/") for path in proxied) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert "/live.m3u8" in proxied and any(path.startswith("/live/") for path in proxied), job.error
+        # Long enough to have been offered a private segment.
+        time.sleep(2.5)
+        job.cancelled = True
+        worker.join(timeout=15)
+        assert not worker.is_alive(), "ffmpeg kept recording a cancelled live stream"
+        assert hits == []
+        assert not job.directory.exists()
+
+    def test_behind_the_operators_proxy_ffmpeg_is_still_refused(self, network, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+        """
+        Pointed at this server's proxy, ffmpeg would go around the one the
+        operator configured; pointed at theirs, around the guard. So there
+        it stays refused, as it was before the proxy.
+        """
+        public, hits, proxied = network
+        monkeypatch.setattr(server_app, "BEHIND_A_PROXY", True)
+        job = _run(public + "/redirects.mp4", clip_start=0.0, clip_end=1.0)
+        assert (job.state, job.error) == ("error", server_app.FFMPEG_BEHIND_A_PROXY)
+        assert hits == [] and proxied == []
 
     @pytest.mark.parametrize(
         ("preset", "ext", "start", "end"),
@@ -1679,12 +2022,145 @@ class TestFfmpegNeverFetches:
         ids=["video", "audio", "to-the-end", "from-the-start"],
     )
     def test_a_clip_is_still_a_clip(self, network, preset: str, ext: str, start: float | None, end: float | None) -> None:  # noqa: ANN001
-        """Four seconds in, one second out, cut from the file on disk."""
-        public, _hits = network
+        """Four seconds in, one second out, fetched by ffmpeg through the proxy."""
+        public, hits, proxied = network
         job = _run(public + "/v.mp4", preset=preset, clip_start=start, clip_end=end)
         assert job.state == "done", job.error
         assert job.filename.endswith(ext)
-        assert 0.8 <= _duration(job.directory / job.filename) <= 1.5
+        assert 0.8 <= _duration(job.directory / job.filename) <= 1.2
+        assert "/v.mp4" in proxied
+        assert hits == []
+
+    def test_what_ffmpeg_does_after_the_download_it_does_to_files_on_disk(self, network, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+        """
+        Only the downloader is handed a URL. The postprocessors — the
+        merge, the audio extraction, the tags, the cover, the subtitles —
+        run ffmpeg too, on what is already in the job's directory; yt-dlp
+        passes an http(s) name to ffmpeg as it is, so one handed a URL
+        would fetch it, with nothing in between.
+        """
+        public, _hits, _proxied = network
+        ffmpeg_pp = server_app.yt_dlp.postprocessor.FFmpegPostProcessor
+        real = ffmpeg_pp._ffmpeg_filename_argument
+        named: list[str] = []
+
+        def recording(name: str) -> str:
+            named.append(name)
+            return real(name)
+
+        monkeypatch.setattr(ffmpeg_pp, "_ffmpeg_filename_argument", staticmethod(recording))
+        job = _run(public + "/v.mp4", preset="audio_m4a", clip_start=1.0, clip_end=2.0)
+        assert job.state == "done", job.error
+        assert named
+        assert all(Path(name).resolve().is_relative_to(job.directory.resolve()) for name in named), named
+
+
+@needs_ffmpeg
+@pytest.mark.skipif(not shutil.which("openssl"), reason="needs openssl for a certificate")
+@pytest.mark.parametrize("path", ["/v.mp4", "/hop"], ids=["a-clip", "a-redirect-to-the-private-network"])
+def test_https_is_tunnelled_and_each_hop_checked(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sample_mp4: bytes, path: str) -> None:
+    """
+    ffmpeg speaks https through the proxy with CONNECT, and a tunnel is all
+    the proxy sees of it: the host and the port, checked before it opens. A
+    redirect is a CONNECT of its own, and checked the same way.
+    """
+    from yt_dlp.extractor.common import InfoExtractor
+
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=127.0.0.1",
+         "-keyout", str(tmp_path / "key.pem"), "-out", str(tmp_path / "cert.pem")],
+        check=True, capture_output=True,
+    )
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(tmp_path / "cert.pem", tmp_path / "key.pem")
+    monkeypatch.setattr(server_app, "refused_address", lambda raw: str(raw) == "127.0.0.3")
+    monkeypatch.setattr(server_app, "EXEMPT_HOSTS", frozenset())
+    monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", False)
+    monkeypatch.setattr(server_app, "BEHIND_A_PROXY", False)
+    monkeypatch.setattr(server_app, "DOWNLOAD_ROOT", tmp_path)
+    tunnels: list[str] = []
+    connect = server_app.GuardedProxy.do_CONNECT
+
+    def watched(handler: "server_app.GuardedProxy") -> None:
+        tunnels.append(handler.path)
+        connect(handler)
+
+    monkeypatch.setattr(server_app.GuardedProxy, "do_CONNECT", watched)
+    hits: list[str] = []
+
+    class Private(_Quiet):
+        def do_GET(self) -> None:  # noqa: N802
+            hits.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(sample_mp4)))
+            self.end_headers()
+            self.wfile.write(sample_mp4)
+
+    with _serving(Private, "127.0.0.3", tls) as private:
+
+        class Media(_Quiet):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/hop":
+                    self.send_response(302)
+                    self.send_header("Location", f"{private}/secret.mp4")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                # A CDN's answer to a range: ffmpeg seeks back for the index
+                # at the end of the file.
+                first = int(self.headers.get("Range", "bytes=0-")[6:].split("-")[0] or 0)
+                self.send_response(206 if first else 200)
+                self.send_header("Accept-Ranges", "bytes")
+                if first:
+                    self.send_header("Content-Range", f"bytes {first}-{len(sample_mp4) - 1}/{len(sample_mp4)}")
+                self.send_header("Content-Length", str(len(sample_mp4) - first))
+                self.end_headers()
+                self.wfile.write(sample_mp4[first:])
+
+        with _serving(Media, tls=tls) as media:
+
+            class SecureIE(InfoExtractor):
+                _VALID_URL = r"https://secure\.example/v/(?P<id>\w+)"
+
+                def _real_extract(self, url: str) -> dict:
+                    return {
+                        "id": self._match_id(url),
+                        "title": "Over TLS",
+                        "formats": [{"format_id": "mp4", "url": media + path, "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}],
+                    }
+
+            _with_extractors(monkeypatch, SecureIE)
+            job = _run("https://secure.example/v/abc", clip_start=1.0, clip_end=2.0)
+    assert urlsplit(media).netloc in tunnels
+    assert hits == []
+    if path == "/hop":
+        assert urlsplit(private).netloc in tunnels
+        assert (job.state, job.error) == ("error", server_app.PRIVATE_ADDRESS_MESSAGE)
+    else:
+        assert job.state == "done", job.error
+        assert 0.8 <= _duration(job.directory / job.filename) <= 1.2
+
+
+@pytest.mark.parametrize("name", ["FFMPEG_FETCH_REFUSED", "FFMPEG_BEHIND_A_PROXY", "PRIVATE_ADDRESS_MESSAGE"])
+def test_a_refusal_reaches_the_page_as_it_was_written(name: str) -> None:
+    """Anything saying "ffmpeg" and "not" is otherwise read as "ffmpeg is missing"."""
+    message = getattr(server_app, name)
+    assert server_app.humanize_error(Exception(f"ERROR: {message}"), "https://cdn.example/v.mp4") == message
+
+
+def test_ffmpeg_is_not_handed_what_the_proxy_cannot_carry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    rtmp, rtsp and the rest are ffmpeg's own protocols, spoken over sockets
+    the proxy never sees. The format check refuses them first; this is the
+    downloader refusing them too, for whatever reaches it another way.
+    """
+    import re as _re
+
+    monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", False)
+    with server_app.yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+        downloader = server_app.FFmpegFD(ydl, ydl.params)
+        with pytest.raises(server_app.yt_dlp.utils.DownloadError, match=_re.escape(server_app.FFMPEG_FETCH_REFUSED)):
+            downloader.real_download(str(tmp_path / "live.flv"), {"id": "x", "url": "rtmp://10.0.0.1/live/stream", "protocol": "rtmp", "ext": "flv"})
 
 
 @needs_ffmpeg
@@ -1858,6 +2334,67 @@ def test_the_tunnel_sends_the_cookies_the_resolve_relied_on(client: TestClient, 
             assert seen["elsewhere"] == [None]
 
 
+def test_the_tunnel_never_carries_the_uploaded_session(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    The jar a resolve reads also holds the uploaded cookies.txt. A grant is
+    for a whole host, so granting those let anyone who can resolve a page
+    with a video on a cookie domain read any page there signed in as the
+    owner. Only what the site set during this extraction goes to the tunnel,
+    and a cookie the file had is kept back even when the site rotated it.
+    """
+    from yt_dlp.extractor.common import InfoExtractor
+
+    seen: list[str | None] = []
+
+    class Victim(_Quiet):
+        def do_GET(self) -> None:  # noqa: N802
+            seen.append(self.headers.get("Cookie"))
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+    with _serving(Victim) as victim:
+
+        class Planted(InfoExtractor):
+            _VALID_URL = r"https://planted\.example/v/(?P<id>\w+)"
+
+            def _real_extract(self, url: str) -> dict:
+                self._set_cookie("127.0.0.1", "sess", "abc")
+                self._set_cookie("127.0.0.1", "rotated", "new")
+                return {
+                    "id": self._match_id(url),
+                    "title": "A video on a host the owner is signed in to",
+                    "formats": [{"format_id": "v", "url": f"{victim}/a.mp4", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}],
+                }
+
+        real = server_app.yt_dlp.YoutubeDL
+
+        class WithPlanted(real):
+            def add_default_info_extractors(self) -> None:
+                self.add_info_extractor(Planted())
+                super().add_default_info_extractors()
+
+        cookies = tmp_path / "cookies.txt"
+        cookies.write_text(
+            "# Netscape HTTP Cookie File\n"
+            "127.0.0.1\tFALSE\t/\tFALSE\t2147483647\tSID\toperator-session-secret\n"
+            "127.0.0.1\tFALSE\t/\tFALSE\t2147483647\trotated\told\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(server_app, "COOKIES_PATH", cookies)
+        monkeypatch.setattr(server_app.yt_dlp, "YoutubeDL", WithPlanted)
+        monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", True)
+        monkeypatch.setattr(server_app, "TUNNEL_HOSTS", {})
+
+        resolved = client.post("/api/resolve", json={"url": "https://planted.example/v/v1"})
+        assert resolved.status_code == 200, resolved.text
+        assert server_app._granted("127.0.0.1").get("Cookie") == "sess=abc"
+        page = client.get("/api/tunnel", params={"url": f"{victim}/account/private-page"})
+        assert page.status_code == 200, page.text
+        assert seen == ["sess=abc"]
+
+
 # --------------------------------------------------------- the event loop
 
 
@@ -1985,11 +2522,13 @@ class TestAPlaylistBehindTheBotWall:
 
 
 @needs_ffmpeg
+@pytest.mark.parametrize("guarded", [True, False], ids=["through-the-proxy", "private-hosts-allowed"])
 @pytest.mark.parametrize("subs", ["embed", "files"])
-def test_a_clips_subtitles_are_the_clips(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sample_mp4: bytes, subs: str) -> None:
+def test_a_clips_subtitles_are_the_clips(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sample_mp4: bytes, subs: str, guarded: bool) -> None:
     """
     The media was cut and the subtitle files were not: a clip from 0:02 had
     the cues of 0:00 as separate files, and a .srt the length of the video.
+    yt-dlp fetches the subtitles whole whichever way the clip is fetched.
     """
     import zipfile
 
@@ -1997,8 +2536,12 @@ def test_a_clips_subtitles_are_the_clips(monkeypatch: pytest.MonkeyPatch, tmp_pa
 
     vtt = "WEBVTT\n\n" + "".join(f"00:00:0{s}.000 --> 00:00:0{s}.900\nsecond {s}\n\n" for s in range(4))
 
+    proxied: list[str] = []
+
     class Site(_Quiet):
         def do_GET(self) -> None:  # noqa: N802
+            if self.headers.get("Via"):
+                proxied.append(self.path)
             body, kind = (vtt.encode(), "text/vtt") if self.path.endswith(".vtt") else (sample_mp4, "video/mp4")
             self.send_response(200)
             self.send_header("Content-Type", kind)
@@ -2006,7 +2549,11 @@ def test_a_clips_subtitles_are_the_clips(monkeypatch: pytest.MonkeyPatch, tmp_pa
             self.end_headers()
             self.wfile.write(body)
 
-    monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", True)
+    if guarded:
+        # Loopback plays the internet.
+        monkeypatch.setattr(server_app, "refused_address", lambda _raw: False)
+        monkeypatch.setattr(server_app, "BEHIND_A_PROXY", False)
+    monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", not guarded)
     monkeypatch.setattr(server_app, "DOWNLOAD_ROOT", tmp_path)
     with _serving(Site) as base:
 
@@ -2024,6 +2571,8 @@ def test_a_clips_subtitles_are_the_clips(monkeypatch: pytest.MonkeyPatch, tmp_pa
         _with_extractors(monkeypatch, SubtitledIE)
         job = _run("https://subtitled.example/v/abc", subs=subs, sub_langs="en", clip_start=2.0, clip_end=3.0)
     assert job.state == "done", job.error
+    # The video through the proxy, when there is a guard; the subtitles by yt-dlp.
+    assert set(proxied) == ({"/v.mp4"} if guarded else set())
     path = job.directory / job.filename
     if subs == "files":
         with zipfile.ZipFile(path) as bundle:
@@ -2112,10 +2661,27 @@ class TestThePhoneAddress:
 
     @staticmethod
     def _lan_urls(client: TestClient, **headers: str) -> list[str]:
-        return client.get("/api/health", headers={"host": "localhost:8000", **headers}).json()["lanUrls"]
+        # A server listening on 8000, as uvicorn tells the app, whatever the
+        # Host header says.
+        listening = TestClient(server_app.app, base_url="http://localhost:8000")
+        return listening.get("/api/health", headers=headers).json()["lanUrls"]
 
     def test_a_server_on_the_lan_names_its_address(self, client: TestClient) -> None:
         assert self._lan_urls(client) == ["http://192.168.1.42:8000"]
+
+    def test_the_port_tried_is_the_one_this_server_listens_on(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        """
+        The Host header is the caller's to write. Trying the port it named
+        made health, which asks for no key, a way to learn which ports this
+        machine listens on at its own private addresses — firewalled ones too.
+        """
+        tried: list[int] = []
+        monkeypatch.setattr(server_app, "answers", lambda _address, port: tried.append(port) or True)
+        assert self._lan_urls(client, host="anything:6379") == ["http://192.168.1.42:8000"]
+        assert tried == [8000]
+        # No port to go by, as on a Unix socket: nothing is tried.
+        assert server_app.lan_urls("http", None, False) == []
+        assert tried == [8000]
 
     def test_a_container_names_none_of_its_own(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(server_app, "lan_addresses", lambda: ["172.17.0.2"])
