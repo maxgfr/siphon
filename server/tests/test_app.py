@@ -17,6 +17,7 @@ import contextlib
 import functools
 import http.server
 import importlib
+import os
 import shutil
 import socket
 import ssl
@@ -25,9 +26,10 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 import pytest
@@ -478,11 +480,15 @@ class TestPlaylists:
         options = server_app.build_options(self._job(), None)
         assert options["noplaylist"] is True
         assert "playlistend" not in options
+        # noplaylist only means something to an extractor that reads it. A
+        # link that is nothing but a list is its first entry, not all of it.
+        assert options["playlist_items"] == "1"
 
     def test_asking_for_the_playlist_lifts_the_restriction(self) -> None:
         options = server_app.build_options(self._job(is_playlist=True), None)
         assert options["noplaylist"] is False
         assert options["playlistend"] == server_app.PLAYLIST_LIMIT
+        assert "playlist_items" not in options
 
     def test_one_dead_video_does_not_abandon_the_rest(self) -> None:
         assert server_app.build_options(self._job(is_playlist=True), None)["ignoreerrors"] is True
@@ -1509,6 +1515,41 @@ class TestTunnelRedirects:
             for server in (target, first):
                 server.shutdown()
 
+    def test_the_host_the_redirects_ended_on_is_carried_too(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        """
+        The page resolves a redirected playlist's links against where it
+        landed, and a load balancer lands it on another host: every segment
+        was then refused as a host this server never resolved, though the
+        tunnel had just been sent there by one it had.
+        """
+        class Edge(_Quiet):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.headers.get("Host", "").startswith("127.0.0.1"):
+                    self.send_response(302)
+                    self.send_header("Location", f"http://localhost:{self.server.server_address[1]}{self.path}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = b"#EXTM3U\n#EXTINF:2.0,\nseg0.ts\n#EXT-X-ENDLIST\n" if self.path.endswith(".m3u8") else b"\x47" * 188
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", True)
+        monkeypatch.setattr(server_app, "TUNNEL_HOSTS", {})
+        server_app._grant_host("http://127.0.0.1/", {"Cookie": "a=1"})
+        with _serving(Edge) as base:
+            playlist = client.get("/api/tunnel", params={"url": f"{base}/v/index.m3u8"})
+            assert playlist.status_code == 200
+            landed = playlist.headers["x-siphon-final-url"]
+            assert urlsplit(landed).hostname == "localhost"
+            segment = client.get("/api/tunnel", params={"url": urljoin(landed, "seg0.ts")})
+            assert segment.status_code == 200, segment.text
+            assert segment.content == b"\x47" * 188
+        # On the granted host's say-so, and with nothing of its credentials.
+        assert server_app._granted("localhost") == {}
+
 
 class TestCookiesStayDeleted:
     def test_each_run_gets_a_private_copy(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1873,6 +1914,9 @@ class TestFfmpegFetchesThroughTheGuard:
                 "/vod.m3u8": f"{head}#EXTINF:2.0,\n{private}/vod.ts\n#EXT-X-ENDLIST\n",
                 "/sample-aes.m3u8": f'{head}#EXT-X-KEY:METHOD=SAMPLE-AES,URI="{private}/key"\n#EXTINF:2.0,\n{private}/sample-aes.ts\n#EXT-X-ENDLIST\n',
                 "/local.m3u8": f"{head}#EXTINF:2.0,\nfile://{elsewhere / 'secret.ts'}\n#EXT-X-ENDLIST\n",
+                # For yt-dlp's own downloader, which takes HLS with no clip.
+                "/all-private.m3u8": f"{head}#EXTINF:2.0,\n{private}/seg0.ts\n#EXTINF:2.0,\n{private}/seg1.ts\n#EXT-X-ENDLIST\n",
+                "/some-private.m3u8": f"{head}#EXTINF:2.0,\n/seg0.ts\n#EXTINF:2.0,\n{private}/seg1.ts\n#EXTINF:2.0,\n/seg2.ts\n#EXT-X-ENDLIST\n",
             }
             segment = (elsewhere / "secret.ts").read_bytes()
             on_air = time.monotonic()
@@ -1890,7 +1934,7 @@ class TestFfmpegFetchesThroughTheGuard:
                         proxied.append(self.path)
                     if self.path == "/live.m3u8":
                         body, kind = live().encode(), "application/vnd.apple.mpegurl"
-                    elif self.path.startswith("/live/"):
+                    elif self.path.startswith(("/live/", "/seg")):
                         body, kind = segment, "video/mp2t"
                     elif self.path in playlists:
                         body, kind = playlists[self.path].encode(), "application/vnd.apple.mpegurl"
@@ -1928,6 +1972,19 @@ class TestFfmpegFetchesThroughTheGuard:
         assert hits == []
         assert path in proxied, "ffmpeg did not go through the proxy"
         # ffmpeg only says it failed; the proxy knows why.
+        assert (job.state, job.error) == ("error", server_app.PRIVATE_ADDRESS_MESSAGE)
+
+    @pytest.mark.parametrize("path", ["/all-private.m3u8", "/some-private.m3u8"])
+    def test_a_segment_refused_to_yt_dlps_own_downloader_is_said(self, network, path: str) -> None:  # noqa: ANN001
+        """
+        With no clip, HLS goes to yt-dlp's own downloader, which retries a
+        refused segment and then skips it, saying why only on stderr: the
+        job failed as "The downloaded file is empty", or finished a shorter
+        video without a word.
+        """
+        public, hits, _ = network
+        job = _run(public + path)
+        assert hits == []
         assert (job.state, job.error) == ("error", server_app.PRIVATE_ADDRESS_MESSAGE)
 
     @pytest.mark.parametrize("no_proxy", ["*", "localhost,127.0.0.1,127.0.0.3"])
@@ -2251,6 +2308,121 @@ class TestEveryMediaExtension:
             job = _run(f"{base}/clip.{ext}")
         assert job.state == "done", job.error
         assert job.filename.endswith(f".{ext}")
+
+
+@needs_ffmpeg
+class TestWhatAJobHandsOver:
+    """
+    What a job ends with, from real yt-dlp against a site on this machine:
+    one video when one was asked for, the size of the file that is handed
+    over, and the audio of a page that names its artwork relative to itself.
+    """
+
+    @pytest.fixture()
+    def site(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sample_mp4: bytes) -> Iterator[str]:
+        media = tmp_path / "media"
+        media.mkdir()
+        for n in (1, 2, 3):
+            (media / f"clip{n}.mp4").write_bytes(sample_mp4)
+        _ffmpeg("-i", str(media / "clip1.mp4"), "-vframes", "1", str(media / "thumb.jpg"))
+        # A page with three videos on it is a list, and nothing in its
+        # address says which one it is: noplaylist has nothing to go on.
+        (media / "three.html").write_text(
+            "<!doctype html><html><head><title>Three clips</title></head><body>"
+            + "".join(f'<video src="clip{n}.mp4"></video>' for n in (1, 2, 3))
+            + "</body></html>"
+        )
+        (media / "page.html").write_text(
+            '<!doctype html><html><head><meta property="og:title" content="A page and its video" />'
+            '<meta property="og:video" content="/clip1.mp4" /><meta property="og:image" content="/thumb.jpg" />'
+            "</head><body>video</body></html>"
+        )
+        monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", True)
+        monkeypatch.setattr(server_app, "DOWNLOAD_ROOT", tmp_path / "jobs")
+        (tmp_path / "jobs").mkdir()
+        monkeypatch.setattr(server_app, "PLAYLIST_LIMIT", 2)
+        with _serving(functools.partial(_Quiet, directory=str(media))) as base:
+            yield base
+
+    def test_this_one_on_a_link_that_is_only_a_list_is_one_video(self, site: str) -> None:
+        """
+        "This one" is the page's default, and it said "only the video this
+        link points at" while the job fetched every video on the list, past
+        the cap, into a zip.
+        """
+        one = _run(f"{site}/three.html")
+        assert one.state == "done", one.error
+        assert one.filename.endswith(".mp4"), one.filename
+        every = _run(f"{site}/three.html", is_playlist=True)
+        with zipfile.ZipFile(every.directory / every.filename) as bundle:
+            assert len(bundle.namelist()) == server_app.PLAYLIST_LIMIT
+
+    @pytest.mark.parametrize(("path", "preset", "playlist"), [
+        ("/clip1.mp4", "audio_mp3", False),
+        ("/clip1.mp4", "video_best", False),
+        ("/three.html", "video_best", True),
+    ], ids=["mp3-of-a-video", "the-video-itself", "a-playlist-zip"])
+    def test_the_size_shown_is_the_size_of_the_file_handed_over(self, site: str, path: str, preset: str, playlist: bool) -> None:
+        """An MP3 was listed at the size of the video it came from, and a zip at its last track's."""
+        job = _run(site + path, preset=preset, is_playlist=playlist)
+        assert job.state == "done", job.error
+        assert job.total_bytes == (job.directory / job.filename).stat().st_size
+
+    @pytest.mark.parametrize("preset", ["audio_mp3", "audio_m4a"])
+    def test_the_audio_of_a_page_whose_artwork_is_a_relative_link(self, site: str, preset: str) -> None:
+        """
+        The cover is fetched to embed it, and "/thumb.jpg" as the page wrote
+        it is no address: the whole job failed, reported as a link yt-dlp
+        does not recognise, while the video of the same page downloaded.
+        """
+        job = _run(f"{site}/page.html", preset=preset)
+        assert job.state == "done", job.error
+
+    @pytest.mark.parametrize("endpoint", ["/api/probe", "/api/resolve"])
+    def test_the_preview_is_given_the_artworks_whole_address(self, site: str, endpoint: str) -> None:
+        """Relative, the preview asked this server's own origin for it."""
+        body = TestClient(server_app.app).post(endpoint, json={"url": f"{site}/page.html"}).json()
+        assert body["thumbnail"] == f"{site}/thumb.jpg"
+
+
+def test_a_scheme_yt_dlp_cannot_fetch_is_not_an_unrecognised_link() -> None:
+    message = server_app.humanize_error(Exception('ERROR: Unable to handle request: Unsupported url scheme: ""'))
+    assert "does not recognise" not in message
+
+
+def test_the_access_key_never_reaches_the_access_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A download's link carries the key in its query, because the browser's
+    own downloader cannot send a header, and uvicorn logs every path whole:
+    the key was in `docker logs`, and in every log a host keeps.
+    """
+    # The guard is on for this process too, and the server is on loopback.
+    monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", True)
+    with socket.socket() as spare:
+        spare.bind(("127.0.0.1", 0))
+        port = spare.getsockname()[1]
+    env = {**os.environ, "AUTH_TOKEN": "s3cr3t-access-key", "DOWNLOAD_DIR": str(tmp_path)}
+    server = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "server.app:app", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=Path(__file__).resolve().parents[2], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    try:
+        with httpx.Client(trust_env=False, timeout=5) as http:
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    http.get(f"http://127.0.0.1:{port}/api/health")
+                    break
+                except httpx.TransportError:
+                    if time.monotonic() > deadline:
+                        raise
+                    time.sleep(0.2)
+            http.get(f"http://127.0.0.1:{port}/api/jobs/0123456789abcdef/file?key=s3cr3t-access-key")
+    finally:
+        server.terminate()
+        output = server.communicate(timeout=15)[0]
+    assert "/api/jobs/0123456789abcdef/file" in output
+    assert "s3cr3t-access-key" not in output
 
 
 # ------------------------------------------------ the tunnel and a cookie jar

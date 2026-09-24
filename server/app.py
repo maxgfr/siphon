@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator, Literal
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request as UrlRequest, build_opener
 
 import yt_dlp
@@ -1219,9 +1219,35 @@ class PickSubtitle(yt_dlp.postprocessor.PostProcessor):
         return [], info
 
 
+def whole_address(base: str, address: Any) -> Any:
+    """An address as a page wrote it, made whole against the page's own."""
+    return urljoin(base, address) if isinstance(address, str) and address else address
+
+
+class WholeThumbnails(yt_dlp.postprocessor.PostProcessor):
+    """
+    Make every thumbnail's address whole. The generic extractor hands a
+    page's og:image back as the page wrote it, and "/thumb.jpg" is no address
+    to fetch: the audio presets fetch the cover to embed it, and the whole job
+    failed on "Unsupported url scheme" while the video of the same page
+    downloaded.
+    """
+
+    def run(self, info: dict[str, Any]):
+        base = info.get("webpage_url") or info.get("original_url") or ""
+        for thumbnail in info.get("thumbnails") or []:
+            thumbnail["url"] = whole_address(base, thumbnail.get("url"))
+        if info.get("thumbnail"):
+            info["thumbnail"] = whole_address(base, info["thumbnail"])
+        return [], info
+
+
 def job_postprocessors(job: Job) -> list[tuple[yt_dlp.postprocessor.PostProcessor, str]]:
     """The steps yt-dlp's options cannot name, each with when it runs."""
-    steps: list[tuple[yt_dlp.postprocessor.PostProcessor, str]] = [(CheckMediaUrls(), "before_dl")]
+    steps: list[tuple[yt_dlp.postprocessor.PostProcessor, str]] = [
+        (WholeThumbnails(), "pre_process"),
+        (CheckMediaUrls(), "before_dl"),
+    ]
     if job.subs != "off" and PRESETS[job.preset]["kind"] == "video":
         # Before anything is fetched, after yt-dlp's own choice is made.
         steps.append((PickSubtitle([lang.strip() for lang in job.sub_langs.split(",") if lang.strip()]), "pre_process"))
@@ -1299,6 +1325,12 @@ def build_options(job: Job, client: str | None) -> dict[str, Any]:
         options["playlistend"] = PLAYLIST_LIMIT
         # One dead video must not abandon the other forty-nine.
         options["ignoreerrors"] = True
+    else:
+        # noplaylist is read only by the extractors that know a video inside
+        # a list (a watch link with &list=). A link that is nothing but a list
+        # — a /playlist?list=, a page with several videos — came back whole,
+        # past the cap and zipped, for "This one": its first entry is the one.
+        options["playlist_items"] = "1"
     cookies = cookie_copy(job.directory)
     if cookies:
         options["cookiefile"] = cookies
@@ -1371,6 +1403,29 @@ def _keep_errors(ydl: yt_dlp.YoutubeDL) -> list[str]:
     return kept
 
 
+def _keep_refusals(ydl: yt_dlp.YoutubeDL) -> list[str]:
+    """
+    Every refusal of the address guard yt-dlp's own downloaders ran into.
+
+    They retry a fragment they could not fetch and then skip it, saying why
+    only on the screen, which is quiet here: an HLS stream whose segments
+    were all on a private address failed as "The downloaded file is empty",
+    and one with a few of them there finished shorter, without a word.
+    Wrapped at the YoutubeDL rather than set per thread, because fragments
+    are fetched by a pool of threads of yt-dlp's own.
+    """
+    kept: list[str] = []
+    screen = ydl.to_screen
+
+    def to_screen(message: Any, *args: Any, **kwargs: Any) -> None:
+        if PRIVATE_ADDRESS_MESSAGE in str(message):
+            kept.append(str(message))
+        screen(message, *args, **kwargs)
+
+    ydl.to_screen = to_screen
+    return kept
+
+
 def _swallowed(errors: list[str], otherwise: str) -> yt_dlp.utils.DownloadError:
     """
     What to fail with when nothing arrived: a bot wall if any item hit one,
@@ -1403,7 +1458,16 @@ def _run_job(job: Job) -> None:
                     for step, when in job_postprocessors(job):
                         ydl.add_post_processor(step, when=when)
                     errors = _keep_errors(ydl)
-                    info = ydl.extract_info(job.url, download=True)
+                    refused = _keep_refusals(ydl)
+                    try:
+                        info = ydl.extract_info(job.url, download=True)
+                    except yt_dlp.utils.DownloadError:
+                        if refused:
+                            raise yt_dlp.utils.DownloadError(PRIVATE_ADDRESS_MESSAGE) from None
+                        raise
+                    if refused and not job.is_playlist:
+                        # A file with holes where the refused segments were.
+                        raise yt_dlp.utils.DownloadError(PRIVATE_ADDRESS_MESSAGE)
                     if info is None:
                         # The playlist itself failed, and ignoreerrors said so
                         # only on stderr.
@@ -1450,6 +1514,10 @@ def _run_job(job: Job) -> None:
                 else:
                     chosen = files[0]
                 job.filename = chosen.name
+                # The progress hook counted the stream it fetched: the video an
+                # MP3 was made from, the last track of a zip. The row shows the
+                # file it hands over.
+                job.total_bytes = chosen.stat().st_size
                 job.progress = 1.0
                 job.stage = "ready"
                 job.finished = time.time()
@@ -1502,7 +1570,9 @@ def humanize_error(exc: Exception, url: str = "") -> str:
         return "That video is unavailable."
     if "members-only" in lowered or "this video is available to" in lowered:
         return "That video is members-only."
-    if "unsupported url" in lowered:
+    # yt-dlp's own words for a link no extractor takes. "Unsupported url
+    # scheme" is a fetch of something that is no address, not the link.
+    if "unsupported url:" in lowered:
         return "yt-dlp does not recognise that link."
     if "is not a valid url" in lowered:
         return "That does not look like a link."
@@ -1571,6 +1641,28 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         sweeper.cancel()
+
+
+class KeyOutOfTheAccessLog(logging.Filter):
+    """
+    Keep the access key out of the access log.
+
+    A finished file's link carries the key in its query, because the
+    browser's own downloader cannot send a header, and uvicorn logs every
+    path whole: the key was in `docker logs`, in every log store a host
+    keeps, and in any log pasted to someone when asking for help.
+    """
+
+    KEY = re.compile(r"([?&]key=)[^&#\s]*")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(self.KEY.sub(r"\1[redacted]", arg) if isinstance(arg, str) else arg for arg in record.args)
+        return True
+
+
+# uvicorn sets its logging up before it imports this, so the filter stays.
+logging.getLogger("uvicorn.access").addFilter(KeyOutOfTheAccessLog())
 
 
 app = FastAPI(
@@ -1778,11 +1870,14 @@ async def probe(body: ProbeRequest, authorization: str | None = Header(default=N
         if not entries:
             raise HTTPException(status_code=400, detail="That playlist is empty.")
         first = entries[0]
+        # The preview asks for it from the page, where a relative address is
+        # this server's own origin.
+        page = info.get("webpage_url") or url
         return {
             "title": info.get("title") or first.get("title"),
             "uploader": info.get("uploader") or info.get("channel") or first.get("uploader"),
             "duration": None,
-            "thumbnail": info.get("thumbnails", [{}])[-1].get("url") if info.get("thumbnails") else first.get("thumbnail"),
+            "thumbnail": whole_address(page, info.get("thumbnails", [{}])[-1].get("url") if info.get("thumbnails") else first.get("thumbnail")),
             "extractor": info.get("extractor_key"),
             "isLive": False,
             # The UI needs all three: whether to offer the choice at all, how
@@ -1798,7 +1893,7 @@ async def probe(body: ProbeRequest, authorization: str | None = Header(default=N
         "title": info.get("title"),
         "uploader": info.get("uploader") or info.get("channel"),
         "duration": info.get("duration"),
-        "thumbnail": info.get("thumbnail"),
+        "thumbnail": whole_address(info.get("webpage_url") or url, info.get("thumbnail")),
         "extractor": info.get("extractor_key"),
         "isLive": bool(info.get("is_live")),
         "isPlaylist": False,
@@ -2191,7 +2286,7 @@ def resolve_url(url: str) -> dict[str, Any]:
                     "title": info.get("title") or entries[0].get("title"),
                     "uploader": info.get("uploader") or info.get("channel"),
                     "duration": None,
-                    "thumbnail": entries[0].get("thumbnail"),
+                    "thumbnail": whole_address(info.get("webpage_url") or url, entries[0].get("thumbnail")),
                     "extractor": f"{info.get('extractor_key') or 'yt-dlp'} (server, {client or 'default'})",
                     "isLive": False,
                     "formats": [],
@@ -2212,8 +2307,9 @@ def resolve_url(url: str) -> dict[str, Any]:
                     headers["Cookie"] = jar[fmt["url"]]
                 _grant_host(fmt["url"], headers)
             formats = [fmt for fmt, _ in pairs]
-            if info.get("thumbnail"):
-                _grant_host(info["thumbnail"], None)
+            thumbnail = whole_address(info.get("webpage_url") or url, info.get("thumbnail"))
+            if thumbnail:
+                _grant_host(thumbnail, None)
             subtitles = subtitle_tracks(info)
             for track in subtitles:
                 _grant_host(track["url"], info.get("http_headers"))
@@ -2223,7 +2319,7 @@ def resolve_url(url: str) -> dict[str, Any]:
                 "title": info.get("title"),
                 "uploader": info.get("uploader") or info.get("channel"),
                 "duration": info.get("duration"),
-                "thumbnail": info.get("thumbnail"),
+                "thumbnail": thumbnail,
                 "extractor": f"{info.get('extractor_key') or 'yt-dlp'} (server, {client or 'default'})",
                 "isLive": bool(info.get("is_live")),
                 "formats": formats,
@@ -2362,7 +2458,13 @@ async def tunnel(url: str, request: Request, key: str | None = None, authorizati
     # is this server's, so a redirected playlist's relative links would be
     # resolved against the address the page asked for, not the one the
     # playlist lives at. The CORS headers expose it with the rest.
-    passed["X-Siphon-Final-URL"] = getattr(upstream, "url", None) or target
+    passed["X-Siphon-Final-URL"] = final = getattr(upstream, "url", None) or target
+    if (urlparse(final).hostname or "").lower() != host.lower():
+        # The page fetches that playlist's segments from where it landed, and
+        # a load balancer lands it on another host, which no resolve named.
+        # It was reached on the granted host's say-so, as the redirect was, so
+        # it is carried too, with none of that host's credentials.
+        _grant_host(final, None)
     return StreamingResponse(_iter_upstream(upstream), status_code=status, headers=passed)
 
 

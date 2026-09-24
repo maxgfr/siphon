@@ -198,10 +198,12 @@ export async function detectEndpoint(address, key = '', fetchImpl = globalThis.f
           'If the browser asked whether this page may reach apps on this device, allow it.',
       );
     }
+    // A server or a relay that is up but does not name this page leaves out
+    // its CORS header, and looks to the page exactly like nothing there.
     throw new Error(
       page?.protocol === 'https:' && base.startsWith('http://')
         ? 'Blocked: this page is HTTPS and the address is plain HTTP. Browsers refuse mixed content.'
-        : 'Could not reach that address.',
+        : `Could not reach that address. Is it running — and if it is your own server or relay, does its ALLOWED_ORIGINS name this page${page ? ` (${page.origin})` : ''}?`,
     );
   }
   throw new Error('That address answers, but not as a siphon server, a cobalt, Piped or Invidious instance, or a relay.');

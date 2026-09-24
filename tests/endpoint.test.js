@@ -318,6 +318,19 @@ test('a server on this computer that does not answer is not blamed on mixed cont
   });
 });
 
+test('a server anywhere else that does not answer this page is asked about its ALLOWED_ORIGINS too', async () => {
+  // A server that is up but does not name this page leaves out its CORS
+  // header, and every probe fails as if nothing were there: "could not
+  // reach" alone sent the person to check a server that was running.
+  const { fetchImpl } = stub({});
+  await onPage('https://you.github.io', async () => {
+    const error = await detectEndpoint('https://api.example', '', fetchImpl).catch((e) => e);
+    assert.match(error.message, /could not reach/i);
+    assert.match(error.message, /ALLOWED_ORIGINS/);
+    assert.match(error.message, /https:\/\/you\.github\.io/);
+  });
+});
+
 test('the same goes for a download that cannot reach the server', async () => {
   const { ServerBackend } = await import('../web/api.js');
   const realFetch = globalThis.fetch;

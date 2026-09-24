@@ -76,6 +76,19 @@ jobs:
               assert ydl.cache.load("siphon-ci", "probe") == 1, f"yt-dlp cannot keep a cache under HOME={os.environ.get('HOME')}"
           print("cache kept, HOME =", os.environ.get("HOME"))
           EOF
+      # A shell left as PID 1 ignores SIGTERM: every stop sat out the grace
+      # period and ended in a SIGKILL, exit 137, with no shutdown at all.
+      - name: A stop reaches the server, which shuts down cleanly
+        run: |
+          docker run -d --name stop-check siphon:ci
+          sleep 8
+          start=$(date +%s)
+          docker stop stop-check
+          took=$(( $(date +%s) - start ))
+          code=$(docker inspect stop-check -f '{{.State.ExitCode}}')
+          docker rm stop-check
+          echo "stopped in ${took}s, exit code ${code}"
+          test "$took" -lt 5 && test "$code" = 0
 
   # Informative, not gating. A runner is a datacentre IP, and whether YouTube
   # answers one on a given day is YouTube's decision, not this code's. What it

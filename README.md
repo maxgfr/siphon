@@ -274,8 +274,11 @@ that refuse a page. A server **with** ffmpeg takes the whole job; a server
 and converts. The tunnel only fetches hosts a recent resolve produced, with
 the headers that resolve named. A redirect is followed only to a public
 address, and a cookie or key granted to one host never follows it to
-another. What keeps strangers' pages off it is `ALLOWED_ORIGINS` and the
-key, as for the rest of the API.
+another. The host a redirect lands on is carried too, with none of the first
+host's credentials, since a playlist's segments are fetched from where it
+landed. What keeps strangers' pages off it is `ALLOWED_ORIGINS` and the
+key, as for the rest of the API; the key a file link carries in its query
+is kept out of the server's access log.
 
 ### Configuration
 
@@ -288,7 +291,9 @@ origin and the field empties, so the key is not sent to a stranger's
 instance; type the first one back and the key returns. **Test** names the
 address and says what it is, and for an Invidious or Piped instance whether
 it answers this page for a video, before you save. Under **Advanced** are
-yt-dlp's options, applied by your own server to every download it makes.
+yt-dlp's options, applied by your own server to every download it makes, and
+checked on Save the way the server reads them, so a slip is shown beside the
+field rather than failing every download after it.
 With any other helper they are kept, greyed, until one is set, and so they
 are on a server without ffmpeg, which only resolves and leaves the download
 to this device:
@@ -438,15 +443,22 @@ that are yours: the bridge, the relay, the server.
 
 ## What else it does
 
-- **A queue.** Paste, tap, and the box clears for the next link. Each download
+- **A queue.** Paste, tap, and the box clears for the next link; one typed
+  without `https://` is taken with it. Each download
   is a row with its own progress; several run at once; rows survive a reload,
   and a server that does not answer for a moment then is asked again rather
   than given up on. Cancel stops a row where it is, a conversion on the device
   included. The list holds 20 rows: the oldest finished one makes room for a
   new one, never one still running. Saving settings, a new helper included,
-  leaves a running download to finish. A row changes in place as it moves,
+  leaves a running download to finish. More links than your server takes at
+  once wait their turn rather than fail. Closing or reloading the page while
+  a download runs on this device asks first, where the browser allows it:
+  that download lives in the tab. A row changes in place as it moves,
   so a keyboard or a finger on its button stays there, and a screen reader
   is told when a download is ready or has failed.
+- **Away from your server.** With your own server set and out of reach —
+  away from home, the tunnel down — a link this device can read itself is
+  downloaded on it instead, and its row says so.
 - **Several links at once.** Paste a whole list, drop a selection of links on
   the page, or share a message full of them: each becomes its own row, in
   order, at the quality chosen. `Ctrl+V` with nothing focused lands in the
@@ -457,23 +469,26 @@ that are yours: the bridge, the relay, the server.
   the desktop counterpart of the phone's share sheet.
 - **Resume.** A connection that dies at 80% is picked up from 80%. A refusal —
   a 404, a private video — is not retried, because repeating it would only
-  make the same answer arrive later.
+  make the same answer arrive later. A row's **Try again**, once a download
+  has failed, starts it over.
 - **Subtitles.** Off, embedded, or as separate `.srt` files beside the video
   (the last needs your server). Auto-generated captions are included; the
   languages are a preference list, so `fr,en` offered only Japanese gets
   Japanese rather than nothing.
 - **Playlists.** Offered, never assumed: a video inside a playlist stays one
-  video unless you tap **All**. A full server delivers one `.zip`, numbered in
-  playlist order; the device takes them one row each. `PLAYLIST_LIMIT` caps it.
+  video unless you tap **All**, and **This one** of a link that is only a list
+  is its first video. A full server delivers one `.zip`, numbered in
+  playlist order; the device takes them one row each, a YouTube playlist or
+  channel through your server. `PLAYLIST_LIMIT` caps it.
 - **Tagged audio.** MP3 and M4A carry title, artist, date and cover art; an
   `.mp3` link taken as MP3 is not converted, and keeps the tags it came with.
   Video keeps its metadata and chapters.
 
-What the device alone does not do: subtitles for a link that offers none,
-cookies (nowhere safe to put them), sites that build their player in
-JavaScript (yt-dlp has a hand-written extractor for each; the page has four
-general ones), and converting a file above half a gigabyte without warning
-you first — ffmpeg.wasm wants the whole input in memory.
+What the device alone does not do: record a live stream, subtitles for a
+link that offers none, cookies (nowhere safe to put them), sites that build
+their player in JavaScript (yt-dlp has a hand-written extractor for each; the
+page has four general ones), and converting a file above half a gigabyte
+without warning you first — ffmpeg.wasm wants the whole input in memory.
 
 ## Development
 

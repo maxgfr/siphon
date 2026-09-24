@@ -12,7 +12,8 @@
  * hover or a precise tap.
  */
 import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, bundledInfo, privacyNote, describeEndpoint, servesPages, withScheme, phoneRoute } from './api.js';
-import { looksLikeUrl, urlsIn } from './links.js';
+import { asLink, looksLikeUrl, urlsIn } from './links.js';
+import { validateYtdlp, fromAdvanced } from './options.js';
 
 const SETTINGS_KEY = 'siphon:settings';
 const POLL_MS = 700;
@@ -374,7 +375,11 @@ function renderPlaylistNote(info) {
   const note = $('playlistNote');
   if (!note) return;
   if (!wantPlaylist) {
-    note.textContent = 'Only the video this link points at.';
+    // A tab is shown a list only for a link that is nothing but one, and takes
+    // its first video; a server is also shown one for a video inside a list.
+    note.textContent = backend?.supportsPlaylist
+      ? 'Only the video this link points at — or, for a link to the list alone, its first.'
+      : 'Only the first video on the list.';
     return;
   }
   const count = Math.min(info.count, info.limit);
@@ -404,7 +409,7 @@ function showError(error) {
 /** The action bar holds one control: the thing you came to press. */
 function renderAction() {
   const go = $('go');
-  if (go) go.disabled = !looksLikeUrl($('url').value);
+  if (go) go.disabled = !asLink($('url').value);
 }
 
 /* -------------------------------------------------------------------- queue */
@@ -424,8 +429,8 @@ function saveQueue() {
     // The cap is on finished rows; one still running is kept whatever its place.
     localStorage.setItem(
       QUEUE_KEY,
-      JSON.stringify(queue.filter((entry, index) => index < QUEUE_MAX || isActive(entry)).map(({ key, id, url, title, preset, state, error, filename }) => ({
-        key, id, url, title, preset, state, error, filename,
+      JSON.stringify(queue.filter((entry, index) => index < QUEUE_MAX || isActive(entry)).map(({ key, id, url, title, preset, playlist, state, error, filename }) => ({
+        key, id, url, title, preset, playlist, state, error, filename,
       }))),
     );
   } catch {
@@ -435,6 +440,9 @@ function saveQueue() {
 
 const STAGE_TEXT = {
   starting: 'Starting…',
+  // Your server has as many downloads in flight as it takes; this one is
+  // started as soon as it has room.
+  waiting: 'Waiting for your server to have room…',
   // A bar that silently jumps back to zero reads as a bug. Naming the reason
   // turns the same event into the app visibly working around YouTube.
   retrying: 'Retrying — YouTube asked for a login',
@@ -574,6 +582,22 @@ function renderQueue() {
   if (said.length) $('queueStatus').textContent = said.join(' ');
 }
 
+/**
+ * Whether a download lives in this tab: one on this device, or one about to
+ * be. A reload or a closed tab ends it, and the row comes back
+ * "Interrupted"; a server's goes on without the page.
+ */
+const inThisTab = () =>
+  queue.some((entry) => isActive(entry) && (String(entry.id || '').startsWith('b-') || (!entry.id && !backend?.full)));
+
+/** Ask before a reload or a closed tab throws a download on this device away. */
+function guardUnload(event) {
+  if (!inThisTab()) return;
+  event.preventDefault();
+  // What older browsers read instead.
+  event.returnValue = '';
+}
+
 function findEntry(key) {
   return queue.find((entry) => entry.key === key);
 }
@@ -602,9 +626,10 @@ function retryEntry(key) {
   if (!entry) return;
   queue = queue.filter((item) => item !== entry);
   renderQueue();
-  // A row is one video, even when it came from a playlist, so a retry is one
-  // video too — not the whole list again.
-  enqueueOne(entry.url, { preset: entry.preset, title: entry.title });
+  // A device's row is one video, even when it came from a playlist, so its
+  // retry is one video too — not the whole list again. A server's "All" is
+  // one row for the whole list, and its retry is that list again.
+  enqueueOne(entry.url, { preset: entry.preset, title: entry.title, playlist: entry.playlist === true });
 }
 
 /* ----------------------------------------------------------------- running */
@@ -620,6 +645,14 @@ function retryEntry(key) {
 async function enqueue(url, { preset = settings.preset, playlist = wantPlaylist } = {}) {
   const probe = probeOf(url);
   const entries = probe?.entries || [];
+  // "This one" of a link that is nothing but a list: the device is shown a
+  // list only for such a link, which has no video of its own to download.
+  // Its first is the one; asked for the list's address, the job had no
+  // formats to take.
+  if (!playlist && !backend?.supportsPlaylist && probe?.isPlaylist && entries.length > 0) {
+    await enqueueOne(entries[0].url, { preset, title: entries[0].title });
+    return;
+  }
   if (playlist && !backend?.supportsPlaylist && entries.length > 0) {
     for (const entry of entries.slice(0, probe.limit || entries.length)) {
       // eslint-disable-next-line no-await-in-loop -- the queue is the point
@@ -643,6 +676,8 @@ async function enqueueOne(url, { preset = settings.preset, playlist = false, tit
     url,
     title: title || probeOf(url)?.title || url,
     preset,
+    // Kept, so a retry asks for what this asked for: a server's whole list.
+    playlist: Boolean(playlist),
     state: 'starting',
     stage: 'starting',
     progress: 0,
@@ -650,14 +685,30 @@ async function enqueueOne(url, { preset = settings.preset, playlist = false, tit
   queue.unshift(entry);
   trimQueue();
   renderQueue();
+  await startEntry(entry);
+}
 
+/** How long a row waits before asking a busy server again. */
+const BUSY_RETRY_MS = 3000;
+
+/** Start a row's job. A server with no room yet has it wait its turn. */
+async function startEntry(entry) {
+  // Cancelled while it waited: nothing to start.
+  if (!queue.includes(entry)) return;
   try {
-    const started = await backend.start(url, preset, {
-      playlist,
+    const started = await backend.start(entry.url, entry.preset, {
+      playlist: entry.playlist,
       subs: settings.subs,
       subLangs: settings.subLangs,
       ytdlp: { ...DEFAULT_SETTINGS.ytdlp, ...(settings.ytdlp || {}) },
     });
+    // Cancelled while it was being identified: the row is gone, and the job
+    // must go with it, or it runs to the end with nothing to show it or stop
+    // it — the whole video, over mobile data, into storage.
+    if (!queue.includes(entry)) {
+      if (started.kind !== 'direct') backend.cancel?.(started.id);
+      return;
+    }
     if (started.kind === 'direct') {
       // A public instance streams the file itself; there is no job to follow.
       entry.state = 'done';
@@ -668,22 +719,35 @@ async function enqueueOne(url, { preset = settings.preset, playlist = false, tit
     } else {
       entry.id = started.id;
       entry.state = 'running';
+      entry.stage = 'starting';
       startPolling();
     }
   } catch (error) {
+    if (!queue.includes(entry)) return;
+    if (error?.busy) {
+      // Too many downloads in flight on your server: a pasted list longer
+      // than it takes at once failed its last rows while the page said they
+      // were all queued. They wait, and start as the others finish.
+      entry.stage = 'waiting';
+      setTimeout(() => startEntry(entry), BUSY_RETRY_MS);
+      renderQueue();
+      return;
+    }
     entry.state = 'error';
     entry.error = error instanceof BackendError ? error.message : String(error?.message || error);
     if (error instanceof BackendError && error.hint) entry.error += ` ${error.hint}`;
+    // A setting saved before the sheet checked it fails every job, and the
+    // row is where that shows.
+    if (fromAdvanced(entry.error)) entry.error += ' Change it in Settings → Advanced.';
   }
   saveQueue();
   renderQueue();
 }
 
 /**
- * Past the cap, the oldest finished rows go, and never one still running:
- * letting go of it would cancel its download, and a row still starting has no
- * job yet to cancel, so its download would run on with no row. While more
- * than the cap are running the list is simply longer.
+ * Past the cap, the oldest finished rows go, and never one still running or
+ * starting: letting go of it would cancel its download. While more than the
+ * cap are running the list is simply longer.
  */
 function trimQueue() {
   let over = queue.length - QUEUE_MAX;
@@ -700,7 +764,25 @@ function startPolling() {
   pollTimer = setInterval(pollAll, POLL_MS);
 }
 
+/**
+ * One round of polls at a time. The timer does not wait for the last round,
+ * and on mobile data a round takes longer than the interval: the rounds
+ * piled up, every one waiting when the job finished saw it done, and each
+ * handed the file over again — the same download saved two, or sixteen, times.
+ */
+let polling = false;
+
 async function pollAll() {
+  if (polling) return;
+  polling = true;
+  try {
+    await pollOnce();
+  } finally {
+    polling = false;
+  }
+}
+
+async function pollOnce() {
   const active = queue.filter((entry) => entry.id && (entry.state === 'running' || entry.state === 'starting'));
   if (active.length === 0) {
     clearInterval(pollTimer);
@@ -712,6 +794,8 @@ async function pollAll() {
     active.map(async (entry) => {
       try {
         const job = await backend.poll(entry.id);
+        // Cancelled, or settled, while the answer was on its way.
+        if (!queue.includes(entry) || !isActive(entry)) return;
         entry.misses = 0;
         Object.assign(entry, {
           stage: job.stage,
@@ -767,7 +851,8 @@ async function pollAll() {
  */
 function handOver(entry) {
   const href = fileHref(entry.fileUrl);
-  if (!href || (platform.ios && platform.standalone)) return;
+  if (!href || entry.handed || (platform.ios && platform.standalone)) return;
+  entry.handed = true;
 
   const anchor = document.createElement('a');
   anchor.href = href;
@@ -842,8 +927,9 @@ async function refreshBackendLabel() {
     const info = await backend.health();
     label.textContent = info.label;
   } catch (error) {
-    // The helper is not answering. The device still works on its own, so this
-    // is a note on the header, not a wall across the screen.
+    // The helper is not answering. The device still works on its own — with
+    // your server out of reach it takes the links it can read — so this is a
+    // note on the header, not a wall across the screen.
     label.textContent = `${settings.helper.label} unreachable — open settings`;
     showError(error);
   }
@@ -855,8 +941,8 @@ let probeTimer = null;
 
 function scheduleProbe() {
   clearTimeout(probeTimer);
-  const url = $('url').value.trim();
-  if (!looksLikeUrl(url) || !backend?.supportsProbe) {
+  const url = asLink($('url').value);
+  if (!url || !backend?.supportsProbe) {
     renderPreview(null);
     lastProbe = null;
     return;
@@ -875,9 +961,14 @@ async function runProbe(url) {
     probedUrl = url;
     renderPreview(info);
     if (info?.isLive) {
+      // Only your own server records one, and it keeps what it recorded when
+      // the stream ends; a cancel throws it away. This device takes none.
       renderFeedback(
         '<div class="notice"><p><strong>That is a live stream.</strong> ' +
-          'It will keep recording until you stop it, so the file has no natural end.</p></div>',
+          (backend?.full
+            ? 'Your server records it until the stream ends, which may be hours away; cancelling throws the recording away.'
+            : 'This device cannot record one: only your own server, with ffmpeg, can.') +
+          '</p></div>',
       );
     }
   } catch (error) {
@@ -909,6 +1000,9 @@ function openSettings() {
   // it — would leave the list showing nothing. The server takes it as no
   // preference, and so does the sheet.
   if ($('optClient').selectedIndex < 0) $('optClient').value = '';
+  // What the last upload said is not what is stored now; the state beside
+  // the heading is.
+  $('cookiesResult').textContent = '';
   reflectHelper(settings.helper, settings.endpoint);
   renderSuggested();
   $('settings').showModal();
@@ -1001,7 +1095,21 @@ async function renderSuggested() {
  * reads as the sheet not having noticed.
  */
 function reflectHelper(helper, address = '') {
-  setStatus(helper.kind === 'none' ? '' : 'ok', named(address ? hostOf(address) : '', describeEndpoint(helper)));
+  const host = address ? hostOf(address) : '';
+  if (helper.kind === 'siphon' && helper.keyAccepted === false) {
+    // Adopted on a first visit at a server started with a key: it is there,
+    // and nothing goes through it until the key is in. A green "it does
+    // everything" here was followed by every link failing.
+    setStatus('bad', named(host, 'Your server, and it wants an access key — the AUTH_TOKEN it was started with.'));
+    $('cookiesBlock').hidden = true;
+    showPhoneHint(helper, address);
+    scopeYtdlp(null);
+    return;
+  }
+  // The bridge goes first whatever the helper, and is named with it.
+  const bridge = backend?.hasBridge ? bridgeSentence(helper) : '';
+  const text = helper.kind === 'none' && bridge ? bridge : [describeEndpoint(helper), bridge].filter(Boolean).join(' ');
+  setStatus(helper.kind === 'none' && !bridge ? '' : 'ok', named(host, text));
   // Only our own server has a cookie store to write to.
   $('cookiesBlock').hidden = helper.kind !== 'siphon';
   if (helper.kind === 'siphon') setCookieState(helper.hasCookies === true);
@@ -1011,9 +1119,21 @@ function reflectHelper(helper, address = '') {
 
 const named = (host, text) => (host ? `${host} — ${text}` : text);
 
+/** What the settings say about the bridge, which is used ahead of any helper. */
+function bridgeSentence(helper) {
+  const bridge = `the bridge${backend?.bridgeVersion ? ` (${backend.bridgeVersion})` : ''}`;
+  return helper.kind === 'none'
+    ? `Nothing set, and ${bridge} is installed: YouTube and hosts that refuse a page go through it, from this device.`
+    : `${bridge[0].toUpperCase()}${bridge.slice(1)} is installed too, and is used first.`;
+}
+
 function setStatus(kind, text) {
   $('statusDot').className = `dot${kind ? ` ${kind}` : ''}`;
   $('statusText').textContent = text;
+  // The buttons that ask for a verdict sit near the top of a long sheet and
+  // the verdict at its foot: on a phone it was written off-screen, and a tap
+  // on "Use this computer" seemed to do nothing.
+  if ($('settings').open) $('statusText').closest('.status-line')?.scrollIntoView?.({ block: 'nearest' });
 }
 
 function draftSettings() {
@@ -1175,6 +1295,18 @@ function setCookieState(present, note = '') {
   if (note) $('cookiesResult').textContent = note;
 }
 
+/**
+ * Remember whether the saved server holds a session. The sheet draws that
+ * from the saved helper, which only a Save used to write: closed and opened
+ * again after an upload, it said "not set" and hid Remove, over the line
+ * saying the cookies were stored.
+ */
+function keepCookieState(present) {
+  if (settings.helper.kind !== 'siphon' || draftSettings().endpoint !== settings.endpoint) return;
+  settings = { ...settings, helper: { ...settings.helper, hasCookies: present } };
+  saveSettings();
+}
+
 async function uploadCookies(file) {
   const result = $('cookiesResult');
   if (!file) return;
@@ -1188,6 +1320,7 @@ async function uploadCookies(file) {
     // The block is only shown once the address proved to be a siphon server.
     const target = makeBackend({ ...draftSettings(), helper: { kind: 'siphon', label: 'yt-dlp', ffmpeg: true } });
     const info = await target.putCookies(text);
+    keepCookieState(true);
     setCookieState(true, `Stored ${formatBytes(info.bytes)} of cookies. YouTube downloads will use your session.`);
   } catch (error) {
     setCookieState(false, error instanceof BackendError ? error.message : 'Could not store that file.');
@@ -1197,6 +1330,7 @@ async function uploadCookies(file) {
 async function removeCookies() {
   try {
     await makeBackend({ ...draftSettings(), helper: { kind: 'siphon', label: 'yt-dlp', ffmpeg: true } }).dropCookies();
+    keepCookieState(false);
     setCookieState(false, 'Removed.');
   } catch (error) {
     $('cookiesResult').textContent = error instanceof BackendError ? error.message : 'Could not remove them.';
@@ -1332,14 +1466,18 @@ const carriesText = (dt) => Array.from(dt?.types || []).some((type) => type === 
 
 /* --------------------------------------------------------------------- boot */
 
-function readSharedUrl() {
+function readSharedLinks() {
   // Android share-target and plain ?url= links both land here. The shared text
-  // is often "Title https://…", so pull the first URL out of it.
+  // is often "Title https://…", and a message can hold several: every link in
+  // any of the fields, each once. urlsIn, not a bare match: "Look
+  // https://youtu.be/…." shares the sentence's full stop too, and a YouTube
+  // id with a dot on it is no id.
   const params = new URLSearchParams(location.search);
-  // urlsIn, not a bare match: "Look https://youtu.be/…." shares the
-  // sentence's full stop too, and a YouTube id with a dot on it is no id.
-  const candidate = params.get('url') || params.get('text') || params.get('share') || '';
-  return urlsIn(candidate)[0] || '';
+  const links = [];
+  for (const name of ['url', 'text', 'title', 'share']) {
+    for (const link of urlsIn(params.get(name) || '')) if (!links.includes(link)) links.push(link);
+  }
+  return links;
 }
 
 function init() {
@@ -1355,8 +1493,9 @@ function init() {
   renderQueue();
 
   $('go').addEventListener('click', () => {
-    const url = $('url').value.trim();
-    if (!looksLikeUrl(url)) return;
+    // A link typed without its scheme is taken with the one it most likely has.
+    const url = asLink($('url').value);
+    if (!url) return;
     enqueue(url);
     clearInput();
   });
@@ -1405,15 +1544,16 @@ function init() {
       const links = urlsIn(urlInput.value);
       if (links.length === 1) urlInput.value = links[0];
     }
-    $('go') && ($('go').disabled = !looksLikeUrl(urlInput.value));
+    renderAction();
     renderFeedback('');
     scheduleProbe();
   });
   urlInput.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && looksLikeUrl(urlInput.value)) {
+    const link = asLink(urlInput.value);
+    if (event.key === 'Enter' && link) {
       event.preventDefault();
       urlInput.blur();
-      enqueue(urlInput.value.trim());
+      enqueue(link);
       clearInput();
     }
   });
@@ -1499,6 +1639,15 @@ function init() {
 
   $('testConnection').addEventListener('click', testConnection);
   $('saveSettings').addEventListener('click', async () => {
+    // The Advanced options are read the way your server reads them. Saved
+    // as typed, a slip failed every later download, far from where it was made.
+    const problem = validateYtdlp(readYtdlp());
+    if (problem) {
+      $('advanced').open = true;
+      setStatus('bad', `Advanced: ${problem.message}`);
+      $(problem.field).focus();
+      return;
+    }
     // Saving is what settles what the address is; an address that cannot be
     // reached is not saved, and the reason stays on screen.
     const helper = await probeDraft();
@@ -1510,20 +1659,35 @@ function init() {
     renderFeedback('');
     syncSubFields();
     refreshBackendLabel();
+    // The guide says what YouTube needs; with a helper just set, it needs nothing.
+    fillTour();
     scheduleProbe();
   });
 
-  const shared = readSharedUrl();
-  if (shared) {
-    urlInput.value = shared;
+  // One shared link fills the field; a message with several queues them all,
+  // as a paste does, once the queue is back and the helper settled.
+  const shared = readSharedLinks();
+  if (shared.length === 1) {
+    urlInput.value = shared[0];
     urlInput.dispatchEvent(new Event('input'));
+  }
+  if (shared.length) {
     // Keep the shared link out of the address bar, and out of any bookmark
     // or screenshot the user takes afterwards.
     window.history.replaceState(null, '', location.pathname);
   }
 
+  // The bridge says it is there after the page has asked, and what the
+  // header and the guide said before that is out of date.
+  window.addEventListener('siphon:bridge', () => {
+    refreshBackendLabel();
+    fillTour();
+  });
+  // A download on this device lives in this tab.
+  window.addEventListener('beforeunload', guardUnload);
+
   setupInstall();
-  boot(loaded.firstVisit);
+  boot(loaded.firstVisit, shared.length > 1 ? shared : []);
 
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
@@ -1537,7 +1701,7 @@ function init() {
  * against whichever backend is current, and doing that against a provisional
  * one would mark live downloads as gone.
  */
-async function boot(firstVisit) {
+async function boot(firstVisit, shared = []) {
   if (firstVisit) {
     settings.helper = await pickInitialHelper();
     saveSettings();
@@ -1545,6 +1709,8 @@ async function boot(firstVisit) {
     syncSubFields();
   }
   await restoreQueue();
+  // After the restore, which puts back the saved rows in place of these.
+  if (shared.length) enqueueMany(shared);
   refreshBackendLabel();
   setupTour();
   // The site's own relay, if the owner set one up — and nothing else: no
@@ -1605,13 +1771,20 @@ function setupTour() {
 
 async function fillTour() {
   const kind = settings.helper.kind;
-  const host = escapeHtml(hostOf(settings.endpoint));
+  // No address is this page's own origin: the server that served it.
+  const host = escapeHtml(hostOf(settings.endpoint) || location.host);
   const status = $('tourYoutube');
   const options = $('tourOptions');
   let text;
   let settled = false;
-  if (kind === 'siphon') {
+  if (kind === 'siphon' && settings.helper.keyAccepted === false) {
+    text = `Your server at <strong>${host}</strong> handles YouTube, playlists and subtitles once it has its access key: add it in settings.`;
+    settled = true;
+  } else if (kind === 'siphon') {
     text = `<strong>Ready.</strong> Your server at <strong>${host}</strong> handles YouTube, playlists and subtitles.`;
+    settled = true;
+  } else if (kind === 'none' && backend?.hasBridge) {
+    text = '<strong>Ready.</strong> The bridge fetches YouTube, and any host that refuses a page, from this device.';
     settled = true;
   } else if (kind === 'relay') {
     text = `<strong>Ready.</strong> YouTube goes through the relay at <strong>${host}</strong>; everything else stays on this device.`;

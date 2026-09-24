@@ -43,8 +43,10 @@ const INV_PORT = 8789;
 const PIPED_PORT = 8792;
 const COBALT_PORT = 8793;
 const OWN_PORT = 8794;
+const FULL_PORT = 8797;
 const MEDIA = `http://127.0.0.1:${MEDIA_PORT}`;
 const OWN = `http://127.0.0.1:${OWN_PORT}`;
+const FULL = `http://127.0.0.1:${FULL_PORT}`;
 const INV = `http://127.0.0.1:${INV_PORT}`;
 const PIPED = `http://127.0.0.1:${PIPED_PORT}`;
 const COBALT = `http://127.0.0.1:${COBALT_PORT}`;
@@ -153,6 +155,8 @@ const TYPES = {
 const flaky = { asks: [], cut: false, downUntil: 0, refused: 0 };
 /** How many times the slow route has been asked for its bytes. */
 const slow = { gets: 0 };
+/** What the delayed route was asked, as each request arrived. */
+const delayed = { asks: [] };
 
 function serve(root, port, prefix) {
   const server = createServer((request, response) => {
@@ -220,6 +224,19 @@ function serve(root, port, prefix) {
         response.writeHead(200, { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': size });
       }
       return createReadStream(source, { start: from }).pipe(response);
+    }
+
+    // A host that takes three seconds over every answer, so a download sits
+    // in "Starting…" while the link is identified.
+    if (path.endsWith('/delayed.mp4')) {
+      delayed.asks.push(request.method);
+      const source = join(root, '/media/clip.mp4');
+      setTimeout(() => {
+        response.writeHead(200, { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': statSync(source).size });
+        if (request.method === 'HEAD') return response.end();
+        return createReadStream(source).pipe(response);
+      }, 3000);
+      return undefined;
     }
 
     // A download slow enough to be interrupted: 64 KB every 200 ms, 4 MB
@@ -294,7 +311,7 @@ function serveInvidious(port) {
       if (video[1] === 'PRIVATEvid0') return json(response, 500, { error: 'This video is private' });
       const media = local ? '/videoplayback?expire=1&itag=18' : 'https://rr1---sn-example.googlevideo.com/videoplayback?itag=18';
       return json(response, 200, {
-        title: 'A clip through Invidious', videoId: video[1], author: 'the fixture', lengthSeconds: 6, liveNow: false,
+        title: 'A clip through Invidious', videoId: video[1], author: 'the fixture', lengthSeconds: 6, liveNow: video[1] === 'LIVEstream0',
         videoThumbnails: [{ quality: 'medium', url: `/vi/${video[1]}/mqdefault.jpg`, width: 320, height: 180 }],
         formatStreams: [{ url: media, itag: '18', type: 'video/mp4; codecs="avc1.42001E, mp4a.40.2"', quality: 'medium', bitrate: '600000', container: 'mp4', encoding: 'h264', qualityLabel: '360p', resolution: '360p', size: '640x360', fps: 25 }],
         adaptiveFormats: [],
@@ -465,7 +482,8 @@ const ownHealth = { lanUrls: [], ytClients: ['android_vr', 'mweb', 'tv', 'web', 
 /**
  * Your own server, started with AUTH_TOKEN, as far as the settings sheet can
  * tell: health answers everyone and says a key is wanted, and the gated
- * check takes only the right one. Nothing is downloaded through it here.
+ * check takes only the right one. Nothing is downloaded through it here. It
+ * serves the page as well, as the image does, for a first visit to it.
  */
 function serveSiphon(port) {
   const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS' };
@@ -474,11 +492,90 @@ function serveSiphon(port) {
   const server = createServer((request, response) => {
     const url = new URL(request.url, 'http://x');
     if (request.method === 'OPTIONS') return response.writeHead(204, cors).end();
+    if (!url.pathname.startsWith('/api/')) {
+      const file = join(WEB, url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname));
+      if (!file.startsWith(WEB) || !existsSync(file) || statSync(file).isDirectory()) return response.writeHead(404).end();
+      return response.writeHead(200, { 'Content-Type': TYPES[extname(file)] || 'application/octet-stream' }).end(readFileSync(file));
+    }
     if (url.pathname === '/api/health') {
       return json(response, 200, { service: 'siphon', ytDlpVersion: '2026.09.01', ffmpeg: true, requiresKey: true, capabilities: ['jobs', 'resolve', 'tunnel'], lanUrls: ownHealth.lanUrls, ytClients: ownHealth.ytClients });
     }
     if (request.headers.authorization !== `Bearer ${OWN_KEY}`) return json(response, 401, { detail: 'This server needs an access key.' });
     return json(response, 404, { detail: 'No such download.' });
+  });
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
+}
+
+/* ------------------------------------------- a fake siphon server that downloads */
+
+/**
+ * Your own server with ffmpeg, as the queue sees it: a job is posted, polled
+ * until it is done, and its file fetched. How long a poll takes to answer,
+ * how long a job runs and how many it takes at once are the test's to set;
+ * what it was asked is kept.
+ */
+const full = { posts: [], files: 0, rtt: 0, jobMs: 1000, busyOver: Infinity, failPlaylistOnce: false, jobs: new Map(), cookies: false };
+
+function serveFull(port) {
+  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS', 'Access-Control-Expose-Headers': '*' };
+  const json = (response, status, body) =>
+    response.writeHead(status, { ...cors, 'Content-Type': 'application/json' }).end(JSON.stringify(body));
+  const read = (request) => new Promise((resolve) => {
+    let text = '';
+    request.on('data', (chunk) => { text += chunk; });
+    request.on('end', () => resolve(text ? JSON.parse(text) : {}));
+  });
+  const running = () => [...full.jobs.values()].filter((job) => !job.cancelled && !job.failed && Date.now() - job.created < job.ms).length;
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, 'http://x');
+    if (request.method === 'OPTIONS') return response.writeHead(204, cors).end();
+    if (url.pathname === '/api/health') {
+      return json(response, 200, { service: 'siphon', ytDlpVersion: '2026.09.01', ffmpeg: true, requiresKey: false, capabilities: ['jobs', 'resolve', 'tunnel'], lanUrls: [], hasCookies: full.cookies });
+    }
+    if (url.pathname === '/api/probe') {
+      const body = await read(request);
+      return json(response, 200, /\/list\//.test(body.url) ? { title: 'A list', isPlaylist: true, count: 3, limit: 2 } : { title: 'A clip', isPlaylist: false });
+    }
+    if (url.pathname === '/api/cookies') {
+      if (request.method === 'DELETE') {
+        full.cookies = false;
+        return json(response, 200, { ok: true });
+      }
+      const body = await read(request);
+      full.cookies = true;
+      return json(response, 200, { ok: true, bytes: String(body.cookies || '').length });
+    }
+    if (url.pathname === '/api/jobs' && request.method === 'POST') {
+      const body = await read(request);
+      full.posts.push(body);
+      // The real one's limit, and its words.
+      if (running() >= full.busyOver) return json(response, 429, { detail: 'Too many downloads in flight. Try again shortly.' });
+      const failed = body.playlist === true && full.failPlaylistOnce;
+      if (failed) full.failPlaylistOnce = false;
+      const id = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+      full.jobs.set(id, { created: Date.now(), ms: full.jobMs, failed, playlist: body.playlist === true });
+      return json(response, 200, { id });
+    }
+    const asked = /^\/api\/jobs\/(\w+)(\/file)?$/.exec(url.pathname);
+    const job = asked && full.jobs.get(asked[1]);
+    if (!job) return json(response, 404, { detail: 'No such download.' });
+    if (request.method === 'DELETE') {
+      job.cancelled = true;
+      return json(response, 200, { ok: true });
+    }
+    const name = job.playlist ? 'A list.zip' : 'A clip.mp4';
+    if (asked[2]) {
+      full.files += 1;
+      const bytes = Buffer.alloc(1000, 7);
+      return response.writeHead(200, { ...cors, 'Content-Type': 'application/octet-stream', 'Content-Length': bytes.length, 'Content-Disposition': `attachment; filename="${name}"` }).end(bytes);
+    }
+    await new Promise((resolve) => setTimeout(resolve, full.rtt));
+    if (job.failed) return json(response, 200, { id: asked[1], state: 'error', stage: 'failed', progress: 0, error: 'HTTP Error 404: Not Found' });
+    const done = Date.now() - job.created >= job.ms;
+    return json(response, 200, {
+      id: asked[1], state: done ? 'done' : 'running', stage: done ? 'ready' : 'downloading', progress: done ? 1 : 0.5,
+      title: 'A clip', filename: done ? name : null, totalBytes: 1000,
+    });
   });
   return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
 }
@@ -505,7 +602,7 @@ const resolutionIn = (report) => (/\b(\d{3,4}x\d{3,4})\b/.exec(report) || [])[1]
 /* ------------------------------------------------------------------------- run */
 
 buildFixtures();
-const servers = [await serve(WEB, APP_PORT, '/app'), await serve(WORK, MEDIA_PORT, ''), await serveInvidious(INV_PORT), await servePiped(PIPED_PORT), await serveCobalt(COBALT_PORT), await serveSiphon(OWN_PORT)];
+const servers = [await serve(WEB, APP_PORT, '/app'), await serve(WORK, MEDIA_PORT, ''), await serveInvidious(INV_PORT), await servePiped(PIPED_PORT), await serveCobalt(COBALT_PORT), await serveSiphon(OWN_PORT), await serveFull(FULL_PORT)];
 const browser = await chromium.launch(process.env.CHROMIUM ? { executablePath: process.env.CHROMIUM } : {});
 const context = await browser.newContext({ acceptDownloads: true });
 const page = await context.newPage();
@@ -533,6 +630,14 @@ page.on('console', (message) => {
   consoleErrors.push(`${message.text()} <${at}>`);
 });
 page.on('pageerror', (error) => consoleErrors.push(`pageerror: ${error.message}`));
+// A reload during a download on this device asks first. The checks that
+// reload on purpose say yes; each time it asked is counted.
+const leaving = { asked: 0 };
+page.on('dialog', (dialog) => {
+  if (dialog.type() !== 'beforeunload') return dialog.dismiss();
+  leaving.asked += 1;
+  return dialog.accept();
+});
 
 // Whether the 32 MB converter was fetched is what the "costs nothing extra"
 // claim rests on, so watch the wire rather than trusting the plan.
@@ -730,6 +835,112 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   await page.waitForTimeout(500);
 }
 
+/* Cancel while a link is still being identified: the row goes, and so does
+   the download — it is never fetched. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  delayed.asks.length = 0;
+  await page.fill('#url', `${MEDIA}/media/delayed.mp4`);
+  await page.click('#go');
+  await page.waitForTimeout(500);
+  const starting = (await page.textContent('#queueList li .q-msg')) || '';
+  await page.click('#queueList [data-cancel]');
+  // Past the host's answer to what the link is, and past when a download
+  // that carried on would have asked for the file.
+  await page.waitForTimeout(7000);
+  const rows = await page.locator('#queueList li').count();
+  check('a download cancelled while it was starting is never fetched', /Starting/.test(starting) && rows === 0 && !delayed.asks.includes('GET'),
+    `${starting}; ${rows} rows; the host was asked ${delayed.asks.join(', ') || 'nothing'}`);
+}
+
+/* A link typed without http:// is still a link. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.fill('#url', `127.0.0.1:${MEDIA_PORT}/media/clip.mp4`);
+  const enabled = await page.isEnabled('#go');
+  check('a link typed without its scheme can be downloaded', enabled);
+  if (enabled) {
+    const waiting = page.waitForEvent('download', { timeout: 60_000 });
+    await page.click('#go');
+    const event = await waiting.catch(() => null);
+    const saved = event ? join(DOWNLOADS, `typed-${event.suggestedFilename()}`) : '';
+    if (event) await event.saveAs(saved);
+    check('and it is', Boolean(saved) && Buffer.compare(source, readFileSync(saved)) === 0, saved.split('/').pop() || 'no download');
+  }
+}
+
+/* A message with several links, shared into the app: each becomes its own row. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  const landed = [];
+  const collect = (event) => landed.push(event);
+  page.on('download', collect);
+  const message = `Two clips: ${MEDIA}/media/clip.mp4 and ${MEDIA}/media/song.mp3`;
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html?text=${encodeURIComponent(message)}`, { waitUntil: 'networkidle' });
+  await page.waitForFunction(() => document.querySelectorAll('#queueList li').length === 2, null, { timeout: 15_000 }).catch(() => {});
+  const rows = await page.locator('#queueList li').count();
+  const said = (await page.textContent('#feedback')) || '';
+  check('a shared message with two links is two rows', rows === 2 && /2 links queued/.test(said), `${rows} rows; ${said.trim()}`);
+  const deadline = Date.now() + 60_000;
+  while (landed.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 250));
+  page.off('download', collect);
+  check('and both land', landed.length === 2, `${landed.length} downloads`);
+
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html?text=${encodeURIComponent(`Look: ${MEDIA}/media/clip.mp4.`)}`, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(500);
+  check('and one shared link fills the field, as before', (await page.inputValue('#url')) === `${MEDIA}/media/clip.mp4` && (await page.locator('#queueList li').count()) === 0,
+    await page.inputValue('#url'));
+  await page.fill('#url', '');
+}
+
+/* A download on this device lives in the tab: leaving asks first. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  const guarded = () => page.evaluate(() => {
+    const event = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
+  const idle = await guarded();
+  await page.fill('#url', `${MEDIA}/media/slow.mp4`);
+  await page.click('#go');
+  await page.waitForFunction(() => /\d+%/.test(document.querySelector('#queueList li')?.textContent || ''), null, { timeout: 20_000 });
+  const busy = await guarded();
+  await page.click('#queueList [data-cancel]');
+  const after = await guarded();
+  check('leaving the page while a download runs on this device asks first, and only then', !idle && busy && !after, `idle ${idle}, running ${busy}, cancelled ${after}`);
+}
+
+/* The Advanced options are checked before they are saved. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.click('#openSettings');
+  await page.click('#advanced summary');
+  await page.fill('#optClipStart', 'abc');
+  await page.click('#saveSettings');
+  await page.waitForTimeout(500);
+  const open = await page.evaluate(() => document.getElementById('settings').open);
+  const said = (await page.textContent('#statusText')) || '';
+  const focused = await page.evaluate(() => document.activeElement?.id);
+  check('a clip time that is not one keeps the sheet open, and says so beside it', open && /Clip times look like/.test(said) && focused === 'optClipStart', `${open ? 'open' : 'closed'}; ${said}; focus on ${focused}`);
+  await page.fill('#optClipStart', '0:05');
+  await page.fill('#optClipEnd', '0:02');
+  await page.click('#saveSettings');
+  await page.waitForTimeout(500);
+  check('and so does a clip that ends before it starts', /end after it starts/.test((await page.textContent('#statusText')) || '') && await page.evaluate(() => document.getElementById('settings').open));
+  await page.fill('#optClipStart', '');
+  await page.fill('#optClipEnd', '');
+  await page.click('#closeSettings');
+}
+
 /* A progressive MP4 that already meets the preset: no conversion at all. */
 {
   coreRequests = 0;
@@ -922,7 +1133,9 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   await page.fill('#url', `${MEDIA}/media/slow.mp4`);
   await page.click('#go');
   await page.waitForFunction(() => /\d+%/.test(document.querySelector('#queueList li')?.textContent || ''), null, { timeout: 20_000 });
+  const asked = leaving.asked;
   await page.reload({ waitUntil: 'networkidle' });
+  check('a reload during a download on this device asks first', leaving.asked === asked + 1, `${leaving.asked - asked} times`);
   await page.waitForSelector('#queueList li', { timeout: 15_000 });
   await page.waitForTimeout(1500);
   const label = (await page.textContent('#queueList li .q-msg')) || '';
@@ -1053,6 +1266,15 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
     (report.match(/Stream #0:\d[^\n]*/g) || []).map((line) => line.replace(/\s+/g, ' ').slice(0, 50)).join(' | '));
   check('the page itself never touched googlevideo or youtube.com', strangers.length === 0, strangers.slice(0, 2).join(' ; '));
 
+  // A live stream: this device cannot record one, and the notice does not
+  // promise that it will.
+  await page.fill('#url', 'https://www.youtube.com/watch?v=LIVEstream0');
+  await page.waitForFunction(() => /live stream/i.test(document.getElementById('feedback').textContent || ''), null, { timeout: 20_000 }).catch(() => {});
+  const live = (await page.textContent('#feedback')) || '';
+  check('a live stream is said to be one this device cannot record, not one it will record until stopped',
+    /live stream/i.test(live) && /cannot/.test(live) && !/until you stop it/.test(live), live.trim().slice(0, 100));
+  await page.fill('#url', '');
+
   // A private video: the row has to say so in the instance's words, and no
   // other instance is asked, since none would answer differently.
   const asked = invidious.videos.length;
@@ -1129,6 +1351,8 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   await page.click('#saveSettings');
   await page.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 15_000 });
   check('your own server is saved with its access key', /your server/.test((await page.textContent('#backendLabel')) || ''), await page.textContent('#backendLabel'));
+  const guide = (await page.textContent('#tourYoutube')) || '';
+  check('and the guide says YouTube is ready, rather than what to set up for it', /^Ready\./.test(guide) && await page.evaluate(() => document.getElementById('tourOptions').hidden), guide.slice(0, 80));
   await page.click('#openSettings');
   const kept = await page.inputValue('#endpointKey');
 
@@ -1227,6 +1451,165 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   check('and nothing it sent ran in this page', (await page.evaluate(() => window.__fromInstance)) === undefined);
   check('the page itself never touched googlevideo or youtube.com', strangers.length === 0, strangers.slice(0, 2).join(' ; '));
   check('the instance never saw your server\'s key, not in a probe and not with a download', cobalt.keyed.length === 0, cobalt.keyed.slice(0, 3).join(' ; '));
+}
+
+/* On a phone, the verdict of a button near the top of the settings sheet is
+   in view, not written at its foot below the fold. */
+{
+  const phone = await browser.newContext({ viewport: { width: 390, height: 664 }, isMobile: true, hasTouch: true });
+  await phone.addInitScript(() => {
+    localStorage.setItem('siphon:settings', JSON.stringify({ endpoint: '', key: '', helper: { kind: 'none', label: 'this device only' }, preset: 'video_best', subs: 'off' }));
+    localStorage.setItem('siphon:install-dismissed', '1');
+    localStorage.setItem('siphon:tour-seen', '1');
+  });
+  const tab = await phone.newPage();
+  await tab.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await tab.click('#openSettings');
+  await tab.click('#useLocalhost');
+  await tab.waitForFunction(() => !/checking/i.test(document.getElementById('statusText').textContent || ''), null, { timeout: 20_000 });
+  const box = await tab.locator('#statusText').boundingBox();
+  const said = (await tab.textContent('#statusText')) || '';
+  check('on a phone, what "Use this computer" found is on screen', box && box.y >= 0 && box.y + box.height <= 664, `${box ? `${Math.round(box.y)}..${Math.round(box.y + box.height)} of 664` : 'no box'}: ${said.slice(0, 60)}`);
+  await phone.close();
+}
+
+/* A first visit to the page your own server serves, when it wants a key: it
+   is adopted, and every screen says the key is what is missing. */
+{
+  const visit = await browser.newContext();
+  await visit.addInitScript(() => localStorage.setItem('siphon:install-dismissed', '1'));
+  const tab = await visit.newPage();
+  const errors = [];
+  tab.on('pageerror', (error) => errors.push(error.message));
+  await tab.goto(`${OWN}/`, { waitUntil: 'networkidle' });
+  await tab.waitForFunction(() => !/checking/i.test(document.getElementById('backendLabel').textContent || ''), null, { timeout: 15_000 });
+  const header = (await tab.textContent('#backendLabel')) || '';
+  check('a server adopted without the key it wants says so in the header', /your server/.test(header) && /access key/.test(header), header);
+  const guide = (await tab.textContent('#tourYoutube')) || '';
+  check('and the guide names the server it is on, not an empty space', guide.includes(`127.0.0.1:${OWN_PORT}`) && !/at\s+handles/.test(guide), guide.slice(0, 90));
+  await tab.click('#openSettings');
+  const dot = (await tab.getAttribute('#statusDot', 'class')) || '';
+  const said = (await tab.textContent('#statusText')) || '';
+  check('and the settings say the key is missing, not that it does everything', /\bbad\b/.test(dot) && /access key/.test(said) && !/does everything/.test(said), `${dot}: ${said.slice(0, 80)}`);
+  check('no uncaught errors on the server\'s own page', errors.length === 0, errors.slice(0, 2).join(' ; '));
+  await visit.close();
+}
+
+/* Your own server doing the downloads, as the queue sees it. */
+{
+  const own = await browser.newContext({ acceptDownloads: true });
+  await own.addInitScript((endpoint) => {
+    // Seeded once, so a reload keeps what a check changed.
+    if (!localStorage.getItem('siphon:settings')) {
+      localStorage.setItem('siphon:settings', JSON.stringify({
+        endpoint, key: '', helper: { kind: 'siphon', label: 'yt-dlp 2026.09.01', ffmpeg: true, keyAccepted: true, hasCookies: false, capabilities: ['jobs', 'resolve', 'tunnel'] },
+        preset: 'video_best', subs: 'off',
+      }));
+    }
+    localStorage.setItem('siphon:install-dismissed', '1');
+    localStorage.setItem('siphon:tour-seen', '1');
+  }, FULL);
+  const tab = await own.newPage();
+  const errors = [];
+  tab.on('pageerror', (error) => errors.push(error.message));
+  const handed = [];
+  tab.on('download', (event) => handed.push(event.suggestedFilename()));
+  const fresh = async () => {
+    await tab.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+    await tab.evaluate(() => localStorage.removeItem('siphon:queue'));
+    await tab.reload({ waitUntil: 'networkidle' });
+    handed.length = 0;
+  };
+  const settled = (count) => tab.waitForFunction((n) => {
+    const rows = [...document.querySelectorAll('#queueList li')];
+    return rows.length === n && rows.every((row) => row.dataset.state === 'done' || row.dataset.state === 'error');
+  }, count, { timeout: 60_000 }).catch(() => {});
+
+  // A poll that takes longer to answer than the time between polls, as on
+  // mobile data: the file is handed over once.
+  await fresh();
+  Object.assign(full, { rtt: 1500, jobMs: 3000, files: 0 });
+  await tab.fill('#url', `${MEDIA}/media/clip.mp4`);
+  await tab.click('#go');
+  await settled(1);
+  await tab.waitForTimeout(3000);
+  check('on a slow connection a finished download is saved once, not once per poll that was waiting', handed.length === 1 && full.files === 1, `${handed.length} handed over, ${full.files} fetched`);
+  full.rtt = 0;
+
+  // "All" of a list is one row on your server; trying it again asks for the
+  // list again, after a reload too.
+  await fresh();
+  Object.assign(full, { jobMs: 500, failPlaylistOnce: true });
+  full.posts.length = 0;
+  await tab.fill('#url', `${MEDIA}/list/three`);
+  await tab.waitForSelector('.playlist-choice', { timeout: 15_000 });
+  await tab.check('input[name="scope"][value="all"]');
+  await tab.click('#go');
+  await tab.waitForSelector('#queueList li [data-retry]', { timeout: 20_000 });
+  await tab.reload({ waitUntil: 'networkidle' });
+  await tab.waitForSelector('#queueList li [data-retry]', { timeout: 20_000 });
+  await tab.click('#queueList li [data-retry]');
+  await settled(1);
+  check('Try again on a failed "All" asks for the whole list again', full.posts.length === 2 && full.posts.every((post) => post.playlist === true),
+    JSON.stringify(full.posts.map((post) => post.playlist)));
+
+  // More links than your server takes at once: the rest wait their turn.
+  await fresh();
+  Object.assign(full, { jobMs: 2500, busyOver: 2 });
+  full.posts.length = 0;
+  await tab.evaluate((links) => {
+    const dt = new DataTransfer();
+    dt.setData('text/plain', links.join('\n'));
+    document.getElementById('url').dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+  }, [1, 2, 3, 4, 5].map((n) => `${MEDIA}/media/clip${n}.mp4`));
+  await tab.waitForFunction(() => document.querySelectorAll('#queueList li').length === 5, null, { timeout: 15_000 }).catch(() => {});
+  await tab.waitForTimeout(500);
+  const waiting = (await tab.textContent('#queueList')) || '';
+  await settled(5);
+  const states = await tab.$$eval('#queueList li', (rows) => rows.map((row) => row.dataset.state));
+  const text = (await tab.textContent('#queueList')) || '';
+  check('five links pasted to a server that takes two at a time all finish, none refused', states.length === 5 && states.every((state) => state === 'done') && !/Too many downloads/.test(text),
+    `${states.join(', ')}; ${full.posts.length} asks`);
+  check('and the ones waiting say so', /Waiting for your server/.test(waiting), waiting.replace(/\s+/g, ' ').slice(0, 90));
+  full.busyOver = Infinity;
+
+  // Cookies uploaded, the sheet closed and opened again: they are still there.
+  await fresh();
+  await tab.click('#openSettings');
+  await tab.click('#advanced summary');
+  await tab.setInputFiles('#cookiesFile', { name: 'cookies.txt', mimeType: 'text/plain', buffer: Buffer.from('# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tx\n') });
+  await tab.waitForFunction(() => /Stored/.test(document.getElementById('cookiesResult').textContent || ''), null, { timeout: 10_000 }).catch(() => {});
+  await tab.keyboard.press('Escape');
+  await tab.click('#openSettings');
+  const cookies = async () => ({
+    state: (await tab.textContent('#cookiesState')) || '',
+    remove: await tab.isVisible('#cookiesClear'),
+    result: (await tab.textContent('#cookiesResult')) || '',
+  });
+  const reopened = await cookies();
+  check('cookies uploaded are still said to be stored when the sheet is opened again', /stored/.test(reopened.state) && reopened.remove && reopened.result === '', JSON.stringify(reopened));
+  await tab.reload({ waitUntil: 'networkidle' });
+  await tab.click('#openSettings');
+  await tab.click('#advanced summary');
+  const reloaded = await cookies();
+  check('and after a reload', /stored/.test(reloaded.state) && reloaded.remove, JSON.stringify(reloaded));
+  await tab.click('#closeSettings');
+
+  // Your server out of reach: a file this device can read is still a download.
+  await tab.evaluate(() => {
+    const saved = JSON.parse(localStorage.getItem('siphon:settings'));
+    localStorage.setItem('siphon:settings', JSON.stringify({ ...saved, endpoint: 'http://127.0.0.1:9' }));
+  });
+  await fresh();
+  await tab.fill('#url', `${MEDIA}/media/clip.mp4`);
+  await tab.click('#go');
+  await settled(1);
+  const row = (await tab.textContent('#queueList li')) || '';
+  check('with your server out of reach, a plain file downloads on this device, and the row says so',
+    (await tab.getAttribute('#queueList li', 'data-state')) === 'done' && /your server could not be reached/.test(row), row.replace(/\s+/g, ' ').slice(0, 120));
+
+  check('no uncaught errors with your own server', errors.length === 0, errors.slice(0, 2).join(' ; '));
+  await own.close();
 }
 
 check('no uncaught errors in the page', consoleErrors.length === 0, consoleErrors.slice(0, 2).join(' ; '));
