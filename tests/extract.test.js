@@ -870,6 +870,34 @@ test('with nothing to ask and no escape, YouTube is refused in a sentence that n
   await assert.rejects(() => extract(WATCH, { net, resolvers: [] }), (error) => /helper|relay|bridge/i.test(error.hint) && error.retryable === false);
 });
 
+test('a YouTube playlist or channel goes to your server, which reads it as a list', async () => {
+  // It has no video of its own, so there is nothing for an instance or
+  // InnerTube to take — but a server's yt-dlp answers it with its entries,
+  // and the device takes them one row each. It was refused before the
+  // server was asked, and told the person to get the server they had.
+  const net = { hasEscape: true, hasOpenEscape: false, hasBridge: false, escape: { name: 'tunnel' } };
+  for (const url of ['https://www.youtube.com/playlist?list=PL1234567890', 'https://www.youtube.com/@somechannel/videos']) {
+    let asked = 0;
+    const server = {
+      name: 'server',
+      generic: true,
+      resolve: async () => {
+        asked += 1;
+        return { title: 'A list', formats: [], playlist: { count: 2, limit: 50, entries: [{ url: 'https://www.youtube.com/watch?v=aaaaaaaaaaa', title: 'One' }] } };
+      },
+    };
+    const instance = { name: 'invidious', generic: false, resolve: async () => assert.fail('an instance is asked for a video, not a list') };
+    const found = await extract(url, { net, resolvers: [instance, server] });
+    assert.equal(asked, 1, url);
+    assert.equal(found.playlist.entries.length, 1, url);
+  }
+  // With no server to ask, it is still the sentence that names one.
+  await assert.rejects(
+    () => extract('https://www.youtube.com/playlist?list=PL1234567890', { net, resolvers: [] }),
+    (error) => /no video in it/.test(error.message) && /your own server/.test(error.hint),
+  );
+});
+
 /* ------------------------------------------------------ pages and ladders */
 
 /**

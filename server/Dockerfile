@@ -63,7 +63,13 @@ COPY server/entrypoint.sh /usr/local/bin/siphon-entrypoint
 RUN chmod 755 /usr/local/bin/siphon-entrypoint
 ENTRYPOINT ["siphon-entrypoint"]
 
+# Asked directly, never through HTTP(S)_PROXY: urllib takes those from the
+# environment and does not skip loopback for them, so a server run behind a
+# proxy was marked unhealthy by a question the proxy could not answer.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-  CMD python -c "import urllib.request,os;urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"PORT\",8000)}/api/health').read()" || exit 1
+  CMD python -c "import urllib.request as u,os;u.build_opener(u.ProxyHandler({})).open(f'http://127.0.0.1:{os.environ.get(\"PORT\",8000)}/api/health',timeout=4).read()" || exit 1
 
-CMD ["sh", "-c", "uvicorn server.app:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# exec, so uvicorn is the process a stop signal reaches. Left as the shell's
+# child, the shell was PID 1, which ignores SIGTERM: every stop waited out the
+# grace period and ended in a SIGKILL.
+CMD ["sh", "-c", "exec uvicorn server.app:app --host 0.0.0.0 --port ${PORT:-8000}"]

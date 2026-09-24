@@ -480,6 +480,83 @@ test('a 502 the relay marks as its own is the host out of its reach, and worth a
   }
 });
 
+test('a refusal from a relay or a server from before the mark is still named as theirs', async () => {
+  // A relay deployed last month, or a server image from before its answers
+  // were marked, refuses with its own body and no header. Taken for the
+  // host's, "host not allowed" read as the site itself turning the page away.
+  const unmarked = (answer) => () =>
+    new Response(JSON.stringify(answer), { status: 403, headers: { 'Content-Type': 'application/json' } });
+  let stub = throughEscape(unmarked({ error: 'host not allowed' }));
+  try {
+    const error = await new Fetcher({ escape: relayEscape('https://relay.example') }).text('https://cdn.example/clip.mp4').catch((e) => e);
+    assert.equal(error.message, 'The relay refused to fetch that address.');
+    assert.match(error.hint, /ALLOWED_HOSTS/);
+    assert.equal(error.retryable, false);
+  } finally {
+    stub.restore();
+  }
+  stub = throughEscape(unmarked({ error: 'origin not allowed' }));
+  try {
+    const error = await new Fetcher({ escape: relayEscape('https://relay.example') }).text('https://cdn.example/clip.mp4').catch((e) => e);
+    assert.equal(error.message, 'The relay refused to fetch that address.');
+    assert.match(error.hint, /ALLOWED_ORIGINS/);
+  } finally {
+    stub.restore();
+  }
+  stub = throughEscape(unmarked({ detail: 'Not a host this server resolved. Resolve the link first.' }));
+  try {
+    const error = await new Fetcher({ escape: TUNNEL }).text('https://rr1---sn-abc.googlevideo.com/videoplayback').catch((e) => e);
+    assert.equal(error.message, 'The server refused to fetch that address.');
+    assert.match(error.hint, /hosts it resolved itself/);
+  } finally {
+    stub.restore();
+  }
+  // Anything else unmarked is still the host's own answer.
+  for (const answer of [() => new Response('denied', { status: 403 }), unmarked({ error: 'Forbidden' })]) {
+    stub = throughEscape(answer);
+    try {
+      const error = await new Fetcher({ escape: relayEscape('https://relay.example') }).text('https://cdn.example/clip.mp4').catch((e) => e);
+      assert.equal(error.message, 'cdn.example answered 403.');
+    } finally {
+      stub.restore();
+    }
+  }
+});
+
+test('once its retries are spent, a download does not promise that Try again resumes it', async () => {
+  // Try again is a new download, from the first byte: only the retries
+  // inside one pick up where the last broke off.
+  const promise = /resumes rather than starting over/;
+  let stub = stubFetch([() => ok(WHOLE, { breakAfter: 150 })]);
+  try {
+    const error = await new Fetcher().bytes('https://cdn.example/clip.mp4', { attempts: 2 }).catch((e) => e);
+    assert.match(error.message, /kept breaking/);
+    assert.doesNotMatch(error.hint, promise);
+  } finally {
+    stub.restore();
+  }
+  stub = stubFetch([() => {
+    throw new TypeError('Failed to fetch');
+  }]);
+  try {
+    const net = new Fetcher();
+    net.verdicts.set('https://cdn.example', 'direct');
+    const error = await net.request('https://cdn.example/clip.mp4').catch((e) => e);
+    assert.match(error.message, /Lost the connection/);
+    assert.doesNotMatch(error.hint, promise);
+  } finally {
+    stub.restore();
+  }
+  stub = throughEscape(() => new Response('{}', { status: 502, headers: { 'X-Relay-Error': 'upstream: connect ECONNREFUSED' } }));
+  try {
+    const error = await new Fetcher({ escape: relayEscape('https://relay.example') }).text('https://cdn.example/clip.mp4').catch((e) => e);
+    assert.match(error.message, /could not reach/);
+    assert.doesNotMatch(error.hint, promise);
+  } finally {
+    stub.restore();
+  }
+});
+
 /* ------------------------------------------------------------- the bridge */
 
 const USERSCRIPT = readFileSync(new URL('../bridge/siphon-bridge.user.js', import.meta.url), 'utf8');
@@ -507,24 +584,26 @@ function bridged(file, { ignoreRange = false, failOn = null, finalUrl = null, pe
   const gm = (options) => {
     const request = { url: options.url, range: options.headers?.Range || options.headers?.range || null, aborted: false };
     asked.push(request);
+    // A file and a delay for each host, when they are given as functions of the URL.
+    const source = typeof file === 'function' ? file(options.url) : file;
     const timer = setTimeout(() => {
       if (failOn?.(asked.length, request)) return options.onerror?.({ error: 'connection reset' });
       const match = /^bytes=(\d+)-(\d*)$/.exec(request.range || '');
       let status = 200;
-      let body = file;
+      let body = source;
       const headers = [`content-type: video/mp4`];
       if (match && !ignoreRange) {
         const from = Number(match[1]);
-        const to = Math.min(match[2] ? Number(match[2]) : file.length - 1, file.length - 1);
+        const to = Math.min(match[2] ? Number(match[2]) : source.length - 1, source.length - 1);
         status = 206;
-        body = file.subarray(from, to + 1);
-        headers.push(`content-range: bytes ${from}-${to}/${file.length}`);
+        body = source.subarray(from, to + 1);
+        headers.push(`content-range: bytes ${from}-${to}/${source.length}`);
       }
       if (encoding) headers.push(`content-encoding: ${encoding}`);
       headers.push(`content-length: ${body.length}`);
       const response = body.slice().buffer;
       options.onload?.({ status, statusText: '', responseHeaders: headers.join('\r\n'), response, finalUrl: finalUrl || options.url });
-    }, perRequestMs);
+    }, typeof perRequestMs === 'function' ? perRequestMs(options.url) : perRequestMs);
     return {
       abort: () => {
         request.aborted = true;
@@ -650,6 +729,30 @@ test('a playlist through the bridge is relative to where its redirect landed', a
     const doc = await net.document('https://short.example/v/42.m3u8');
     assert.equal(doc.url, 'https://cdn.example/hls/42/master.m3u8');
     assert.equal(new URL('v360/index.m3u8', doc.url).href, 'https://cdn.example/hls/42/v360/index.m3u8');
+  } finally {
+    bridge.done();
+  }
+});
+
+test('two Fetchers on one page, as a settings save leaves them, each get their own answers', async () => {
+  // A running download keeps the Fetcher it started with and the next one
+  // gets a new one. Each counted its requests from 1 on the same window, so
+  // the first answer for a number settled both: a download was handed
+  // another's bytes, and saved as Ready.
+  const A = new Uint8Array(1000).fill(0xaa);
+  const B = new Uint8Array(1000).fill(0xbb);
+  const bridge = bridged((url) => (url.includes('a.example') ? A : B), { perRequestMs: (url) => (url.includes('a.example') ? 5 : 80) });
+  try {
+    const running = await bridgeFetcher('https://a.example/a.bin');
+    const next = await bridgeFetcher('https://a.example/a.bin');
+    running.verdicts.set('https://b.example', 'bridge');
+    await running.bytes('https://a.example/a.bin');
+    const slow = running.bytes('https://b.example/b.bin');
+    await next.bytes('https://a.example/a.bin');
+    const fast = next.bytes('https://a.example/a.bin');
+    const [got, other] = await Promise.all([slow, fast]);
+    assert.deepEqual([got[0], got.length], [0xbb, 1000], 'the running download got its own file');
+    assert.deepEqual([other[0], other.length], [0xaa, 1000]);
   } finally {
     bridge.done();
   }

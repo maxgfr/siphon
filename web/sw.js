@@ -14,7 +14,7 @@
 const CACHE = 'siphon-v6';
 const SHELL = [
   './', './index.html', './styles.css', './manifest.webmanifest', './icon.svg',
-  './app.js', './api.js', './errors.js', './links.js', './config.json', './instances.json',
+  './app.js', './api.js', './errors.js', './links.js', './options.js', './config.json', './instances.json',
   // Everything api.js imports. A module missing from this list is fetched
   // from the network on the first visit, before the worker controls the
   // page, and so is not in the cache when the network goes: the shell then

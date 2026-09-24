@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { looksLikeUrl, urlsIn } from '../web/links.js';
+import { asLink, looksLikeUrl, urlsIn } from '../web/links.js';
 
 test('one link is one link', () => {
   assert.equal(looksLikeUrl(' https://example.com/v '), true);
@@ -40,4 +40,18 @@ test('text with no link in it is nothing to take', () => {
   assert.deepEqual(urlsIn('just words'), []);
   assert.deepEqual(urlsIn(''), []);
   assert.deepEqual(urlsIn(undefined), []);
+});
+
+test('a link typed without its scheme is still a link, and anything else is not', () => {
+  // A phone keyboard offers ".com" and never "https://": the button stayed
+  // greyed out, with nothing on the page saying why.
+  assert.equal(asLink('youtu.be/dQw4w9WgXcQ'), 'https://youtu.be/dQw4w9WgXcQ');
+  assert.equal(asLink(' www.youtube.com/watch?v=dQw4w9WgXcQ '), 'https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+  assert.equal(asLink('example.com/clip.mp4'), 'https://example.com/clip.mp4');
+  // A server on this computer or this network is plain http, as the helper field has it.
+  assert.equal(asLink('127.0.0.1:41833/video.mp4'), 'http://127.0.0.1:41833/video.mp4');
+  assert.equal(asLink('https://example.com/v'), 'https://example.com/v');
+  for (const text of ['hello', 'foo bar', 'clip.mp4', 'Look at youtu.be/x', 'ftp://example.com/v', '', null]) {
+    assert.equal(asLink(text), '', String(text));
+  }
 });

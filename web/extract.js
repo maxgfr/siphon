@@ -752,6 +752,18 @@ const isBotWall = (reason) => /sign in|not a bot|confirm you|age|inappropriate/i
 async function extractYouTube(url, context) {
   const id = youtubeId(url);
   if (!id) {
+    // A playlist or a channel has no video of its own for an instance or
+    // InnerTube to take. Your server's yt-dlp reads it as a list, which the
+    // device then takes one row each.
+    let failure = null;
+    for (const resolver of (context.resolvers || []).filter((each) => each.generic)) {
+      try {
+        return await resolver.resolve(url, context);
+      } catch (error) {
+        failure = error;
+      }
+    }
+    if (failure) throw failure;
     throw new BackendError('That YouTube link has no video in it.', {
       hint: 'Channel and playlist pages need your own server.',
       retryable: false,

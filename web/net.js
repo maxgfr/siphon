@@ -65,6 +65,11 @@ export class Fetcher {
     return this.bridge.ready;
   }
 
+  /** The version the bridge announced itself with, if it did. */
+  get bridgeVersion() {
+    return this.bridge.version;
+  }
+
   /** Whether a host that refuses the page can still be reached somehow. */
   get hasEscape() {
     return this.hasBridge || this.hasRelay;
@@ -151,13 +156,14 @@ export class Fetcher {
     // address looks exactly like a host off the allow-list — and a 502 the
     // host's, or the relay failing to reach it. Ours mark the answers they
     // make themselves. Anything unmarked is the host's, and the caller says
-    // so, as it does for a public CORS proxy, which marks nothing.
-    const reason = response.headers.get(RELAY_ERROR_HEADER);
+    // so, as it does for a public CORS proxy, which marks nothing — unless it
+    // is one of our own refusals from before the mark, in its own words.
+    const reason = response.headers.get(RELAY_ERROR_HEADER) ?? (await unmarkedRefusal(response, this.escape.name));
     if (reason === null) return response;
     const subject = `${what[0].toUpperCase()}${what.slice(1)}`;
     if (response.status >= 500) {
       throw new BackendError(`${subject} could not reach ${hostOf(url)}.`, {
-        hint: `It said: ${reason}. Try again — a download resumes rather than starting over.`,
+        hint: `It said: ${reason}. Try again.`,
       });
     }
     throw new BackendError(`${subject} refused to fetch that address.`, {
@@ -372,6 +378,23 @@ export const RELAY_ERROR_HEADER = 'X-Relay-Error';
 /** This page's origin, as an ALLOWED_ORIGINS entry would name it. */
 export const pageOrigin = () => (typeof location !== 'undefined' && location.origin !== 'null' ? location.origin : "this page's address");
 
+/**
+ * A refusal our relay or a siphon server's tunnel made before they marked
+ * their answers, read from its body: a relay deployed last month and a server
+ * image from before the mark still answer this way. Read from a clone, so a
+ * host's own 403 goes back untouched; null when it is not one of those.
+ */
+async function unmarkedRefusal(response, escape) {
+  if (response.status !== 403 || !/json/i.test(response.headers.get('content-type') || '')) return null;
+  try {
+    const body = await response.clone().json();
+    if (escape === 'tunnel') return /^not a host this server resolved/i.test(String(body?.detail || '')) ? 'not a host this server resolved' : null;
+    return /^(host not allowed|origin not allowed|redirect refused)/i.test(String(body?.error || '')) ? String(body.error) : null;
+  } catch {
+    return null;
+  }
+}
+
 function reportedUrl(response) {
   try {
     const url = new URL(response.headers.get(FINAL_URL_HEADER) || '');
@@ -424,6 +447,9 @@ function spanOf(method, headers) {
   return span.to === null || span.to - span.from + 1 > FIRST_WINDOW ? span : null;
 }
 
+/** The bridge of each window: see installBridge. */
+const bridges = new WeakMap();
+
 /**
  * The bridge: a userscript on this page that fetches on the page's behalf.
  *
@@ -441,11 +467,19 @@ function spanOf(method, headers) {
  * inject responses.
  */
 function installBridge() {
+  if (typeof window === 'undefined') return { ready: false, version: null, request: null };
+  // One per window, whatever the number of Fetchers: a settings save makes a
+  // new one while a download runs on the old, and the userscript answers on
+  // the window with nothing but an id. Two counters from 1 each gave the
+  // first answer for a number to both, and one download another's bytes.
+  if (!bridges.has(window)) bridges.set(window, createBridge());
+  return bridges.get(window);
+}
+
+function createBridge() {
   const pending = new Map();
   let nextId = 1;
   const state = { ready: false, version: null, request: null };
-
-  if (typeof window === 'undefined') return state;
   const aborted = () => new DOMException('Aborted', 'AbortError');
 
   window.addEventListener('message', (event) => {
@@ -454,6 +488,9 @@ function installBridge() {
     if (message.siphon === 'ready') {
       state.ready = true;
       state.version = message.version || null;
+      // It answers after the page has asked, and whatever named what is in
+      // use before then is out of date: the header, the guide.
+      window.dispatchEvent(new Event('siphon:bridge'));
       return;
     }
     const waiting = pending.get(message.id);
@@ -635,11 +672,17 @@ function pause(ms, signal) {
   });
 }
 
-/** Retries are spent and the file is still incomplete. Say how far it got. */
+/**
+ * Retries are spent and the file is still incomplete. Say how far it got.
+ *
+ * Only the retries inside one download pick up where the last broke off; the
+ * row's Try again is a new download from the first byte, and says so rather
+ * than promise otherwise.
+ */
 function cutShort(url, error, received, stated) {
   const far = stated ? ` after ${Math.round((received / stated) * 100)}%` : '';
   return new BackendError(`The download from ${hostOf(url)} kept breaking${far}.`, {
-    hint: `Last attempt: ${error?.message || error}. Try again — a download resumes rather than starting over.`,
+    hint: `Last attempt: ${error?.message || error}. Each break was picked up where it left off; Try again starts over, so wait for a steadier connection.`,
   });
 }
 
@@ -652,7 +695,7 @@ function httpError(response, url) {
 /** The network went, mid-conversation with a host that had been answering. Worth another try. */
 function connectionLost(origin) {
   return new BackendError(`Lost the connection to ${hostOf(origin)}.`, {
-    hint: 'The network dropped part-way. Try again — a download resumes rather than starting over.',
+    hint: 'The network dropped part-way. Try again when it is back.',
   });
 }
 

@@ -52,7 +52,7 @@ async function readError(response, fallback) {
  */
 function networkError(base) {
   const secureMismatch = location.protocol === 'https:' && base.startsWith('http://') && !isLoopback(base);
-  return new BackendError(
+  return unreachable(new BackendError(
     secureMismatch ? 'Blocked: this page is HTTPS and the server is plain HTTP.' : 'Could not reach the server.',
     {
       hint: secureMismatch
@@ -60,7 +60,13 @@ function networkError(base) {
         : 'Check the address in settings, and that the server is running and allows this page in ALLOWED_ORIGINS.' +
           (isLoopback(base) ? ' If the browser asked whether this page may reach apps on this device, allow it.' : ''),
     },
-  );
+  ));
+}
+
+/** Marks an error as the server not being there at all — not a refusal, not an answer. */
+function unreachable(error) {
+  error.unreachable = true;
+  return error;
 }
 
 /* -------------------------------------------------------------- self-hosted */
@@ -95,6 +101,12 @@ export class ServerBackend {
         hint: 'Add it in settings — it is the AUTH_TOKEN the server was started with.',
         retryable: false,
       });
+    }
+    if (response.status === 429) {
+      // As many downloads in flight as it takes: this one waits its turn.
+      const error = new BackendError(await readError(response, 'Your server is busy.'));
+      error.busy = true;
+      throw error;
     }
     if (!response.ok) {
       throw new BackendError(await readError(response, `The server answered ${response.status}.`));
@@ -328,6 +340,15 @@ function serverResolver(server) {
 
 /* ------------------------------------------------------------------- siphon */
 
+/** What a row says when your server could not be reached and this device took the link. */
+const TAKEN_HERE = 'Taken on this device: your server could not be reached.';
+
+/** The bridge before 1.2 neither stops a cancelled transfer nor says where a redirect landed. */
+const olderBridge = (version) => {
+  const [major, minor] = String(version || '').split('.').map(Number);
+  return Number.isFinite(major) && (major < 1 || (major === 1 && (minor || 0) < 2));
+};
+
 /**
  * The one backend.
  *
@@ -380,6 +401,17 @@ export class Siphon {
     this.supportsPlaylist = this.full;
     /** @type {Map<string, object>} which backend owns a job id */
     this.owners = previous?.owners || new Map();
+    /** Jobs this device took because your server could not be reached. */
+    this.takenHere = previous?.takenHere || new Set();
+  }
+
+  /** Whether the bridge is on this page: it goes first, whatever the helper. */
+  get hasBridge() {
+    return this.device.net.hasBridge;
+  }
+
+  get bridgeVersion() {
+    return this.device.net.bridgeVersion;
   }
 
   /** Where a job id came from, including ones started before a reload. */
@@ -388,24 +420,42 @@ export class Siphon {
   }
 
   async health() {
+    // A server adopted without the key it wants is there, and does nothing
+    // until the key is in: the header says so before a link fails on it.
+    const keyless = this.server && this.helper.keyAccepted === false ? ' — needs its access key' : '';
     if (this.full) {
       const info = await this.server.health();
-      return { ...info, label: `${info.label} · your server` };
+      return { ...info, label: `${info.label} · your server${keyless}` };
     }
     const info = await this.device.health();
     const suffix = {
-      siphon: 'your server resolves',
+      siphon: `your server resolves${keyless}`,
       cobalt: `${this.helper.label} for the rest`,
       piped: 'Piped for YouTube',
       invidious: 'Invidious for YouTube',
       relay: 'relay for YouTube',
       none: 'no helper',
     }[this.helper.kind] || 'no helper';
-    return { ...info, label: `${info.label} · ${suffix}` };
+    // The bridge is used ahead of any helper, so it is named first; with it
+    // and nothing else, "no helper" would read as a bridge that is not running.
+    const bridge = info.bridge
+      ? `bridge${info.bridgeVersion ? ` ${info.bridgeVersion}` : ''}${olderBridge(info.bridgeVersion) ? ', update it' : ''}`
+      : '';
+    const parts = [info.label, bridge, bridge && this.helper.kind === 'none' ? '' : suffix];
+    return { ...info, label: parts.filter(Boolean).join(' · ') };
   }
 
   async probe(url) {
-    if (this.full) return this.server.probe(url);
+    if (this.full) {
+      try {
+        return await this.server.probe(url);
+      } catch (error) {
+        if (!error?.unreachable) throw error;
+        return this.device.probe(url).catch(() => {
+          throw error;
+        });
+      }
+    }
     try {
       return await this.device.probe(url);
     } catch (error) {
@@ -418,9 +468,25 @@ export class Siphon {
 
   async start(url, preset, options = {}) {
     if (this.full) {
-      const started = await this.server.start(url, preset, options);
-      this.owners.set(started.id, this.server);
-      return started;
+      try {
+        const started = await this.server.start(url, preset, options);
+        this.owners.set(started.id, this.server);
+        return started;
+      } catch (error) {
+        // Away from home, or with the tunnel down: a link this device can
+        // read itself is still a download, taken here and said so on its row.
+        // A refusal, or anything the server answered, is not the network.
+        if (!error?.unreachable) throw error;
+        try {
+          await this.device.identify(url);
+        } catch {
+          throw error;
+        }
+        const started = await this.device.start(url, preset, options);
+        this.owners.set(started.id, this.device);
+        this.takenHere.add(started.id);
+        return started;
+      }
     }
     try {
       // identify() is what throws when the device has no way in; start() would
@@ -435,8 +501,9 @@ export class Siphon {
     return started;
   }
 
-  poll(id) {
-    return this.#owner(id).poll(id);
+  async poll(id) {
+    const job = await this.#owner(id).poll(id);
+    return this.takenHere.has(id) ? { ...job, note: [TAKEN_HERE, job.note].filter(Boolean).join(' ') } : job;
   }
 
   fileUrl(id) {
@@ -446,6 +513,7 @@ export class Siphon {
   cancel(id) {
     const owner = this.#owner(id);
     this.owners.delete(id);
+    this.takenHere.delete(id);
     return owner.cancel?.(id) || Promise.resolve();
   }
 

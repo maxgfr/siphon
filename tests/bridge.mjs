@@ -242,6 +242,18 @@ const MEDIA = `http://${MEDIA_HOST}:${MEDIA_PORT}/media`;
   });
   check('the page detects the bridge through the handshake', status.bridge === true, JSON.stringify({ bridge: status.bridge, relay: status.relay }));
 
+  // Used ahead of any helper, so named: "no helper", and the guide offering
+  // to install it, read exactly like a bridge that was not running.
+  await page.waitForFunction(() => /bridge/.test(document.getElementById('backendLabel').textContent || ''), null, { timeout: 5000 }).catch(() => {});
+  const header = (await page.textContent('#backendLabel')) || '';
+  check('the header names the bridge, and its version', /bridge 1\.2\.0/.test(header) && !/no helper/.test(header), header);
+  const guide = (await page.textContent('#tourYoutube')) || '';
+  check('and the guide says YouTube is ready through it', /^Ready\./.test(guide) && await page.evaluate(() => document.getElementById('tourOptions').hidden), guide.slice(0, 90));
+  await page.click('#openSettings');
+  const said = (await page.textContent('#statusText')) || '';
+  check('and so do the settings', /bridge/.test(said) && !/will need a helper/.test(said), said.slice(0, 90));
+  await page.click('#closeSettings');
+
   const direct = await download(page, `${MEDIA}/clip.mp4`, 'video_best');
   check('a direct file on a refusing host arrives through the bridge, byte-identical',
     Boolean(direct.saved) && Buffer.compare(readFileSync(direct.saved), readFileSync(at('clip.mp4'))) === 0, direct.error || direct.saved?.split('/').pop());

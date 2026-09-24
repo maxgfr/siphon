@@ -448,7 +448,8 @@ for (const [old, expected] of [
   check('the clip fields bring up a keyboard with a colon on it', clipKeyboards.every((mode) => !['numeric', 'decimal', 'tel'].includes(mode)), clipKeyboards.join(', '));
   check('with your own server set, the yt-dlp options are live', !(await page.evaluate(() => document.getElementById('ytdlpBlock').classList.contains('off'))) && /Applied by your server/.test((await page.textContent('#ytdlpScope')) || ''),
     ((await page.textContent('#ytdlpScope')) || '').slice(0, 60));
-  await page.check('#optSponsor');
+  // Sponsor removal stays off: with a clip, your server refuses the pair,
+  // and so does the sheet.
   await page.fill('#optClipStart', '0:10');
   await page.fill('#optClipEnd', '1:00');
   await page.fill('#optRate', '2M');
@@ -462,7 +463,7 @@ for (const [old, expected] of [
   await page.waitForTimeout(1500);
   const body = posted[0] || {};
   check('the options ride with every job, in the server\'s vocabulary',
-    body.sponsorblock === true && body.clip_start === '0:10' && body.clip_end === '1:00' && body.rate_limit === '2M' && body.yt_client === 'tv' && body.url === 'https://example.com/a-video',
+    body.sponsorblock === false && body.clip_start === '0:10' && body.clip_end === '1:00' && body.rate_limit === '2M' && body.yt_client === 'tv' && body.url === 'https://example.com/a-video',
     JSON.stringify(body).slice(0, 160));
   await page.reload({ waitUntil: 'networkidle' });
   await page.waitForTimeout(1200);
@@ -474,7 +475,7 @@ for (const [old, expected] of [
     rate: document.getElementById('optRate').value,
     client: document.getElementById('optClient').value,
   }));
-  check('and survive a reload', back.sponsor && back.clip === '0:10-1:00' && back.rate === '2M' && back.client === 'tv', JSON.stringify(back));
+  check('and survive a reload', !back.sponsor && back.clip === '0:10-1:00' && back.rate === '2M' && back.client === 'tv', JSON.stringify(back));
 
   // tv_embedded was offered until yt-dlp retired it. Saved then, it is not
   // one of the options now; the server takes it as no preference, and the

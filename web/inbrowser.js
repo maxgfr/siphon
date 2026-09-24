@@ -77,6 +77,7 @@ export class BrowserBackend {
       presets: null,
       escape: this.net.escape?.name || null,
       bridge: this.net.hasBridge,
+      bridgeVersion: this.net.bridgeVersion,
       resolvers: this.resolvers.map((resolver) => resolver.name),
       converterLoaded: isLoaded(),
     };

@@ -84,7 +84,10 @@ export async function writer(key) {
           await writable.write(chunk);
         },
         async reset() {
-          await writable.close().catch(() => {});
+          // Aborted, not closed: close commits the bytes to the file, and a
+          // reload before this attempt finished brought the first attempt's
+          // back as a finished download — "Ready", and a part of the video.
+          await writable.abort().catch(() => {});
           writable = await handle.createWritable();
         },
         async done(mime = '') {

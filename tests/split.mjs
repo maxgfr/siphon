@@ -376,6 +376,29 @@ async function download(url, preset) {
   await setSetting({ subs: 'off' });
 }
 
+/* "This one", the default, of a link that is only a list: its first video,
+   rather than a download of the list's own address, which has no formats. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.fill('#url', `${MEDIA}/list/three`);
+  await page.waitForSelector('.playlist-choice', { timeout: 30_000 }).catch(() => {});
+  const note = (await page.textContent('#playlistNote').catch(() => '')) || '';
+  check('"This one" of a list says it is the list\'s first video', /first video on the list/.test(note), note);
+  const waiting = page.waitForEvent('download', { timeout: 120_000 }).catch(() => null);
+  await page.click('#go');
+  const event = await waiting;
+  const rows = await page.$$eval('#queueList li', (items) => items.map((item) => item.textContent.replace(/\s+/g, ' ').trim()));
+  let same = false;
+  if (event) {
+    const saved = join(WORK, 'downloads', `first-${event.suggestedFilename()}`);
+    await event.saveAs(saved);
+    same = Buffer.compare(readFileSync(saved), readFileSync(at('muxed.mp4'))) === 0;
+  }
+  check('and downloads just that one', rows.length === 1 && same, rows.join(' | ').slice(0, 120));
+}
+
 /* A playlist: one row per video, because a tab cannot build a zip. */
 {
   await page.goto(`http://127.0.0.1:${APP_PORT}/`, { waitUntil: 'networkidle' });

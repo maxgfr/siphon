@@ -386,3 +386,52 @@ def test_every_link_to_the_bridge_in_the_docs_is_the_script_itself() -> None:
     assert links, "docs/ no longer links the bridge"
     for name, link in links:
         assert link == raw, f"{name}: {link}"
+
+
+def dockerfile() -> str:
+    return (ROOT / "server" / "Dockerfile").read_text()
+
+
+def test_a_stop_reaches_the_server_not_a_shell_that_ignores_it() -> None:
+    # `sh -c "uvicorn …"` left dash as PID 1 with uvicorn its child. PID 1
+    # with no handler ignores SIGTERM, and dash only waits on SIGINT: every
+    # docker stop and every deploy sat out the grace period and ended in a
+    # SIGKILL, and Ctrl+C on a foreground run did nothing.
+    cmd = json.loads(re.search(r"^CMD (\[.*\])$", dockerfile(), re.M).group(1))
+    if cmd[0] in ("sh", "/bin/sh", "bash", "/bin/bash"):
+        assert cmd[1] == "-c", cmd
+        assert cmd[2].lstrip().startswith("exec "), cmd
+
+
+def test_the_health_check_asks_this_server_not_the_proxy(tmp_path: Path) -> None:
+    # urllib sends a request through HTTP_PROXY, and on Linux it never skips
+    # loopback on its own: NO_PROXY is matched as a suffix, so 127.0.0.0/8
+    # does not match. A server run behind a proxy, as the README documents,
+    # and every container Docker gives its client's proxies, was unhealthy.
+    import http.server
+    import threading
+
+    command = re.search(r"^HEALTHCHECK[^\n]*\\\n\s*CMD (.*)$", dockerfile(), re.M)
+    assert command, "no HEALTHCHECK CMD"
+
+    class Health(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(200 if self.path == "/api/health" else 404)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Health)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
+        nowhere = "http://127.0.0.1:9"
+        env.update(PORT=str(server.server_address[1]), HTTP_PROXY=nowhere, http_proxy=nowhere, HTTPS_PROXY=nowhere, https_proxy=nowhere)
+        run = subprocess.run(["sh", "-c", command.group(1)], env=env, capture_output=True, text=True, timeout=30)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert run.returncode == 0, run.stderr
