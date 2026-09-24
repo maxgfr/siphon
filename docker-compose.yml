@@ -22,6 +22,9 @@ services:
       # ALLOWED_ORIGINS: "https://maxgfr.github.io"
       # Set this the moment the server is reachable from outside your network.
       # AUTH_TOKEN: "change-me"
+      # This computer's address on your Wi-Fi, for Settings → Test to show as
+      # the one to open on a phone. The container cannot see it for itself.
+      # LAN_URL: "http://192.168.1.42:8000"
       MAX_CONCURRENT_JOBS: "3"
       JOB_TTL_SECONDS: "3600"
     volumes:

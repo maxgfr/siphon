@@ -88,6 +88,9 @@
     </p>
 
     <div id="feedback" aria-live="polite"></div>
+    <!-- How each download ended, said to a screen reader: a row changes in
+         place, and nothing else would announce it. -->
+    <p class="sr-only" id="queueStatus" role="status"></p>
 
     <section class="history" id="queue" hidden>
       <span class="section-label" id="queueLabel">Downloads</span>
@@ -117,10 +120,11 @@
         <div id="tourOptions">
           <p><strong>A free relay</strong> — one click on Cloudflare, then paste the address it gives you into settings.
             <a href="https://deploy.workers.cloudflare.com/?url=https://github.com/maxgfr/siphon/tree/main/relay" target="_blank" rel="noopener">Deploy the relay</a></p>
-          <p><strong>The bridge</strong> — a userscript; nothing leaves this device.
-            <a href="https://github.com/maxgfr/siphon/tree/main/bridge" target="_blank" rel="noopener">Install the bridge</a></p>
+          <p><strong>The bridge</strong> — a userscript for Tampermonkey or Violentmonkey; nothing leaves this device.
+            In Chrome, turn on <em>Allow User Scripts</em> in the manager's extension details too, or no userscript runs.
+            <a href="https://github.com/maxgfr/siphon/raw/main/bridge/siphon-bridge.user.js" target="_blank" rel="noopener">Install the bridge</a></p>
           <p><strong>Your own server</strong> — the most capable: playlists, subtitles, your cookies.
-            <code id="dockerCmd">docker run -d -p 8000:8000 -v siphon:/tmp/siphon ghcr.io/maxgfr/siphon</code>
+            <code id="dockerCmd">docker run -d --name siphon --restart unless-stopped -p 8000:8000 -v siphon:/tmp/siphon ghcr.io/maxgfr/siphon</code>
             <button class="chip-btn" type="button" id="copyDocker">Copy</button></p>
           <p class="tour-owner">Running this site? Set the repository variable <code>SIPHON_RELAY_URL</code> to your relay once, and every visitor gets it by default.</p>
         </div>
@@ -222,14 +226,15 @@
 
         <label class="lbl" for="optClipStart">Clip <span style="font-weight:400;color:var(--muted)">— only this part</span></label>
         <div style="display:flex;gap:8px">
-          <input type="text" id="optClipStart" inputmode="numeric" spellcheck="false" placeholder="from 0:00" />
-          <input type="text" id="optClipEnd" inputmode="numeric" spellcheck="false" placeholder="to 1:30" />
+          <!-- Not a number pad: a phone's has no colon to type 1:23 with. -->
+          <input type="text" id="optClipStart" inputmode="text" spellcheck="false" autocapitalize="off" autocorrect="off" placeholder="from 0:00" />
+          <input type="text" id="optClipEnd" inputmode="text" spellcheck="false" autocapitalize="off" autocorrect="off" placeholder="to 1:30" />
         </div>
         <p class="hint">As <code>1:23</code> or <code>01:02:03</code>. Leave both empty for the whole video.</p>
 
         <label class="lbl" for="optRate">Speed limit <span style="font-weight:400;color:var(--muted)">— optional</span></label>
         <input type="text" id="optRate" inputmode="text" spellcheck="false" autocapitalize="off" placeholder="e.g. 2M" />
-        <p class="hint">Bytes per second, as <code>500K</code> or <code>2M</code>, so a download does not eat the connection.</p>
+        <p class="hint">Bytes per second, as <code>500K</code> or <code>2M</code>, so a download does not eat the connection. Not applied to a clip or a live stream, which ffmpeg fetches.</p>
 
         <label class="lbl" for="optClient">YouTube client</label>
         <select id="optClient">
@@ -240,7 +245,6 @@
           <option value="mweb">mweb</option>
           <option value="web">web</option>
           <option value="ios">ios</option>
-          <option value="tv_embedded">tv_embedded</option>
         </select>
         <p class="hint">
           Which of YouTube's clients to try first. The others still follow when it is turned away.
@@ -271,14 +275,15 @@
 
       <p class="hint">
         <strong>The bridge.</strong> A userscript that lets this page fetch any public address, with no
-        server anywhere — see <code>bridge/</code> in the project. Once installed it is used
-        automatically, ahead of any helper.
+        server anywhere — <a href="https://github.com/maxgfr/siphon/raw/main/bridge/siphon-bridge.user.js" target="_blank" rel="noopener">install it</a> in Tampermonkey
+        or Violentmonkey, and in Chrome turn on <em>Allow User Scripts</em> in the manager's extension
+        details. Once installed it is used automatically, ahead of any helper.
       </p>
     </details>
 
     <div class="status-line">
       <span class="dot" id="statusDot"></span>
-      <span id="statusText">Not checked yet</span>
+      <span id="statusText" role="status">Not checked yet</span>
     </div>
 
     <div class="sheet-actions">

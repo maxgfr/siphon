@@ -9,6 +9,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import { Fetcher, relayEscape, relayTarget, isRelayTemplate } from '../web/net.js';
 
@@ -303,6 +304,74 @@ test('through a relay, the address reported is the relay\'s, so the one asked fo
   }
 });
 
+test('through a relay that says where the request landed, that is where the links are relative to', async () => {
+  // The relay follows redirects itself, so only it knows the final address:
+  // a short link to a playlist on a CDN names its variants relative to the
+  // CDN, and resolved against the short link they are all 404s.
+  const stub = stubFetch([
+    () => {
+      throw new TypeError('Failed to fetch');
+    },
+    () => new Response('#EXTM3U', { headers: { 'X-Siphon-Final-URL': 'https://cdn.example/hls/42/master.m3u8' } }),
+  ]);
+  try {
+    const doc = await new Fetcher({ escape: relayEscape('https://relay.example') }).document('https://short.example/v/42.m3u8');
+    assert.equal(doc.url, 'https://cdn.example/hls/42/master.m3u8');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('the first bytes of a file are read without the rest, even from a host that ignores the range', async () => {
+  // Telling an unnamed application/octet-stream file apart takes a few bytes.
+  // A host that answers the range with the whole file must not have all of
+  // it pulled through: this body never ends, so draining it would hang.
+  let pulled = 0;
+  const endless = new ReadableStream({
+    pull(controller) {
+      pulled += 1;
+      controller.enqueue(new Uint8Array(64).fill(7));
+    },
+  });
+  const stub = stubFetch([() => new Response(endless, { status: 200 })]);
+  try {
+    const head = await new Fetcher().prefix('https://files.example/d/1', { length: 100 });
+    assert.equal(head.length, 100);
+    assert.equal(stub.asked[0].range, 'bytes=0-99');
+    assert.ok(pulled < 10, `read ${pulled} chunks`);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('a peek at a host that refuses HEAD and ignores the range does not pull the file through', async () => {
+  // `/download.php?id=7`: 405 to HEAD, and the whole file to a one-byte GET.
+  // Identifying the link needs its headers, not a copy of it in the tab.
+  const CHUNK = 64 * 1024;
+  const SIZE = 32 * 1024 * 1024;
+  let pulled = 0;
+  const whole = new ReadableStream({
+    pull(controller) {
+      pulled += 1;
+      controller.enqueue(new Uint8Array(CHUNK));
+      if (pulled * CHUNK >= SIZE) controller.close();
+    },
+  });
+  const stub = stubFetch([
+    () => new Response(null, { status: 405 }),
+    () => new Response(whole, { status: 200, headers: { 'Content-Type': 'video/mp4', 'Content-Length': String(SIZE) } }),
+  ]);
+  try {
+    const head = await new Fetcher().peek('https://files.example/download.php?id=7');
+    assert.equal(head.type, 'video/mp4');
+    assert.equal(head.length, SIZE);
+    assert.equal(stub.asked[1].range, 'bytes=0-0');
+    assert.ok(pulled < 10, `read ${pulled} chunks of the body`);
+  } finally {
+    stub.restore();
+  }
+});
+
 /* ------------------------------------------------------------ relay shapes */
 
 test('a relay address is a base of ours or a template of anyone\'s', () => {
@@ -323,4 +392,265 @@ test('a relay and the bridge reach any host; a tunnel reaches only what its serv
   const tunnel = new Fetcher({ escape: { name: 'tunnel', via: (url) => `https://ytdl.example/api/tunnel?url=${encodeURIComponent(url)}` } });
   assert.equal(tunnel.hasEscape, true, 'a tunnel is an escape for the hosts it was told about');
   assert.equal(tunnel.hasOpenEscape, false, 'but not for YouTube\'s own API, which no resolve names');
+});
+
+/** A host that refuses the page, then whatever the escape answers. */
+const throughEscape = (answer) => stubFetch([
+  () => {
+    throw new TypeError('Failed to fetch');
+  },
+  answer,
+]);
+const TUNNEL = { name: 'tunnel', via: (url) => `https://ytdl.example/api/tunnel?url=${encodeURIComponent(url)}` };
+
+test('a 403 the host sent through the relay is the host\'s answer, not the relay refusing', async () => {
+  // googlevideo refusing a link bound to another IP, carried as it came. The
+  // relay went there as asked; ALLOWED_HOSTS has nothing to do with it.
+  for (const escape of [relayEscape('https://relay.example'), TUNNEL]) {
+    const stub = throughEscape(() => new Response('denied', { status: 403 }));
+    try {
+      const error = await new Fetcher({ escape }).text('https://cdn.example/clip.mp4').catch((e) => e);
+      assert.equal(error.message, 'cdn.example answered 403.', escape.name);
+      assert.doesNotMatch(`${error.message} ${error.hint}`, /refused|ALLOWED_HOSTS|resolved itself/, escape.name);
+      assert.equal(stub.asked.length, 2);
+    } finally {
+      stub.restore();
+    }
+  }
+});
+
+test('the relay\'s own refusal, which it marks as its own, says what to change', async () => {
+  const marked = (reason) => () =>
+    new Response(JSON.stringify({ error: reason }), { status: 403, headers: { 'X-Relay-Error': reason } });
+  let stub = throughEscape(marked('host not allowed'));
+  try {
+    const error = await new Fetcher({ escape: relayEscape('https://relay.example') }).text('https://cdn.example/clip.mp4').catch((e) => e);
+    assert.equal(error.message, 'The relay refused to fetch that address.');
+    assert.match(error.hint, /ALLOWED_HOSTS/);
+    assert.equal(error.retryable, false);
+  } finally {
+    stub.restore();
+  }
+  // A relay that no longer takes this page is fixed in another list.
+  stub = throughEscape(marked('origin not allowed'));
+  try {
+    const error = await new Fetcher({ escape: relayEscape('https://relay.example') }).text('https://cdn.example/clip.mp4').catch((e) => e);
+    assert.equal(error.message, 'The relay refused to fetch that address.');
+    assert.match(error.hint, /ALLOWED_ORIGINS/);
+    assert.doesNotMatch(error.hint, /ALLOWED_HOSTS/);
+  } finally {
+    stub.restore();
+  }
+  stub = throughEscape(marked('not a host this server resolved'));
+  try {
+    const error = await new Fetcher({ escape: TUNNEL }).text('https://cdn.example/clip.mp4').catch((e) => e);
+    assert.equal(error.message, 'The server refused to fetch that address.');
+    assert.match(error.hint, /hosts it resolved itself/);
+    assert.equal(error.retryable, false);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('a 502 the relay marks as its own is the host out of its reach, and worth another try', async () => {
+  const unreachable = () => new Response('{"error":"upstream: connect ECONNREFUSED"}', { status: 502, headers: { 'X-Relay-Error': 'upstream: connect ECONNREFUSED' } });
+  let stub = throughEscape(unreachable);
+  try {
+    const error = await new Fetcher({ escape: relayEscape('https://relay.example') }).text('https://cdn.example/clip.mp4').catch((e) => e);
+    assert.equal(error.message, 'The relay could not reach cdn.example.');
+    assert.doesNotMatch(error.message, /answered 502/);
+    assert.equal(error.retryable, true);
+  } finally {
+    stub.restore();
+  }
+  // And a download through it is tried again rather than given up.
+  stub = stubFetch([
+    () => {
+      throw new TypeError('Failed to fetch');
+    },
+    unreachable,
+    () => ok(WHOLE),
+  ]);
+  try {
+    const out = await new Fetcher({ escape: relayEscape('https://relay.example') }).bytes('https://cdn.example/clip.mp4', { attempts: 3 });
+    assert.deepEqual(out, WHOLE);
+    assert.equal(stub.asked.length, 3);
+  } finally {
+    stub.restore();
+  }
+});
+
+/* ------------------------------------------------------------- the bridge */
+
+const USERSCRIPT = readFileSync(new URL('../bridge/siphon-bridge.user.js', import.meta.url), 'utf8');
+
+/**
+ * The page and the userscript, with nothing between them but a window.
+ *
+ * The userscript is the shipped file, run as a manager runs it: handed a
+ * GM_xmlhttpRequest. That one is played here by a host serving `file`, which
+ * answers as a userscript manager does — once, whole, when the last byte is
+ * in — and honours a Range header unless told not to. Every request it was
+ * asked for is recorded, with whether it was called off.
+ */
+function bridged(file, { ignoreRange = false, failOn = null, finalUrl = null, perRequestMs = 0, encoding = null } = {}) {
+  const win = new EventTarget();
+  win.postMessage = (data, _origin, transfer = []) => {
+    const copy = structuredClone(data, { transfer });
+    setTimeout(() => {
+      const event = new Event('message');
+      Object.defineProperties(event, { data: { value: copy }, source: { value: win } });
+      win.dispatchEvent(event);
+    }, 0);
+  };
+  const asked = [];
+  const gm = (options) => {
+    const request = { url: options.url, range: options.headers?.Range || options.headers?.range || null, aborted: false };
+    asked.push(request);
+    const timer = setTimeout(() => {
+      if (failOn?.(asked.length, request)) return options.onerror?.({ error: 'connection reset' });
+      const match = /^bytes=(\d+)-(\d*)$/.exec(request.range || '');
+      let status = 200;
+      let body = file;
+      const headers = [`content-type: video/mp4`];
+      if (match && !ignoreRange) {
+        const from = Number(match[1]);
+        const to = Math.min(match[2] ? Number(match[2]) : file.length - 1, file.length - 1);
+        status = 206;
+        body = file.subarray(from, to + 1);
+        headers.push(`content-range: bytes ${from}-${to}/${file.length}`);
+      }
+      if (encoding) headers.push(`content-encoding: ${encoding}`);
+      headers.push(`content-length: ${body.length}`);
+      const response = body.slice().buffer;
+      options.onload?.({ status, statusText: '', responseHeaders: headers.join('\r\n'), response, finalUrl: finalUrl || options.url });
+    }, perRequestMs);
+    return {
+      abort: () => {
+        request.aborted = true;
+        clearTimeout(timer);
+      },
+    };
+  };
+  globalThis.window = win;
+  new Function('window', 'GM_xmlhttpRequest', USERSCRIPT)(win, gm);
+  return { asked, done: () => delete globalThis.window };
+}
+
+/** A Fetcher whose bridge has announced itself, and which knows the host refuses the page. */
+async function bridgeFetcher(url) {
+  const net = new Fetcher();
+  for (let i = 0; i < 50 && !net.hasBridge; i += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+  assert.ok(net.hasBridge, 'the bridge announced itself');
+  net.verdicts.set(new URL(url).origin, 'bridge');
+  return net;
+}
+
+const MB = 1024 * 1024;
+const FILE = new Uint8Array(24 * MB).map((_, i) => i % 253);
+
+test('a file through the bridge arrives a window at a time, not whole at the end', async () => {
+  // A userscript manager answers a request only once it has all of it. Asked
+  // for in one request, a 1 GB video showed 0% until the end, sat whole in the
+  // manager and then in the page, and could not be resumed part-way.
+  const bridge = bridged(FILE);
+  try {
+    const net = await bridgeFetcher('https://media.example/clip.mp4');
+    const progress = [];
+    let largest = 0;
+    const parts = [];
+    await net.stream('https://media.example/clip.mp4', {
+      onChunk: (chunk) => {
+        largest = Math.max(largest, chunk.length);
+        parts.push(chunk);
+      },
+      onProgress: (received, total) => progress.push([received, total]),
+    });
+    assert.deepEqual(Buffer.concat(parts), Buffer.from(FILE));
+    assert.ok(progress.length > 2, `progress moved ${progress.length} times`);
+    assert.ok(progress.every(([, total]) => total === FILE.length), 'and knew the total from the first window');
+    assert.ok(largest <= 8 * MB, `no piece larger than a window: the largest was ${largest} bytes`);
+    assert.ok(bridge.asked.every((request) => /^bytes=\d+-\d+$/.test(request.range || '')), JSON.stringify(bridge.asked.map((r) => r.range)));
+  } finally {
+    bridge.done();
+  }
+});
+
+test('cancelling a download through the bridge stops the request in the manager', async () => {
+  const bridge = bridged(FILE, { perRequestMs: 20 });
+  try {
+    const net = await bridgeFetcher('https://media.example/clip.mp4');
+    const controller = new AbortController();
+    // Cancelled while the second window is on its way, 5 ms into its 20.
+    const download = net.stream('https://media.example/clip.mp4', {
+      signal: controller.signal,
+      onChunk: () => {},
+      onProgress: () => setTimeout(() => controller.abort(), 5),
+    });
+    await assert.rejects(download, { name: 'AbortError' });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.ok(bridge.asked.some((request) => request.aborted), 'the request in flight was called off');
+    const asked = bridge.asked.length;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(bridge.asked.length, asked, 'and nothing more was asked for');
+  } finally {
+    bridge.done();
+  }
+});
+
+test('a download through the bridge cut part-way resumes from the last window, not from zero', async () => {
+  // The fourth request fails, as a connection dropping near the end does.
+  const bridge = bridged(FILE, { failOn: (count) => count === 4 });
+  try {
+    const net = await bridgeFetcher('https://media.example/clip.mp4');
+    const out = await net.bytes('https://media.example/clip.mp4', { attempts: 3 });
+    assert.deepEqual(Buffer.from(out), Buffer.from(FILE));
+    const broke = Number(/^bytes=(\d+)-/.exec(bridge.asked[3].range)[1]);
+    const next = bridge.asked[4]?.range || '';
+    assert.ok(broke > 0 && next.startsWith(`bytes=${broke}-`), `it asked again from the window that broke (${broke}), not from zero: ${next}`);
+  } finally {
+    bridge.done();
+  }
+});
+
+test('a host that ignores the range through the bridge is taken whole, once', async () => {
+  const small = FILE.subarray(0, 3 * MB);
+  const bridge = bridged(small, { ignoreRange: true });
+  try {
+    const net = await bridgeFetcher('https://media.example/clip.mp4');
+    const out = await net.bytes('https://media.example/clip.mp4');
+    assert.deepEqual(Buffer.from(out), Buffer.from(small));
+    assert.equal(bridge.asked.length, 1);
+  } finally {
+    bridge.done();
+  }
+});
+
+test('a compressed file through the bridge is not pieced together from compressed ranges', async () => {
+  // The manager decodes what it is sent, so a window of a gzip body is not a
+  // window of the file. That answer means one request for the whole, as ever.
+  const bridge = bridged(FILE, { encoding: 'gzip' });
+  try {
+    const net = await bridgeFetcher('https://media.example/data.json');
+    const out = await net.bytes('https://media.example/data.json');
+    assert.deepEqual(Buffer.from(out), Buffer.from(FILE));
+    assert.equal(bridge.asked.length, 2);
+    assert.match(bridge.asked[0].range, /^bytes=0-\d+$/);
+    assert.equal(bridge.asked[1].range, null, 'the second time, whole');
+  } finally {
+    bridge.done();
+  }
+});
+
+test('a playlist through the bridge is relative to where its redirect landed', async () => {
+  const playlist = new TextEncoder().encode('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv360/index.m3u8\n');
+  const bridge = bridged(playlist, { finalUrl: 'https://cdn.example/hls/42/master.m3u8' });
+  try {
+    const net = await bridgeFetcher('https://short.example/v/42.m3u8');
+    const doc = await net.document('https://short.example/v/42.m3u8');
+    assert.equal(doc.url, 'https://cdn.example/hls/42/master.m3u8');
+    assert.equal(new URL('v360/index.m3u8', doc.url).href, 'https://cdn.example/hls/42/v360/index.m3u8');
+  } finally {
+    bridge.done();
+  }
 });

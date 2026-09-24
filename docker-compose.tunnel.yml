@@ -2,9 +2,11 @@
 # on your router.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.tunnel.yml up -d
-#   docker compose logs cloudflared | grep trycloudflare.com
+#   docker compose -f docker-compose.yml -f docker-compose.tunnel.yml logs cloudflared | grep trycloudflare.com
 #
 # The second command prints the https URL the tunnel got. Open that on the phone.
+# It needs the same -f files as the first: compose looks a service up in the
+# files it was given, and docker-compose.yml alone has no cloudflared.
 #
 # Read this before using it: a quick tunnel is a PUBLIC address. Anyone who has
 # it can drive your downloader, on your connection. AUTH_TOKEN is therefore not

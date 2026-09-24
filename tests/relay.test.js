@@ -13,10 +13,13 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import zlib from 'node:zlib';
 
 import worker from '../relay/worker.js';
 
 const ORIGIN = 'https://maxgfr.github.io';
+const realFetch = globalThis.fetch;
 
 /** Stand in for the network, and record exactly what the relay asked it for. */
 function stubUpstream(handler) {
@@ -115,6 +118,82 @@ test('an unset origin allow-list answers anyone, and a set one answers only thos
     // Echoed, not `*`: the answer is specific to the page that asked.
     assert.equal(allowed.headers.get('access-control-allow-origin'), ORIGIN);
     assert.equal(allowed.headers.get('vary'), 'Origin');
+  } finally {
+    upstream.restore();
+  }
+});
+
+test("the page's address in ALLOWED_ORIGINS admits the page, since a browser sends only its origin", async () => {
+  // https://you.github.io/siphon/, copied from the address bar as the READMEs
+  // said, was compared as written with an Origin that never has a path, and
+  // locked the page out of its own relay.
+  const upstream = stubUpstream();
+  try {
+    for (const setting of ['https://maxgfr.github.io/siphon/', 'https://maxgfr.github.io/', 'HTTPS://MAXGFR.GITHUB.IO', 'https://maxgfr.github.io:443']) {
+      const env = { ALLOWED_ORIGINS: setting };
+      const allowed = await call(relayUrl(YT), { headers: { Origin: ORIGIN }, env });
+      assert.equal(allowed.status, 200, setting);
+      assert.equal(allowed.headers.get('access-control-allow-origin'), ORIGIN, setting);
+      const refused = await call(relayUrl(YT), { headers: { Origin: 'https://evil.example' }, env });
+      assert.equal(refused.status, 403, setting);
+    }
+  } finally {
+    upstream.restore();
+  }
+});
+
+test('ALLOWED_ORIGINS=* answers anyone, as it does on the server', async () => {
+  const upstream = stubUpstream();
+  try {
+    const response = await call(relayUrl(YT), { headers: { Origin: 'https://anyone.example' }, env: { ALLOWED_ORIGINS: '*' } });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('access-control-allow-origin'), '*');
+  } finally {
+    upstream.restore();
+  }
+});
+
+test("the relay's own refusals are marked, so a page can tell them from a host's 403", async () => {
+  // googlevideo answers 403 for a link bound to another IP; the allow-list
+  // answers 403 for a host it does not carry. Only the second is fixed by
+  // editing ALLOWED_HOSTS, and the status alone cannot say which it was.
+  const upstream = stubUpstream((url) =>
+    String(url).includes('googlevideo')
+      ? new Response('forbidden by google', { status: 403, headers: { 'X-Relay-Error': 'spoofed' } })
+      : new Response(null, { status: 302, headers: { Location: 'https://elsewhere.example/x' } }),
+  );
+  try {
+    const env = { ALLOWED_ORIGINS: ORIGIN };
+    for (const [target, headers, reason] of [
+      [YT, { Origin: 'https://someone-else.example' }, 'origin not allowed'],
+      ['https://evil.example/x', { Origin: ORIGIN }, 'host not allowed'],
+      ['http://10.0.0.1/x', { Origin: ORIGIN }, 'not a public address'],
+      [YT, { Origin: ORIGIN }, 'redirect refused: host not allowed'],
+    ]) {
+      const response = await call(relayUrl(target), { headers, env });
+      assert.equal(response.headers.get('x-relay-error'), reason, target);
+    }
+
+    const carried = await call(relayUrl('https://rr3---sn-4g5e6nez.googlevideo.com/videoplayback'), { headers: { Origin: ORIGIN }, env });
+    assert.equal(carried.status, 403);
+    assert.equal(await carried.text(), 'forbidden by google');
+    // Only the relay may say it refused: an upstream's header of that name is dropped.
+    assert.equal(carried.headers.get('x-relay-error'), null);
+  } finally {
+    upstream.restore();
+  }
+});
+
+test("an upstream that cannot be reached is the relay's own 502, and marked as one", async () => {
+  const upstream = stubUpstream(() => {
+    throw new Error('connect ECONNREFUSED\nsecond line «here»');
+  });
+  try {
+    const response = await call(relayUrl(YT));
+    assert.equal(response.status, 502);
+    // One line of plain text, whatever the runtime's message held: a header
+    // that is not is a TypeError, and the relay answers nothing.
+    assert.match(response.headers.get('x-relay-error'), /^upstream: connect ECONNREFUSED [\x20-\x7e]*$/);
   } finally {
     upstream.restore();
   }
@@ -247,6 +326,47 @@ test('an upstream encoding is not forwarded, because the body arrives decoded', 
   }
 });
 
+test("the browser's zstd is not asked for, because the runtime's fetch could not undo it", async () => {
+  // Chrome and Firefox offer zstd; Node 22's fetch decodes gzip, deflate and
+  // br only. A host that took the offer reached the page as compressed bytes
+  // with the encoding header dropped as decoded. The runtime's own fetch
+  // runs here against a local host — the stub only points the name at it.
+  const body = JSON.stringify({ title: 'hello', formatStreams: [] });
+  const seen = [];
+  const host = createServer((req, res) => {
+    const offered = req.headers['accept-encoding'] || '';
+    seen.push(offered);
+    if (/zstd/.test(offered)) {
+      // Real zstd where this Node can make it; its magic number and the
+      // bytes otherwise, which no fetch decodes either way.
+      const packed = zlib.zstdCompressSync ? zlib.zstdCompressSync(body) : Buffer.concat([Buffer.from('28b52ffd', 'hex'), Buffer.from(body)]);
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Encoding': 'zstd' }).end(packed);
+    } else if (/gzip/.test(offered)) {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' }).end(zlib.gzipSync(body));
+    } else {
+      res.writeHead(200, { 'Content-Type': 'application/json' }).end(body);
+    }
+  });
+  await new Promise((resolve) => host.listen(0, '127.0.0.1', resolve));
+  const local = `http://127.0.0.1:${host.address().port}`;
+  const upstream = stubUpstream((url, init) => realFetch(String(url).replace('https://inv.example.net', local), init));
+  try {
+    const env = { ALLOWED_HOSTS: 'example.net' };
+    const response = await call(relayUrl('https://inv.example.net/api/v1/videos/x'), { headers: { 'Accept-Encoding': 'gzip, deflate, br, zstd' }, env });
+    assert.equal(response.status, 200);
+    assert.deepEqual(JSON.parse(await response.text()), JSON.parse(body));
+    assert.doesNotMatch(seen[0], /zstd/);
+
+    // A range is offsets into the bytes as sent, which decoding would move.
+    // Given no list of its own, fetch asks for those bytes unencoded.
+    await (await call(relayUrl('https://inv.example.net/videoplayback'), { headers: { 'Accept-Encoding': 'gzip, deflate, br, zstd', Range: 'bytes=0-9' }, env })).arrayBuffer();
+    assert.equal(seen[1], 'identity');
+  } finally {
+    upstream.restore();
+    host.close();
+  }
+});
+
 test('content-length survives when nothing was encoded, since a progress bar needs it', async () => {
   const upstream = stubUpstream(() => new Response('12345', { headers: { 'Content-Length': '5' } }));
   try {
@@ -329,6 +449,32 @@ test('a redirect between allowed hosts is followed, relative locations included'
   }
 });
 
+test('where the redirects ended is sent back, since a playlist is relative to that', async () => {
+  // Through the relay, the answer's address is the relay's own, so a page
+  // resolving a redirected playlist's relative links had only the address it
+  // asked for — the short link, not the CDN directory the playlist lives in.
+  let n = 0;
+  const upstream = stubUpstream(() => {
+    n += 1;
+    if (n === 1) return new Response(null, { status: 302, headers: { Location: 'https://rr3---sn-abc.googlevideo.com/hls/42/master.m3u8' } });
+    return new Response('#EXTM3U\nv360.m3u8\n', { status: 200, headers: { 'X-Siphon-Final-URL': 'https://elsewhere.example/' } });
+  });
+  try {
+    const response = await call(relayUrl('https://youtu.be/x'), { headers: { Origin: ORIGIN } });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('x-siphon-final-url'), 'https://rr3---sn-abc.googlevideo.com/hls/42/master.m3u8');
+    // Readable by the page: the request carries no credentials, so '*' exposes every header.
+    assert.equal(response.headers.get('access-control-expose-headers'), '*');
+    assert.equal(response.headers.get('access-control-allow-credentials'), null);
+
+    // With no redirect it is simply the address asked for.
+    const plain = await call(relayUrl(YT), { headers: { Origin: ORIGIN } });
+    assert.equal(plain.headers.get('x-siphon-final-url'), YT);
+  } finally {
+    upstream.restore();
+  }
+});
+
 test('a redirect loop ends with a 502', async () => {
   const upstream = stubUpstream(() => new Response(null, { status: 302, headers: { Location: YT } }));
   try {
@@ -349,6 +495,44 @@ test('the shapes of a private address the first check missed are refused too', a
       assert.equal((await response.json()).error, 'not a public address', target);
     }
     assert.equal(upstream.calls.length, 0);
+  } finally {
+    upstream.restore();
+  }
+});
+
+test('a public host that merely contains "local" is fetched when it is allowed', async () => {
+  // The check was anchored only at the start, so www.local.ch and
+  // localtv.com were "not a public address" before the allow-list was asked.
+  const upstream = stubUpstream((url) =>
+    String(url).includes('hop.local10.com') ? new Response(null, { status: 302, headers: { Location: 'https://www.local.ch/y.mp4' } }) : new Response('ok'),
+  );
+  try {
+    const env = { ALLOWED_HOSTS: 'local10.com,local.ch,localtv.com,localhostr.com' };
+    for (const target of ['https://www.local10.com/x.mp4', 'https://www.local.ch/x.mp4', 'https://media.localtv.com/x.mp4', 'https://localhostr.com/x.mp4', 'https://hop.local10.com/x.mp4']) {
+      const response = await call(relayUrl(target), { env });
+      assert.equal(response.status, 200, target);
+    }
+  } finally {
+    upstream.restore();
+  }
+});
+
+test('private names and numbers are still refused, first asked or reached by redirect', async () => {
+  const privates = ['http://printer.local/', 'http://printer.local./', 'http://a.localhost/', 'http://localhost/', 'http://localhost./', 'http://127.0.0.1/', 'http://10.0.0.1/', 'http://172.16.0.1/', 'http://[::1]/'];
+  const upstream = stubUpstream((url) => new Response(null, { status: 302, headers: { Location: new URL(url).searchParams.get('to') } }));
+  try {
+    const env = { ALLOWED_HOSTS: 'printer.local,a.localhost,localhost,127.0.0.1,10.0.0.1,172.16.0.1,[::1],googlevideo.com' };
+    for (const target of privates) {
+      const first = await call(relayUrl(target), { env });
+      assert.equal(first.status, 400, target);
+      assert.equal((await first.json()).error, 'not a public address', target);
+    }
+    assert.equal(upstream.calls.length, 0);
+    for (const target of privates) {
+      const hop = await call(relayUrl(`https://rr1.googlevideo.com/r?to=${encodeURIComponent(target)}`), { env });
+      assert.equal(hop.status, 403, target);
+      assert.equal((await hop.json()).error, 'redirect refused: not a public address', target);
+    }
   } finally {
     upstream.restore();
   }

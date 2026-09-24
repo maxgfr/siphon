@@ -2,13 +2,24 @@ name = "siphon-relay"
 main = "worker.js"
 compatibility_date = "2026-01-01"
 
+# Keep the variables set in the dashboard when this deploys. The Deploy button
+# sets up a build that runs `wrangler deploy` on every push, and without this
+# each deploy deletes every plain-text variable the file below does not list —
+# an ALLOWED_ORIGINS added in the dashboard among them, which leaves the relay
+# answering every site without a word. Top level, above [vars]: below it, TOML
+# would make it a variable.
+keep_vars = true
+
 [vars]
 # Which hosts this relay will fetch. Suffix matches, so "googlevideo.com"
 # covers every one of YouTube's numbered media servers. Leave it out to get the
-# defaults in worker.js, which are exactly these.
+# defaults in worker.js, which are exactly these. Change it here rather than in
+# the dashboard: every deploy sets it from this file.
 ALLOWED_HOSTS = "youtube.com,youtu.be,youtube-nocookie.com,googlevideo.com,ytimg.com,ggpht.com,youtubei.googleapis.com,invidious.f5.si,nadeko.net,yewtu.be,invidious.nerdvpn.de,yt.chocolatemoo53.com,invidious.tiekoetter.com,inv.thepixora.com"
 
-# Which pages may use it. SET THIS. Without it, anyone who finds the URL can
-# run their downloads through your worker.
+# Which pages may use it. SET THIS — as a secret, so no deploy can drop it:
+# `npx wrangler secret put ALLOWED_ORIGINS`, or a Secret in the dashboard.
+# Without it, anyone who finds the URL can run their downloads through your
+# worker. The value is your page's origin, with no path:
 #
-#   ALLOWED_ORIGINS = "https://yourname.github.io"
+#   https://yourname.github.io

@@ -12,6 +12,11 @@ if [ "$(id -u)" = "0" ]; then
     mkdir -p "$dir"
     chown app:app "$dir"
   done
+  # setpriv changes who the process is, not its environment, so HOME would
+  # stay /root, which the app user cannot write — and yt-dlp's cache, the
+  # YouTube player it otherwise fetches and solves again for every job, went
+  # nowhere without a word.
+  export HOME=/home/app
   exec setpriv --reuid=app --regid=app --init-groups -- "$@"
 fi
 exec "$@"

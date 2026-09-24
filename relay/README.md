@@ -30,12 +30,17 @@ copy of the server.
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/maxgfr/siphon/tree/main/relay)
 
 One click, a free Cloudflare account, and a `*.workers.dev` address at the
-end. Set `ALLOWED_ORIGINS` to your frontend's URL in the Worker's settings once
-it exists. Then either paste the address into the app's settings, or — if you
-run the site — set the repository variable `SIPHON_RELAY_URL` to it, so every
-visitor gets it as their helper with nothing to configure (the Pages deploy
-writes it into `web/config.json`; the app names it on screen, and clearing it
-is one tap). Or from a terminal:
+end. Once it exists, add `ALLOWED_ORIGINS` in the Worker's settings (Settings
+→ Variables and Secrets) as a **Secret**, set to your page's origin — scheme
+and host, no path: `https://yourname.github.io`, not
+`https://yourname.github.io/siphon/`. A Secret, because the button also sets
+up a build that runs `wrangler deploy` on every push: a deploy replaces the
+plain-text variables with the ones `wrangler.toml` lists unless the file says
+`keep_vars` (this one does), and never touches a Secret. Then either paste the
+address into the app's settings, or — if you run the site — set the repository
+variable `SIPHON_RELAY_URL` to it, so every visitor gets it as their helper
+with nothing to configure (the Pages deploy writes it into `web/config.json`;
+the app names it on screen, and clearing it is one tap). Or from a terminal:
 
 ```sh
 cd relay
@@ -58,9 +63,12 @@ context.
 
 Two things it changes, one each way. It uses **your home IP**, which YouTube
 treats far more gently than a datacentre's — so this clears bot walls the
-Worker cannot. And it only exists while your machine does, so a phone can use
-it only when it can reach that machine. It is also what CI uses to drive a real
-YouTube download.
+Worker cannot. And it is for the browser on that machine alone. A phone on the
+same Wi-Fi can reach the machine and still not use it: the page is HTTPS, and
+a browser lets an HTTPS page call plain http on `127.0.0.1` only — anything
+else, `HOST=0.0.0.0` and a LAN address included, is mixed content and blocked.
+A phone needs the Worker. It is also what CI uses to drive a real YouTube
+download.
 
 Free-tier Workers allow 100,000 requests a day, which a personal downloader
 will not come close to: one video is a handful of requests, not one per
@@ -73,13 +81,23 @@ fetches only the media hosts it lists, so a stranger who finds the URL cannot
 point it at anything else — redirects included: they are followed by hand,
 and each one is checked against the list and the private-address rule
 before it is fetched. It defaults to YouTube's hosts; widen it only for
-hosts you actually want to download from.
+hosts you actually want to download from — in `wrangler.toml`, not the
+dashboard: every deploy sets it from the file.
 
 **`ALLOWED_ORIGINS`** is what keeps other people's pages from spending your
-quota. Leave it unset and the worker answers anyone. Set it to your own
-frontend's URL and it answers only that. It is checked in the worker rather
+quota. Leave it unset (or `*`) and the worker answers anyone. Set it to your
+own page's origin — `https://yourname.github.io`, comma-separated if there are
+several — and it answers only that; a page's full address is cut down to its
+origin, since that is all a browser sends. It is checked in the worker rather
 than left to CORS, because CORS only stops a browser reading the answer — it
 does not stop the worker making the request.
+
+A refusal of the worker's own — this origin, that host — carries an
+`X-Relay-Error` header naming it, which a status the host sent never does: a
+403 from googlevideo is the host's answer, carried, not the allow-list's.
+What it carries says where the redirects it followed ended, in
+`X-Siphon-Final-URL`, since the answer's own address is the worker's: the
+page resolves a redirected playlist's relative links against it.
 
 Cookies are never forwarded in either direction, so the relay cannot act as a
 signed-in user of anything it fetches, and cannot hand one page another page's

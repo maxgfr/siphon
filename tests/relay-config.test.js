@@ -10,7 +10,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { through, evaluate, choose, candidates, cobaltCandidates, evaluateCobalt, chooseCobalt, fromSource, sourceEntries, PUBLIC_RELAYS, COBALT_DIRECTORY, COBALT_DIRECTORIES, COBALT_SOURCE, USER_AGENT, ROBOTS, VIDEO_ID, WATCH } from '../scripts/relay-config.mjs';
+import { spawnSync } from 'node:child_process';
+
+import { through, evaluate, choose, candidates, ownRelay, cobaltCandidates, evaluateCobalt, chooseCobalt, fromSource, sourceEntries, ORIGIN, PUBLIC_RELAYS, COBALT_DIRECTORY, COBALT_DIRECTORIES, COBALT_SOURCE, USER_AGENT, ROBOTS, VIDEO_ID, WATCH } from '../scripts/relay-config.mjs';
 
 const STREAMS = { formatStreams: [{ url: '/videoplayback?itag=18', type: 'video/mp4' }] };
 
@@ -94,10 +96,79 @@ test("when the owner's relay is down, the first public one that passes is taken,
   assert.equal(found.relayKind, 'public');
 });
 
+test("the owner's relay typed without a scheme is given https://, since the page refuses a bare host", async () => {
+  // The page probes an address with no scheme as a path under its own host,
+  // so it refuses one: a relay written into config.json as "you.workers.dev"
+  // was never adopted. The hosted page is https, and a relay it can call
+  // from every visitor's browser is too.
+  assert.equal(ownRelay('mine.workers.dev'), 'https://mine.workers.dev');
+  assert.equal(ownRelay('  mine.workers.dev/ '), 'https://mine.workers.dev/');
+  assert.equal(ownRelay('//mine.workers.dev'), 'https://mine.workers.dev');
+  assert.equal(ownRelay('corsproxy.example/?url={url}'), 'https://corsproxy.example/?url={url}');
+  // One with a scheme is left as it is, and nothing is nothing.
+  assert.equal(ownRelay('https://mine.workers.dev'), 'https://mine.workers.dev');
+  assert.equal(ownRelay('HTTP://127.0.0.1:8787'), 'HTTP://127.0.0.1:8787');
+  assert.equal(ownRelay(''), '');
+  assert.equal(ownRelay(undefined), '');
+
+  const { fetchImpl, asked } = world({ instances: { 'inv.example': STREAMS } });
+  const found = await choose({ own: ' mine.workers.dev ', fetchImpl, instances: ['https://inv.example'] });
+  assert.deepEqual([found.relay, found.relayKind], ['https://mine.workers.dev', 'own']);
+  assert.ok(asked[0].startsWith('https://mine.workers.dev/?url='), asked[0]);
+  assert.equal(candidates('mine.workers.dev')[0], 'https://mine.workers.dev');
+});
+
+test("an owner's relay that is not an http(s) address is refused, saying what to set instead", () => {
+  for (const bad of ['ftp://mine.example', 'javascript:alert(1)', 'https://mine example.dev', 'https://', 'mine.workers.dev:port']) {
+    assert.throws(() => ownRelay(bad), (error) => {
+      assert.match(error.message, /^SIPHON_RELAY_URL /, bad);
+      assert.match(error.message, /https:\/\/you\.workers\.dev/, bad);
+      return true;
+    }, bad);
+  }
+  // Run as the workflow runs it, the refusal is the whole output, before
+  // anything is measured or written.
+  const run = spawnSync(process.execPath, ['scripts/relay-config.mjs'], {
+    env: { ...process.env, SIPHON_RELAY_URL: 'ftp://mine.example' },
+    encoding: 'utf8',
+    timeout: 20_000,
+  });
+  assert.equal(run.status, 1, run.stdout);
+  assert.match(run.stderr, /SIPHON_RELAY_URL "ftp:\/\/mine\.example" is not/);
+  assert.equal(run.stdout, '');
+});
+
 test('nothing passing is no relay, never a dead one', async () => {
   const { fetchImpl } = world({ robotsCors: '' });
   const found = await choose({ fetchImpl, instances: ['https://inv.example'] });
   assert.deepEqual(found, { relay: '', relayKind: '', instance: '' });
+});
+
+test("the page asked as is this repository's, so a fork's relay is measured as its page reaches it", () => {
+  // The workflows pass the repository's Pages origin. Asked as
+  // maxgfr.github.io, a fork's relay — locked to the fork's page as the
+  // README says — answered 403 every day and was logged as down. Run as the
+  // workflow runs it: the variable set, then the scripts, then the relay.
+  const script = `
+    const config = await import('./scripts/relay-config.mjs');
+    const instances = await import('./scripts/instances.mjs');
+    const { default: worker } = await import('./relay/worker.js');
+    globalThis.fetch = async () => new Response('User-agent: *\\nDisallow: /x\\n', { status: 200 });
+    const env = { ALLOWED_ORIGINS: 'https://forkowner.github.io' };
+    const report = await config.evaluate('https://fork-relay.example', { fetchImpl: (url, init) => worker.fetch(new Request(url, init), env) });
+    console.log(JSON.stringify({ config: config.ORIGIN, instances: instances.ORIGIN, robots: report.robots }));
+  `;
+  const run = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    env: { ...process.env, SIPHON_ORIGIN: 'https://ForkOwner.github.io/siphon/' },
+    encoding: 'utf8',
+  });
+  assert.equal(run.status, 0, run.stderr);
+  const said = JSON.parse(run.stdout.trim().split('\n').at(-1));
+  // A page's address, cut to the origin a browser would send for it.
+  assert.equal(said.config, 'https://forkowner.github.io');
+  assert.equal(said.instances, 'https://forkowner.github.io');
+  assert.equal(said.robots, 'ok (cors=https://forkowner.github.io)');
+  assert.equal(ORIGIN, 'https://maxgfr.github.io', 'unset, the upstream page as before');
 });
 
 /* ------------------------------------------------------------------ cobalt */
@@ -111,8 +182,17 @@ const DIRECTORY = [
   { api: 'open.example/', protocol: 'https', online: true, api_online: true, score: 50 },
 ];
 
-/** A cobalt world: every instance answers the sample link its own way; the tunnel streams bytes. */
-function cobaltWorld({ answers, media = 'video/mp4', directory = DIRECTORY } = {}) {
+/** What cobalt answers a page with by default: any origin, the preflight's header allowed. */
+const OPEN_CORS = { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'content-type' };
+
+/**
+ * A cobalt world: every instance answers the sample link its own way; the
+ * tunnel streams bytes. Each answers a page's preflight and carries the CORS
+ * header, as cobalt does by default, unless its host is `closed` (no header,
+ * the preflight refused) or `unread` (a preflight passed, an answer without
+ * the header).
+ */
+function cobaltWorld({ answers, media = 'video/mp4', directory = DIRECTORY, closed = [], unread = [] } = {}) {
   const asked = [];
   const fetchImpl = async (url, init = {}) => {
     asked.push({ url, method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : null, headers: init.headers || {} });
@@ -125,9 +205,17 @@ function cobaltWorld({ answers, media = 'video/mp4', directory = DIRECTORY } = {
       return new Response(new Uint8Array(2048), { status: 200, headers: { 'content-type': media } });
     }
     const host = new URL(url).host;
+    if (init.method === 'OPTIONS') {
+      if (closed.includes(host)) return new Response('forbidden', { status: 403 });
+      return new Response(null, {
+        status: 204,
+        headers: { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET,POST', 'access-control-allow-headers': init.headers['Access-Control-Request-Headers'] },
+      });
+    }
+    const cors = closed.includes(host) || unread.includes(host) ? {} : { 'access-control-allow-origin': '*' };
     const answer = answers[host];
-    if (!answer) return new Response(JSON.stringify({ status: 'error', error: { code: 'error.api.auth.key.missing' } }), { status: 401 });
-    return new Response(JSON.stringify(answer), { status: 200 });
+    if (!answer) return new Response(JSON.stringify({ status: 'error', error: { code: 'error.api.auth.key.missing' } }), { status: 401, headers: cors });
+    return new Response(JSON.stringify(answer), { status: 200, headers: cors });
   };
   return { asked, fetchImpl };
 }
@@ -159,7 +247,8 @@ test('the second directory is asked when the first is unreachable, and each is n
     if (url === first) throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND' } });
     if (COBALT_DIRECTORIES.includes(url)) return new Response(JSON.stringify({ data: { youtube: ['open.example'] } }), { status: 200 });
     if (url.endsWith('/tunnel')) return new Response(new Uint8Array(64), { status: 200, headers: { 'content-type': 'video/mp4' } });
-    return new Response(JSON.stringify(answer), { status: 200 });
+    if (init.method === 'OPTIONS') return new Response(null, { status: 204, headers: OPEN_CORS });
+    return new Response(JSON.stringify(answer), { status: 200, headers: OPEN_CORS });
   };
   const lines = [];
   assert.equal(await chooseCobalt({ fetchImpl, say: (l) => lines.push(l) }), 'https://open.example');
@@ -186,6 +275,28 @@ test('an instance passes when it answers a tunnel for the sample link and the tu
   const post = asked.find((a) => a.method === 'POST');
   assert.equal(post.body.url, WATCH, 'the same link the app would send');
   assert.equal(post.body.downloadMode, 'auto');
+});
+
+test('an instance a page may not call is a no, however well it answers a runner', async () => {
+  // The app POSTs JSON from the page: the browser asks first, and reads the
+  // answer only with the header. A runner does neither, so an instance that
+  // keeps CORS to its own frontend passed, was offered, and failed on tap.
+  const tunnel = { status: 'tunnel', url: 'https://open.example/tunnel' };
+  const shut = cobaltWorld({ answers: { 'open.example': tunnel }, closed: ['open.example'] });
+  const refused = await evaluateCobalt('https://open.example', { fetchImpl: shut.fetchImpl });
+  assert.equal(refused.ok, false);
+  assert.match(refused.answer, /preflight HTTP 403, cors=NONE/);
+  const preflight = shut.asked[0];
+  assert.equal(preflight.method, 'OPTIONS', 'asked first, as a browser asks');
+  assert.equal(preflight.headers.Origin, ORIGIN);
+  assert.equal(preflight.headers['Access-Control-Request-Method'], 'POST');
+  assert.equal(preflight.headers['Access-Control-Request-Headers'], 'content-type');
+  assert.ok(!shut.asked.some((a) => a.method === 'POST'), 'nothing the browser would not send');
+
+  const unread = cobaltWorld({ answers: { 'open.example': tunnel }, unread: ['open.example'] });
+  const blind = await evaluateCobalt('https://open.example', { fetchImpl: unread.fetchImpl });
+  assert.equal(blind.ok, false);
+  assert.match(blind.answer, /tunnel, but cors=NONE/);
 });
 
 test('a keyed instance is a no, with its error code kept', async () => {
@@ -272,8 +383,9 @@ test('with both directories behind a challenge page, the source repository is re
     if (url === 'https://raw.example/two.toml') return new Response('api = "two.example"\n', { status: 200 });
     if (url === 'https://raw.example/down.json') return new Response('{"api":"down.example","online":false}', { status: 200 });
     if (url.endsWith('/tunnel')) return new Response(new Uint8Array(64), { status: 200, headers: { 'content-type': 'video/mp4' } });
-    if (url === 'https://one.example/') return new Response(JSON.stringify({ status: 'error', error: { code: 'error.api.auth.key.missing' } }), { status: 401 });
-    if (url === 'https://two.example/') return new Response(JSON.stringify({ status: 'tunnel', url: 'https://two.example/tunnel' }), { status: 200 });
+    if (init.method === 'OPTIONS') return new Response(null, { status: 204, headers: OPEN_CORS });
+    if (url === 'https://one.example/') return new Response(JSON.stringify({ status: 'error', error: { code: 'error.api.auth.key.missing' } }), { status: 401, headers: OPEN_CORS });
+    if (url === 'https://two.example/') return new Response(JSON.stringify({ status: 'tunnel', url: 'https://two.example/tunnel' }), { status: 200, headers: OPEN_CORS });
     return new Response('{}', { status: 404 });
   };
   const lines = [];

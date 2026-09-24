@@ -35,14 +35,19 @@ and when a file has to be merged or converted it loads
 app, fetched only when a job needs it — and does that here too. It covers what
 the web serves media as, rather than one site at a time:
 
-- a direct `.mp4`, `.webm`, `.m4a`, `.mp3` — the file is the link
+- a direct `.mp4`, `.webm`, `.m4a`, `.mp3` — the file is the link; a
+  download link with no extension, sent as `application/octet-stream`, is
+  known by the name it is sent under or by its first bytes
 - an `.m3u8` HLS stream, including AES-128 encrypted ones, remuxed to MP4
 - a page whose markup declares its video: `og:video`, `<video src>`,
-  `<source>`, JSON-LD `contentUrl`, or an `.m3u8` in inline JSON
-- MP3 and M4A extraction from any of the above, tagged and with cover art
+  `<source>`, a JSON-LD `VideoObject`'s `contentUrl`, or an `.m3u8` in inline
+  JSON
+- MP3 and M4A extraction from any of the above, tagged and with cover art;
+  from an HLS stream it takes the audio-only rendition, or the lightest one
 
 A progressive MP4 at the quality you asked for is handed over exactly as it
-arrived, streamed straight to disk, so the common case costs no conversion.
+arrived, streamed straight to disk, so the common case costs no conversion;
+so is an `.mp3` asked for as MP3, which keeps its own tags.
 A download that breaks resumes where it stopped rather than starting over.
 
 ### YouTube from the page alone: an external instance
@@ -105,15 +110,27 @@ honestly: a public instance that answers a page is a find, not a plan.
 ### No server anywhere: the bridge
 
 A userscript manager (Tampermonkey, Violentmonkey) is itself an extension with
-host permissions, and it lends them to scripts. [`bridge/`](bridge/) is one
-script that runs only on siphon's page and fetches on its behalf, so every
-extractor already here — direct, HLS, pages, YouTube through youtubei.js —
-works on hosts that refuse the page. Install it once; the app uses it
-automatically, ahead of any helper. Desktop Chrome and Firefox, and Firefox
-for Android. It runs on your IP, which YouTube treats far more gently than a
-datacentre's. It fetches public http(s) addresses only, with GET, HEAD or
-POST — never this machine or your network — because its `localhost:8000`
-match cannot tell siphon from anything else served on that port.
+host permissions, and it lends them to scripts. [`bridge/siphon-bridge.user.js`](https://github.com/maxgfr/siphon/raw/main/bridge/siphon-bridge.user.js)
+is one script that runs only on siphon's page and fetches on its behalf, so
+every extractor already here — direct, HLS, pages, YouTube through
+youtubei.js — works on hosts that refuse the page. Install it once, from
+that link: the manager opens its install page for it, and checks the same
+address for updates. The app then uses it automatically, ahead of any
+helper. Desktop Chrome and Firefox, and Firefox for Android. In Chrome, open
+the manager's extension details and turn on **Allow User Scripts** as well:
+until it is on, Chrome runs no userscript at all, and the page carries on
+as if there were no bridge. It runs on your IP, which YouTube treats far
+more gently than a datacentre's. It fetches public http(s) addresses only,
+with GET, HEAD or POST — never this machine or your network — because its
+`localhost:8000` match cannot tell siphon from anything else served on that
+port.
+
+A userscript manager hands a response over only once all of it has arrived,
+so the page asks the bridge for a file a few megabytes at a time: the bar
+moves, the file still goes to disk as it comes, and a broken connection costs
+one piece rather than the whole file. Version 1.2 of the script also stops the
+transfer when you cancel, and reports where a redirect landed, which a
+playlist's relative addresses depend on; update it if yours is older.
 
 ## 2. Your own server, with yt-dlp
 
@@ -121,24 +138,30 @@ The most capable way, and the one every other route falls back to. One
 command, nothing to clone:
 
 ```sh
-docker run -d -p 8000:8000 -v siphon:/tmp/siphon ghcr.io/maxgfr/siphon
+docker run -d --name siphon --restart unless-stopped -p 8000:8000 -v siphon:/tmp/siphon ghcr.io/maxgfr/siphon
 ```
 
 Open `http://localhost:8000`. The image serves the interface *and* the API
 from one origin, so there is no CORS and nothing else to deploy; it is
 published for amd64 and arm64, so the same command works on an Apple Silicon
 Mac or a Raspberry Pi. Every push is also tagged with its short commit sha.
+The `siphon` volume is where the downloads and an uploaded cookie jar live,
+and the name is what the update below finds the container by. The restart
+policy brings it back after a reboot; with a name, the same command run
+again would be refused, and `docker start siphon` is what starts a stopped one.
 
 Or use the hosted page and point it at the machine you are sitting at: open
 [the page](https://maxgfr.github.io/siphon/), **Settings → Use this
 computer**, Save. Browsers treat `localhost` as a secure context, so the
 HTTPS page may call it; Chrome's private-network preflight is answered.
-Verified in a real browser. `ALLOWED_ORIGINS` names that page by default and
-nothing else, so another site open in the same browser is refused — name
-your own page there if you host a copy.
+Verified in a real browser. Newer Chrome also asks you, once, whether the
+page may reach apps on this device — its local network access permission:
+allow it, or the page cannot reach the server. `ALLOWED_ORIGINS` names that
+page by default and nothing else, so another site open in the same browser
+is refused — name your own page there if you host a copy.
 
-`docker compose up -d` does the same with a named volume, a restart policy and
-somewhere obvious to put `AUTH_TOKEN`. To build from source:
+`docker compose up -d` does the same, with somewhere obvious to put
+`AUTH_TOKEN`. To build from source:
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
@@ -146,18 +169,28 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
 ### From your phone
 
-- **Same Wi-Fi.** **Settings → Test** on the computer prints the address to
-  use, something like `http://192.168.1.42:8000`. Open it on the phone, then
-  **Add to Home Screen**: on Android it becomes a share target, so a link goes
-  from the YouTube app into this one in two taps. On installed iOS the
-  finished file is offered as a link to tap, since a home-screen app there has
-  no download manager.
+- **Same Wi-Fi.** The address is the computer's own on your network with the
+  port, something like `http://192.168.1.42:8000`. **Settings → Test** on the
+  computer prints it when the server can tell. In Docker it cannot, since the
+  container sees only its own bridge network, so Test gives the port and an
+  example address and asks for `LAN_URL`. Set `LAN_URL` to the address and
+  Test names it exactly. Open it in the phone's browser and download as you
+  would on the computer; a bookmark brings it back. It will not install as
+  an app from there: plain `http` is a secure context only on `localhost`,
+  so the phone gets no service worker, no share target, and a **Paste**
+  button that only focuses the field. The share
+  sheet — a link from the YouTube app in two taps — needs HTTPS: install
+  [the hosted page](https://maxgfr.github.io/siphon/) and set its helper to
+  an HTTPS address for this machine, the tunnel below or
+  [Tailscale](https://tailscale.com)'s `tailscale serve`. On installed iOS
+  the finished file is offered as a link to tap, since a home-screen app
+  there has no download manager.
 - **From anywhere, still on your machine.** A Cloudflare quick tunnel needs
   no account and no router settings:
 
   ```sh
   docker compose -f docker-compose.yml -f docker-compose.tunnel.yml up -d
-  docker compose logs cloudflared | grep trycloudflare.com
+  docker compose -f docker-compose.yml -f docker-compose.tunnel.yml logs cloudflared | grep trycloudflare.com
   ```
 
   It is a **public** URL: set `AUTH_TOKEN` first and paste the same value
@@ -193,18 +226,39 @@ the next one if the previous fails:
    ```
 
    The plugin is already in the image; the overlay starts the provider and
-   points siphon at it.
+   points siphon at it. Every later compose command needs the same `-f`
+   files: a bare `docker compose up -d` brings siphon back without the
+   provider. Name them once in a `.env` beside the compose files and every
+   command without `-f` reads them (`;` between them on Windows):
+
+   ```sh
+   echo COMPOSE_FILE=docker-compose.yml:docker-compose.potoken.yml >> .env
+   ```
+
+   An explicit `-f` replaces `COMPOSE_FILE`, so the tunnel and build
+   commands above would bring siphon back without the provider: put every
+   overlay you use in it instead, for example
+   `COMPOSE_FILE=docker-compose.yml:docker-compose.potoken.yml:docker-compose.tunnel.yml`,
+   and run those commands without their `-f`.
 
 If all three fail it is almost certainly the IP: datacentre ranges get the
 strictest treatment, which is why your own machine is the first option here.
 And check the version: yt-dlp is what YouTube breaks, and it releases about
-monthly, so the image is rebuilt every Monday with the newest one and
-`docker compose pull && docker compose up -d` is the whole update. **Test**
-in settings shows the running version and says when it is more than 45 days
-old. Running the server outside the image? yt-dlp has needed a JavaScript runtime for YouTube since late 2025
-(it solves the signature challenge with YouTube's own player script); the
-image ships [Deno](https://deno.com), and **Test** in settings says when a
-server has none. The `server-youtube` job measures
+monthly, so the image is rebuilt every Monday with the newest one, and
+taking it is the whole update. Started with compose, that is
+`docker compose pull && docker compose up -d`, run with the files you
+started with, by `-f` or by the `COMPOSE_FILE` of step 3, or an overlay
+drops out. Started with the one command at the top, it is
+`docker pull ghcr.io/maxgfr/siphon && docker rm -f siphon && docker run -d --name siphon --restart unless-stopped -p 8000:8000 -v siphon:/tmp/siphon ghcr.io/maxgfr/siphon`,
+with any `-e` you gave it the first time; the volume keeps the cookies. A
+server started before that command named its container has another name,
+which `docker ps` shows: remove that one instead.
+**Test** in settings shows the running version and says when it is more
+than 45 days old. Running the server outside the image? yt-dlp has needed a
+JavaScript runtime for YouTube since late 2025 (it solves the signature
+challenge with YouTube's own player script); the image ships
+[Deno](https://deno.com), and **Test** in settings says when a server has
+none. The `server-youtube` job measures
 this path on every pull request, from a runner, plain and with the provider;
 what it found on 2026-09-16 is that a datacentre IP with the runtime and the
 provider is still refused on every client until there is a session — the
@@ -226,18 +280,25 @@ key, as for the rest of the API.
 ### Configuration
 
 The app has two settings, both optional: the **helper** address and its
-**access key** if it wants one. **Test** names the address and says what it
-is, and for an Invidious or Piped instance whether it answers this page for
-a video, before you save. Under **Advanced** are yt-dlp's options, applied by
-your own server to every download it makes (with any other helper they are
-kept, greyed, until one is set):
+**access key** if it wants one. An address typed without a scheme gets
+`https://`, or `http://` for `localhost` and an address on your own network
+(`192.168.…`, `10.…`, a `.local` name), which is how a server there answers.
+The key belongs to the address it was typed for: type an address on another
+origin and the field empties, so the key is not sent to a stranger's
+instance; type the first one back and the key returns. **Test** names the
+address and says what it is, and for an Invidious or Piped instance whether
+it answers this page for a video, before you save. Under **Advanced** are
+yt-dlp's options, applied by your own server to every download it makes.
+With any other helper they are kept, greyed, until one is set, and so they
+are on a server without ffmpeg, which only resolves and leaves the download
+to this device:
 
 | option | what it does |
 |---|---|
 | **Remove sponsor segments** | cuts sponsors, self-promotion and "like and subscribe" out of YouTube videos, from the community's [SponsorBlock](https://sponsor.ajay.app) data |
-| **Clip** | only the part between two times, as `1:23` or `01:02:03`; only that span is fetched, cut on keyframes |
-| **Speed limit** | bytes per second, as `500K` or `2M` |
-| **YouTube client** | which of YouTube's clients to try first; the ladder still follows |
+| **Clip** | only the part between two times, as `1:23`, `01:02:03` or seconds, `150`; only that span is fetched, re-encoded so it starts and ends exactly there, with the subtitles and chapters moved to match |
+| **Speed limit** | bytes per second, as `500K` or `2M`; not applied to a clip, a live stream or HLS only ffmpeg reads, which ffmpeg fetches and yt-dlp does not slow down |
+| **YouTube client** | which of YouTube's clients to try first; the ladder still follows. A client the server's yt-dlp no longer has counts as no choice |
 | **YouTube sign-in** | your `cookies.txt`, stored on the server owner-only — step 2 of *Making YouTube work* above |
 
 Each value is narrowed by the server before it reaches yt-dlp — a number, a
@@ -249,7 +310,7 @@ The server takes environment variables:
 
 | variable | default | what it does |
 |---|---|---|
-| `ALLOWED_ORIGINS` | `https://maxgfr.github.io` | Comma-separated origins allowed to call the API from another origin. The server's own page needs no entry. Name your page if you host a copy; `*` without `AUTH_TOKEN` lets any site open in your browser use the server, and the server says so at startup. |
+| `ALLOWED_ORIGINS` | `https://maxgfr.github.io` | Comma-separated origins allowed to call the API from another origin; a page's full address is read as its origin, the only part a browser sends. The server's own page needs no entry. Name your page if you host a copy; `*` without `AUTH_TOKEN` lets any site open in your browser use the server, and the server says so at startup. |
 | `AUTH_TOKEN` | *(unset)* | Shared secret. **Set it the moment the server is reachable from the internet.** Paste the same value into the app's settings. The server warns at startup without one. |
 | `MAX_CONCURRENT_JOBS` | `3` | Downloads running at once. |
 | `JOB_TTL_SECONDS` | `3600` | How long a finished file stays on disk. Swept on a timer, and what a previous run left is swept at startup. |
@@ -260,14 +321,25 @@ The server takes environment variables:
 | `TUNNEL_HOST_TTL` | `7200` | Seconds a host named by a resolve stays fetchable through the tunnel. |
 | `ALLOW_PRIVATE_HOSTS` | off | Lets the server fetch from LAN addresses (a NAS). Off by default: on, the service is an SSRF probe for whoever can reach it. |
 | `PORT` | `8000` | Listen port. |
+| `LAN_URL` | *(unset)* | The address **Test** tells you to open on a phone, e.g. `http://192.168.1.42:8000`. Without it the server names its own network address, if it is listening there. It names nothing in a container, behind a proxy or over HTTPS. |
 
 By default the server refuses anything that is not a public `http(s)`
 address — no `file://`, no `localhost`, no `10.x`, no `100.64/10`, no
 `169.254.169.254`. It checks the link you give it, every format it is about
 to download, and — for every connection the process opens, redirects
-included — the address the connection actually goes to. Qualities are an
-allow-list and subtitle languages are codes, not patterns, so the API
-cannot smuggle yt-dlp options.
+included — the address the connection actually goes to. ffmpeg, which
+fetches a clip, a live stream and HLS yt-dlp cannot read itself, opens
+connections of its own, so it is pointed at a proxy inside the server that
+makes the same check for each one, every redirect included. It may speak
+http(s) there and nothing else: no `file://`, and a stream in rtmp or rtsp
+is refused. The provider and a proxy you configure are reachable on the
+port they are named with, and no other. Behind an `HTTP(S)_PROXY`, though,
+the proxy makes the connections, so past the link and its formats it is the
+proxy that has to refuse private addresses; and since ffmpeg can go through
+only one of the two proxies, what only ffmpeg fetches — a clip, a live
+stream — is refused there. `ALLOW_PRIVATE_HOSTS` lifts the address checks,
+and ffmpeg then connects directly. Qualities are an allow-list and subtitle
+languages are codes, not patterns, so the API cannot smuggle yt-dlp options.
 
 ## 3. A quick deploy
 
@@ -279,49 +351,66 @@ so there is nothing to update when YouTube changes and nothing to store.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/maxgfr/siphon/tree/main/relay)
 
-Paste the `*.workers.dev` address into **Settings → Helper**. Set
-`ALLOWED_ORIGINS` on the Worker to your page's URL so nobody else spends your
-quota; `ALLOWED_HOSTS` keeps it from being an open proxy. With a relay set,
-the bundled Invidious list is walked through it first — the instances refuse
-a *page*, not a plain client — and InnerTube through the relay is the
-fallback. `node relay/serve.mjs` runs the same file on your own machine with
-no account, on your home IP. Details in [`relay/`](relay/).
+Paste the `*.workers.dev` address into **Settings → Helper**. Add
+`ALLOWED_ORIGINS` to the Worker as a **Secret** (Settings → Variables and
+Secrets), which no later deploy can drop, set to your page's origin
+(`https://you.github.io`, no path) so nobody else spends your quota.
+`ALLOWED_HOSTS` keeps it from being an open proxy. With a relay set, the
+bundled Invidious list is walked through it first — the instances refuse a
+*page*, not a plain client — and InnerTube through the relay is the fallback.
+`node relay/serve.mjs` runs the same file on your own machine with no account,
+on your home IP, for the browser on that machine: the page is HTTPS, and a
+browser lets it call plain http on `127.0.0.1` only, so a phone needs the
+Worker. Details in [`relay/`](relay/).
 
 **Running the site for others?** Deploy the relay once and set the repository
 variable `SIPHON_RELAY_URL` to its address (Settings → Secrets and variables
-→ Actions → Variables). The Pages deploy writes it into `web/config.json`, and
-every visitor with nothing set gets it as their helper, named on screen,
-clearable in one tap.
+→ Actions → Variables). The Pages deploy writes it into `web/config.json`,
+with `https://` in front if it has no scheme, and every visitor with nothing
+set gets it as their helper, named on screen, clearable in one tap.
 
 **The whole server, hosted.** Render reads `render.yaml`, builds the
 container and generates an `AUTH_TOKEN` for you; copy it from the dashboard
-into the app's settings with the URL. The free plan sleeps when idle.
+into the app's settings with the URL. The free plan sleeps after 15 idle
+minutes and has no disk that survives it, so YouTube cookies uploaded in
+settings last until the first sleep. For cookies that stay, use Fly below,
+whose volume keeps them, or a paid Render plan with the disk `render.yaml`
+has commented out.
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/maxgfr/siphon)
 
 ```sh
 # or Fly, which does not sleep the same way
 fly launch --no-deploy
-fly secrets set AUTH_TOKEN=$(openssl rand -hex 16)
+TOKEN=$(openssl rand -hex 16); echo "Access key: $TOKEN"
+fly secrets set AUTH_TOKEN="$TOKEN"
 fly deploy
 ```
 
+Paste the key the second line prints into the app's settings: once it is
+set, Fly shows a secret's digest, never its value.
+
 A hosted server runs on a datacentre IP, so it meets YouTube's bot wall more
-often than the same code at home; cookies and the provider above are the
-answer, and the [measurement](docs/verified.md#youtube-and-what-is-still-unproven)
+often than the same code at home. Cookies are the answer there — the
+provider above is a compose sidecar, which neither `render.yaml` nor
+`fly.toml` runs — and the [measurement](docs/verified.md#youtube-and-what-is-still-unproven)
 says what a bare runner gets.
 
 **Your own copy of the page.** Enable Pages once by hand (Settings → Pages →
 Source → *GitHub Actions*; the workflow's token cannot create the site), and
 `.github/workflows/pages.yml` publishes `web/` on every push to `main`, with
 the converter vendored beside it. Point the page at your server in settings
-and set `ALLOWED_ORIGINS` on the server to the page's URL.
+and set `ALLOWED_ORIGINS` on the server to the page's origin
+(`https://you.github.io`, no path).
 
 ## 4. Public servers, measured daily
 
 `web/config.json` is what a fresh visitor starts from, and
 `.github/workflows/relay-config.yml` decides what goes in it — from a runner
-with real network, by asking each candidate exactly what the page asks:
+with real network, by asking each candidate exactly what the page asks, with
+the page's own Origin: `https://<owner>.github.io` for the repository it runs
+in, or the repository variable `SIPHON_ORIGIN` for a custom domain, so a relay
+locked to your page is measured as your page reaches it:
 
 - **relays**: your own (`SIPHON_RELAY_URL`) first, then the public CORS
   proxies — fetch `youtube.com/robots.txt` for a page, then an Invidious
@@ -350,11 +439,19 @@ that are yours: the bridge, the relay, the server.
 ## What else it does
 
 - **A queue.** Paste, tap, and the box clears for the next link. Each download
-  is a row with its own progress; several run at once; rows survive a reload.
+  is a row with its own progress; several run at once; rows survive a reload,
+  and a server that does not answer for a moment then is asked again rather
+  than given up on. Cancel stops a row where it is, a conversion on the device
+  included. The list holds 20 rows: the oldest finished one makes room for a
+  new one, never one still running. Saving settings, a new helper included,
+  leaves a running download to finish. A row changes in place as it moves,
+  so a keyboard or a finger on its button stays there, and a screen reader
+  is told when a download is ready or has failed.
 - **Several links at once.** Paste a whole list, drop a selection of links on
   the page, or share a message full of them: each becomes its own row, in
   order, at the quality chosen. `Ctrl+V` with nothing focused lands in the
-  field too, and "Title https://…" from a share becomes just the link.
+  field too, and "Title https://…" from a share — pasted into the field, or
+  put in whole by the keyboard — becomes just the link.
 - **Send to siphon.** A bookmarklet in the guide: drag it to the bookmarks
   bar, and on any video page one click opens the app with that page's link —
   the desktop counterpart of the phone's share sheet.
@@ -368,8 +465,9 @@ that are yours: the bridge, the relay, the server.
 - **Playlists.** Offered, never assumed: a video inside a playlist stays one
   video unless you tap **All**. A full server delivers one `.zip`, numbered in
   playlist order; the device takes them one row each. `PLAYLIST_LIMIT` caps it.
-- **Tagged audio.** MP3 and M4A carry title, artist, date and cover art. Video
-  keeps its metadata and chapters.
+- **Tagged audio.** MP3 and M4A carry title, artist, date and cover art; an
+  `.mp3` link taken as MP3 is not converted, and keeps the tags it came with.
+  Video keeps its metadata and chapters.
 
 What the device alone does not do: subtitles for a link that offers none,
 cookies (nowhere safe to put them), sites that build their player in
@@ -383,13 +481,13 @@ you first — ffmpeg.wasm wants the whole input in memory.
 pip install -r server/requirements.txt pytest httpx       # yt-dlp[default] carries the signature solver
 # and a JavaScript runtime beside it — Deno — which yt-dlp needs for YouTube since late 2025;
 # the Docker image ships one, and the settings sheet says when a server has none.
-WEB_DIR=web uvicorn server.app:app --reload --port 8000   # the server
-pytest server/tests -q                                    # 194
-npm test                                                  # 221 — the extractor, detection, the measurements
-npm run test:e2e        # the device, a fake Invidious, Piped and cobalt — 64; needs playwright, ffmpeg
-npm run test:deployed   # the app as a static deploy over HTTPS — 75; needs playwright, openssl
-npm run test:bridge     # the userscript against a host that refuses — 13
-npm run test:split      # a server that only resolves, a device that downloads — 24
+WEB_DIR=web uvicorn server.app:app --reload --port 8000   # the server; add --host 0.0.0.0 to open it from a phone
+pytest server/tests -q                                    # the server, and the deploy commands in these docs
+npm test                                                  # the extractor, detection, the measurements
+npm run test:e2e        # the device, a fake Invidious, Piped and cobalt; needs playwright, ffmpeg
+npm run test:deployed   # the app as a static deploy over HTTPS; needs playwright, openssl
+npm run test:bridge     # the userscript against a host that refuses
+npm run test:split      # a server that only resolves, a device that downloads
 npm run test:innertube  # what YouTube says to a bare request from this machine
 npm run test:youtube    # YouTube, for real, from the browser mode; CI, informative
 npm run test:server     # YouTube, for real, from server/app.py; CI, informative

@@ -56,7 +56,15 @@ self.onmessage = async (event) => {
     }
 
     if (type === 'run') {
-      for (const input of payload.inputs) core.FS.writeFile(input.name, input.data);
+      // The inputs were transferred here so that no copy of them exists, and
+      // the core is told it may keep them as they are: otherwise it copies
+      // each one into its file system, and this message, still pointing at
+      // the original, keeps that alive through the whole run — the input
+      // twice over beside the output, which a phone does not have room for.
+      for (const input of payload.inputs) {
+        core.FS.writeFile(input.name, input.data, { canOwn: true });
+        input.data = null;
+      }
       activeRun = id;
       const code = run(payload.args);
       activeRun = null;

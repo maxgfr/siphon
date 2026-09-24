@@ -49,6 +49,10 @@ writeFileSync(at('page.html'), `<!doctype html><html><head><meta property="og:ti
 
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml', '.png': 'image/png', '.mp4': 'video/mp4', '.ts': 'video/mp2t', '.m3u8': 'application/vnd.apple.mpegurl' };
 
+/** A file slow enough to watch arrive: 6 MB at about 1 MB/s, and every byte of it sent counted. */
+const SLOW_SIZE = 6 * 1024 * 1024;
+const slow = { sent: 0 };
+
 function serve(root, port, { cors }) {
   return new Promise((resolve) => {
     createServer((request, response) => {
@@ -57,14 +61,45 @@ function serve(root, port, { cors }) {
       // Answers with no body at all, which a Response refuses to carry one for.
       const status = /\/status\/(\d{3})$/.exec(path);
       if (status) return response.writeHead(Number(status[1])).end();
+      // A short link to the playlist, which lives somewhere else: its
+      // segments are relative to where it landed, not to this address.
+      if (path === '/r/42.m3u8') return response.writeHead(302, { Location: '/media/index.m3u8' }).end();
+      const range = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range || '');
+      const span = (size) => {
+        const from = range ? Number(range[1]) : 0;
+        const to = range && range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
+        return { from, to, head: range ? { 'Content-Range': `bytes ${from}-${to}/${size}` } : {} };
+      };
+      if (path === '/media/slow.mp4') {
+        const { from, to, head } = span(SLOW_SIZE);
+        response.writeHead(range ? 206 : 200, { 'Content-Type': 'video/mp4', 'Content-Length': to - from + 1, 'Accept-Ranges': 'bytes', ...head });
+        if (request.method === 'HEAD') return response.end();
+        let at = from;
+        const timer = setInterval(() => {
+          if (response.destroyed) return clearInterval(timer);
+          const next = Math.min(at + 65536, to + 1);
+          response.write(Buffer.alloc(next - at, 7));
+          slow.sent += next - at;
+          at = next;
+          if (at > to) {
+            clearInterval(timer);
+            response.end();
+          }
+        }, 62);
+        response.on('close', () => clearInterval(timer));
+        return undefined;
+      }
       const file = join(root, path);
       try {
         const stats = statSync(file);
-        const headers = { 'Content-Type': TYPES[extname(file)] || 'application/octet-stream', 'Content-Length': stats.size };
+        // Ranges, as every media host serves them: the bridge asks for files
+        // a window at a time.
+        const { from, to, head } = span(stats.size);
+        const headers = { 'Content-Type': TYPES[extname(file)] || 'application/octet-stream', 'Content-Length': to - from + 1, 'Accept-Ranges': 'bytes', ...head };
         // The whole point: this host does NOT say the page may read it.
         if (cors) headers['Access-Control-Allow-Origin'] = '*';
-        response.writeHead(200, headers);
-        createReadStream(file).pipe(response);
+        response.writeHead(range ? 206 : 200, headers);
+        createReadStream(file, { start: from, end: to }).pipe(response);
       } catch {
         response.writeHead(404).end();
       }
@@ -92,6 +127,8 @@ const browser = await chromium.launch({
 
 /** Every URL the stand-in for GM_xmlhttpRequest was actually asked to fetch. */
 const gmAsked = [];
+/** Its requests still running, so the page's abort can reach them. */
+const gmRunning = new Map();
 
 async function session({ bridge }) {
   const context = await browser.newContext({ acceptDownloads: true, viewport: { width: 412, height: 915 } });
@@ -105,35 +142,53 @@ async function session({ bridge }) {
   }, process.env.SIPHON_CORE_URL || '');
 
   if (bridge) {
-    // GM_xmlhttpRequest, played by Node: no same-origin policy, like the real thing.
-    await page.exposeFunction('__gmFetch', async (method, url, headers, body) => {
+    // GM_xmlhttpRequest, played by Node: no same-origin policy, like the real
+    // thing, and like it, it follows redirects, says where they ended, and
+    // hands the response over whole, once it is all in.
+    await page.exposeFunction('__gmFetch', async (ref, method, url, headers, body) => {
       gmAsked.push(url);
       const target = url.replace(`//${MEDIA_HOST}:`, '//127.0.0.1:');
-      const response = await fetch(target, { method, headers, body: body ? Buffer.from(body, 'base64') : undefined });
-      const buffer = Buffer.from(await response.arrayBuffer());
-      return {
-        status: response.status,
-        statusText: response.statusText,
-        responseHeaders: [...response.headers].map(([k, v]) => `${k}: ${v}`).join('\r\n'),
-        body: buffer.toString('base64'),
-      };
+      const controller = new AbortController();
+      gmRunning.set(ref, controller);
+      try {
+        const response = await fetch(target, { method, headers, body: body ? Buffer.from(body, 'base64') : undefined, signal: controller.signal });
+        const buffer = Buffer.from(await response.arrayBuffer());
+        return {
+          status: response.status,
+          statusText: response.statusText,
+          responseHeaders: [...response.headers].map(([k, v]) => `${k}: ${v}`).join('\r\n'),
+          finalUrl: response.url.replace('//127.0.0.1:', `//${MEDIA_HOST}:`),
+          body: buffer.toString('base64'),
+        };
+      } catch (error) {
+        if (controller.signal.aborted) return { aborted: true };
+        throw error;
+      } finally {
+        gmRunning.delete(ref);
+      }
     });
+    await page.exposeFunction('__gmAbort', (ref) => gmRunning.get(ref)?.abort());
     await page.addInitScript(() => {
+      let refs = 0;
       // The shape GM_xmlhttpRequest has; the userscript below sees only this.
       window.GM_xmlhttpRequest = (options) => {
         // Some managers report a failed request as a load with status 0.
         if (/\/status\/0$/.test(options.url)) {
-          return options.onload?.({ status: 0, statusText: '', responseHeaders: '', response: new ArrayBuffer(0) });
+          options.onload?.({ status: 0, statusText: '', responseHeaders: '', response: new ArrayBuffer(0) });
+          return { abort() {} };
         }
+        const ref = (refs += 1);
         const body = options.data ? btoa(String.fromCharCode(...new Uint8Array(options.data))) : null;
-        window.__gmFetch(options.method || 'GET', options.url, options.headers || {}, body)
+        window.__gmFetch(ref, options.method || 'GET', options.url, options.headers || {}, body)
           .then((r) => {
+            if (r.aborted) return options.onabort?.();
             const bin = atob(r.body);
             const bytes = new Uint8Array(bin.length);
             for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
-            options.onload?.({ status: r.status, statusText: r.statusText, responseHeaders: r.responseHeaders, response: bytes.buffer });
+            return options.onload?.({ status: r.status, statusText: r.statusText, responseHeaders: r.responseHeaders, finalUrl: r.finalUrl, response: bytes.buffer });
           })
           .catch((error) => options.onerror?.({ error: String(error?.message || error) }));
+        return { abort: () => window.__gmAbort(ref) };
       };
     });
     await page.addInitScript(USERSCRIPT);
@@ -198,6 +253,51 @@ const MEDIA = `http://${MEDIA_HOST}:${MEDIA_PORT}/media`;
   const page_ = await download(page, `${MEDIA}/page.html`, 'audio_mp3');
   const audio = page_.saved ? inspect(page_.saved) : '';
   check('a page on a refusing host is scraped and its video converted to mp3', /Audio: mp3/.test(audio), page_.error || page_.saved?.split('/').pop());
+
+  // Through a redirect the page cannot see: only the manager knows where the
+  // playlist landed, and the segments are relative to that.
+  const moved = await download(page, `http://${MEDIA_HOST}:${MEDIA_PORT}/r/42.m3u8`, 'video_best');
+  const movedReport = moved.saved ? inspect(moved.saved) : '';
+  check('a playlist behind a redirect is read relative to where it landed', /Video: h264/.test(movedReport), moved.error || moved.saved?.split('/').pop());
+
+  // A manager hands a response over only when all of it is in, so a file
+  // asked for in one request sat at 0% until the end, whole in memory.
+  {
+    await page.goto(`http://127.0.0.1:${APP_PORT}/`, { waitUntil: 'networkidle' });
+    await page.check('input[name="quality"][value="video_best"]');
+    await page.fill('#url', `${MEDIA}/slow.mp4`);
+    const waiting = page.waitForEvent('download', { timeout: 60_000 });
+    await page.click('#go');
+    let landed = false;
+    waiting.then(() => { landed = true; }, () => { landed = true; });
+    const seen = new Set();
+    while (!landed) {
+      const shown = await page.textContent('#queueList li .q-pct').catch(() => null);
+      if (shown) seen.add(shown.trim());
+      await page.waitForTimeout(100);
+    }
+    const event = await waiting.catch(() => null);
+    const size = event ? statSync(await event.path()).size : 0;
+    check('a slow file through the bridge shows its progress as it arrives, not at the end',
+      [...seen].some((shown) => /^[1-9]\d?%$/.test(shown)) && size === SLOW_SIZE, `${[...seen].join(' ')}; ${size} bytes`);
+  }
+
+  // Cancel stops the transfer itself, not just the page's interest in it.
+  {
+    await page.goto(`http://127.0.0.1:${APP_PORT}/`, { waitUntil: 'networkidle' });
+    await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+    await page.reload({ waitUntil: 'networkidle' });
+    slow.sent = 0;
+    await page.fill('#url', `${MEDIA}/slow.mp4`);
+    await page.click('#go');
+    // Cancelled part-way through the file, whatever the page shows.
+    for (let waited = 0; slow.sent < 2.5 * 1024 * 1024 && waited < 30_000; waited += 50) await page.waitForTimeout(50);
+    await page.click('#queueList li [data-cancel]');
+    const atCancel = slow.sent;
+    await page.waitForTimeout(2500);
+    check('cancelling a download through the bridge stops the host sending it',
+      slow.sent - atCancel < 256 * 1024 && slow.sent < SLOW_SIZE, `${slow.sent - atCancel} bytes after the cancel, ${slow.sent} of ${SLOW_SIZE} in all`);
+  }
 
   const routes = await page.evaluate(async (media) => {
     const { BrowserBackend } = await import('./api.js');

@@ -11,7 +11,7 @@
  * primary action pinned within thumb reach, and no interaction that needs a
  * hover or a precise tap.
  */
-import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, bundledInfo, privacyNote, describeEndpoint, servesPages } from './api.js';
+import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, bundledInfo, privacyNote, describeEndpoint, servesPages, withScheme, phoneRoute } from './api.js';
 import { looksLikeUrl, urlsIn } from './links.js';
 
 const SETTINGS_KEY = 'siphon:settings';
@@ -52,6 +52,9 @@ let settings = { ...DEFAULT_SETTINGS };
 let backend = null;
 let probeToken = 0;
 let lastProbe = null;
+/** The link lastProbe describes: its title and entries are that link's, and no other's. */
+let probedUrl = '';
+const probeOf = (url) => (lastProbe && probedUrl === url ? lastProbe : null);
 let wantPlaylist = false;
 const recent = [];
 
@@ -151,18 +154,18 @@ function siteConfig() {
  * The person still sees whose server their YouTube links will reach — the
  * notice names it, and settings show it — and clearing it is one tap. Tried
  * again on a later visit only if the relay could not be reached this time,
- * never after the person cleared it.
+ * never after the person cleared it: the guide names it then, one tap away.
  */
 async function adoptSiteRelay() {
   if (settings.helper.kind !== 'none' || settings.endpoint) return false;
   try {
     if (localStorage.getItem(SITE_RELAY_TAKEN) === '1') return false;
   } catch { /* storage off: once per session is the harmless side */ }
-  const { relay, relayKind, instance } = await siteConfig();
-  if (!relay) return false;
+  const site = await siteConfig();
+  if (!site.relay) return false;
   let helper;
   try {
-    helper = await detectEndpoint(relay);
+    helper = await detectEndpoint(site.relay);
   } catch {
     return false;
   }
@@ -172,7 +175,29 @@ async function adoptSiteRelay() {
   // A helper the person chose in the meantime wins; so does an address that
   // turned out to be something else than the measurement said.
   if (helper.kind !== 'relay' || settings.helper.kind !== 'none' || settings.endpoint) return false;
+  takeSiteRelay(site, helper);
+  return true;
+}
 
+/**
+ * The guide's "Use it", for a visitor who cleared the site's relay and wants
+ * it back: it is not adopted again on its own, so this is the way back, with
+ * no address to know.
+ */
+async function useSiteRelay() {
+  const site = await siteConfig();
+  try {
+    const helper = await detectEndpoint(site.relay);
+    if (helper.kind !== 'relay') throw new Error('The site\'s relay does not answer as one right now.');
+    takeSiteRelay(site, helper);
+    fillTour();
+  } catch (error) {
+    showError(error);
+  }
+}
+
+/** Make the site's relay the helper, and say whose it is. */
+function takeSiteRelay({ relay, relayKind, instance }, helper) {
   settings = { ...settings, endpoint: relay, key: '', helper, siteInstance: instance };
   saveSettings();
   applyBackend();
@@ -188,7 +213,6 @@ async function adoptSiteRelay() {
         : ' — a public proxy that sees those links; everything else stays on this device.') +
       ' Change or clear it in settings.</p></div>',
   );
-  return true;
 }
 
 const hostOf = (url) => {
@@ -392,12 +416,15 @@ const QUEUE_MAX = 20;
 let queue = [];
 let pollTimer = null;
 
+const isActive = (entry) => entry.state === 'running' || entry.state === 'starting';
+
 function saveQueue() {
   try {
     // Only what is needed to redraw a row and re-find the file on the server.
+    // The cap is on finished rows; one still running is kept whatever its place.
     localStorage.setItem(
       QUEUE_KEY,
-      JSON.stringify(queue.slice(0, QUEUE_MAX).map(({ key, id, url, title, preset, state, error, filename }) => ({
+      JSON.stringify(queue.filter((entry, index) => index < QUEUE_MAX || isActive(entry)).map(({ key, id, url, title, preset, state, error, filename }) => ({
         key, id, url, title, preset, state, error, filename,
       }))),
     );
@@ -428,6 +455,84 @@ function rowLabel(entry) {
   return entry.itemsTotal ? `${stage} ${entry.itemsDone || 1}/${entry.itemsTotal}` : stage;
 }
 
+/** What goes inside a row's <li>. */
+function rowHtml(entry) {
+  const active = entry.state === 'running' || entry.state === 'starting';
+  // A stream's progress is counted in segments, and is real before its size
+  // is known — a video rendition and a separate audio one have no total
+  // until the second playlist has been read.
+  const determinate = entry.stage === 'downloading' && (entry.totalBytes || entry.progress > 0);
+  const percent = Math.round((entry.progress || 0) * 100);
+
+  const bits = [];
+  if (active && entry.speed) bits.push(`${formatBytes(entry.speed)}/s`);
+  if (active && entry.eta) bits.push(`${formatDuration(entry.eta)} left`);
+  if (!active && entry.totalBytes) bits.push(formatBytes(entry.totalBytes));
+  if (entry.attempts > 0 && entry.client) bits.push(`attempt ${entry.attempts + 1} · ${entry.client}`);
+
+  return (
+    '<div class="q-top">' +
+    `<span class="q-title">${escapeHtml(entry.title || entry.url)}</span>` +
+    (active && determinate ? `<span class="q-pct">${percent}%</span>` : '') +
+    '</div>' +
+    (active
+      ? `<div class="q-bar"><div class="q-fill${determinate ? '' : ' indeterminate'}" style="${determinate ? `width:${percent}%` : ''}"></div></div>`
+      : '') +
+    `<p class="q-msg">${escapeHtml(rowLabel(entry))}</p>` +
+    (entry.note ? `<p class="q-msg">${escapeHtml(entry.note)}</p>` : '') +
+    '<div class="q-foot">' +
+    `<span>${escapeHtml(bits.join(' · '))}</span>` +
+    '<span class="spacer"></span>' +
+    // The name rides on the link itself: a blob URL carries no headers, so
+    // without it the Save button hands over a UUID — and after a reload, a
+    // UUID ending in .txt, since the file read back from OPFS has no type.
+    (entry.state === 'done' && fileHref(entry.fileUrl)
+      ? `<a class="q-act primary" href="${escapeHtml(fileHref(entry.fileUrl))}" download="${escapeHtml(entry.filename || '')}">Save</a>`
+      : '') +
+    (active ? `<button class="q-act" type="button" data-cancel="${escapeHtml(entry.key)}">Cancel</button>` : '') +
+    (entry.state === 'error' || entry.state === 'expired' ? `<button class="q-act" type="button" data-retry="${escapeHtml(entry.key)}">Try again</button>` : '') +
+    '</div>'
+  );
+}
+
+/**
+ * Make `node`'s children look like `model`'s, touching only what differs.
+ *
+ * A poll lands every 700 ms. A row drawn again from scratch each time took
+ * with it the Cancel a keyboard was on — focus fell to the page — and the
+ * button a finger was pressing, so a press that spanned a poll was no click
+ * at all. Patched, an element stays the same element for as long as it is
+ * the same kind of thing in the same place: the percentage and the bar
+ * change, the button under the finger does not.
+ */
+function patch(node, model) {
+  const have = [...node.childNodes];
+  const want = [...model.childNodes];
+  want.forEach((next, index) => {
+    const current = have[index];
+    if (!current) {
+      node.appendChild(next);
+    } else if (current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) {
+      node.replaceChild(next, current);
+    } else if (next.nodeType !== Node.ELEMENT_NODE) {
+      if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
+    } else {
+      for (const { name } of [...current.attributes]) if (!next.hasAttribute(name)) current.removeAttribute(name);
+      for (const { name, value } of [...next.attributes]) if (current.getAttribute(name) !== value) current.setAttribute(name, value);
+      patch(current, next);
+    }
+  });
+  for (const extra of have.slice(want.length)) extra.remove();
+}
+
+/** What a screen reader is told when a row reaches an end. */
+function outcome(entry) {
+  if (entry.state === 'done') return `Ready: ${entry.filename || entry.title}.`;
+  if (entry.state === 'error') return `Failed: ${entry.title}. ${entry.error || ''}`.trim();
+  if (entry.state === 'expired') return `${rowLabel(entry)}: ${entry.title}.`;
+  return '';
+}
+
 function renderQueue() {
   const section = $('queue');
   const list = $('queueList');
@@ -443,52 +548,30 @@ function renderQueue() {
   $('queueLabel').textContent = running ? `Downloads — ${running} running` : 'Downloads';
   $('queueClear').hidden = !queue.some((e) => e.state !== 'running' && e.state !== 'starting');
 
-  list.innerHTML = '';
-  for (const entry of queue) {
-    const item = document.createElement('li');
-    if (entry.state === 'error' || entry.state === 'expired') item.className = 'q-error';
+  // Rows are keyed by their entry. The ones whose entry is gone go first, so
+  // a row that stays is never moved: moving an element takes focus off it.
+  const rows = new Map([...list.children].map((item) => [item.dataset.key, item]));
+  const keys = new Set(queue.map((entry) => entry.key));
+  for (const [key, item] of rows) if (!keys.has(key)) item.remove();
 
-    const active = entry.state === 'running' || entry.state === 'starting';
-    const determinate = entry.stage === 'downloading' && entry.totalBytes;
-    const percent = Math.round((entry.progress || 0) * 100);
-
-    const bits = [];
-    if (active && entry.speed) bits.push(`${formatBytes(entry.speed)}/s`);
-    if (active && entry.eta) bits.push(`${formatDuration(entry.eta)} left`);
-    if (!active && entry.totalBytes) bits.push(formatBytes(entry.totalBytes));
-    if (entry.attempts > 0 && entry.client) bits.push(`attempt ${entry.attempts + 1} · ${entry.client}`);
-
-    item.innerHTML =
-      '<div class="q-top">' +
-      `<span class="q-title">${escapeHtml(entry.title || entry.url)}</span>` +
-      (active && determinate ? `<span class="q-pct">${percent}%</span>` : '') +
-      '</div>' +
-      (active
-        ? `<div class="q-bar"><div class="q-fill${determinate ? '' : ' indeterminate'}" style="${determinate ? `width:${percent}%` : ''}"></div></div>`
-        : '') +
-      `<p class="q-msg">${escapeHtml(rowLabel(entry))}</p>` +
-      (entry.note ? `<p class="q-msg">${escapeHtml(entry.note)}</p>` : '') +
-      '<div class="q-foot">' +
-      `<span>${escapeHtml(bits.join(' · '))}</span>` +
-      '<span class="spacer"></span>' +
-      // The name rides on the link itself: a blob URL carries no headers, so
-      // without it the Save button hands over a UUID — and after a reload, a
-      // UUID ending in .txt, since the file read back from OPFS has no type.
-      (entry.state === 'done' && fileHref(entry.fileUrl)
-        ? `<a class="q-act primary" href="${escapeHtml(fileHref(entry.fileUrl))}" download="${escapeHtml(entry.filename || '')}">Save</a>`
-        : '') +
-      (active ? `<button class="q-act" type="button" data-cancel="${entry.key}">Cancel</button>` : '') +
-      (entry.state === 'error' || entry.state === 'expired' ? `<button class="q-act" type="button" data-retry="${entry.key}">Try again</button>` : '') +
-      '</div>';
-    list.appendChild(item);
-  }
-
-  for (const button of list.querySelectorAll('[data-cancel]')) {
-    button.addEventListener('click', () => cancelEntry(button.dataset.cancel));
-  }
-  for (const button of list.querySelectorAll('[data-retry]')) {
-    button.addEventListener('click', () => retryEntry(button.dataset.retry));
-  }
+  const said = [];
+  const model = document.createElement('li');
+  queue.forEach((entry, index) => {
+    let item = rows.get(entry.key);
+    if (!item) {
+      item = document.createElement('li');
+      item.dataset.key = entry.key;
+    } else if (item.dataset.state !== entry.state && outcome(entry)) {
+      said.push(outcome(entry));
+    }
+    item.dataset.state = entry.state;
+    item.classList.toggle('q-error', entry.state === 'error' || entry.state === 'expired');
+    model.innerHTML = rowHtml(entry);
+    patch(item, model);
+    if (list.children[index] !== item) list.insertBefore(item, list.children[index] || null);
+  });
+  // The rows change without a word; this is the word, for whoever cannot see them.
+  if (said.length) $('queueStatus').textContent = said.join(' ');
 }
 
 function findEntry(key) {
@@ -535,9 +618,10 @@ function retryEntry(key) {
  * video rather than fifty.
  */
 async function enqueue(url, { preset = settings.preset, playlist = wantPlaylist } = {}) {
-  const entries = lastProbe?.entries || [];
+  const probe = probeOf(url);
+  const entries = probe?.entries || [];
   if (playlist && !backend?.supportsPlaylist && entries.length > 0) {
-    for (const entry of entries.slice(0, lastProbe.limit || entries.length)) {
+    for (const entry of entries.slice(0, probe.limit || entries.length)) {
       // eslint-disable-next-line no-await-in-loop -- the queue is the point
       await enqueueOne(entry.url, { preset, playlist: false, title: entry.title });
     }
@@ -557,14 +641,14 @@ async function enqueueOne(url, { preset = settings.preset, playlist = false, tit
   const entry = {
     key: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${queue.length}`,
     url,
-    title: title || lastProbe?.title || url,
+    title: title || probeOf(url)?.title || url,
     preset,
     state: 'starting',
     stage: 'starting',
     progress: 0,
   };
   queue.unshift(entry);
-  for (const dropped of queue.splice(QUEUE_MAX)) release(dropped);
+  trimQueue();
   renderQueue();
 
   try {
@@ -593,6 +677,22 @@ async function enqueueOne(url, { preset = settings.preset, playlist = false, tit
   }
   saveQueue();
   renderQueue();
+}
+
+/**
+ * Past the cap, the oldest finished rows go, and never one still running:
+ * letting go of it would cancel its download, and a row still starting has no
+ * job yet to cancel, so its download would run on with no row. While more
+ * than the cap are running the list is simply longer.
+ */
+function trimQueue() {
+  let over = queue.length - QUEUE_MAX;
+  for (let index = queue.length - 1; index >= 0 && over > 0; index -= 1) {
+    if (isActive(queue[index])) continue;
+    release(queue[index]);
+    queue.splice(index, 1);
+    over -= 1;
+  }
 }
 
 function startPolling() {
@@ -693,7 +793,15 @@ async function restoreQueue() {
 
   await Promise.all(
     queue.map(async (entry) => {
-      if (!entry.id) return;
+      if (!entry.id) {
+        // Saved while it was still being identified: no job was started, and
+        // nothing would ever report on it. Try again is the way on.
+        if (entry.state === 'starting') {
+          entry.state = 'error';
+          entry.error = 'Interrupted before it started.';
+        }
+        return;
+      }
       try {
         const job = await backend.poll(entry.id);
         entry.state = job.state === 'done' ? 'done' : job.state === 'error' ? 'error' : 'running';
@@ -702,10 +810,14 @@ async function restoreQueue() {
         entry.filename = job.filename || entry.filename;
         entry.error = job.error;
         if (entry.state === 'done') entry.fileUrl = backend.fileUrl(entry.id);
-      } catch {
-        // Swept by the TTL, or a different server is configured now.
-        entry.state = entry.state === 'done' ? 'expired' : entry.state;
-        if (entry.state !== 'expired' && entry.state !== 'error') entry.state = 'expired';
+      } catch (error) {
+        // Swept by the TTL, or a different server is configured now: the
+        // answer is that there is no such download. Anything else — the
+        // phone between networks, the app opened away from the server — is
+        // not an answer. A running row is followed as any other, with the
+        // same patience for silence; a finished one keeps its link.
+        if (/no such download/i.test(String(error?.message))) entry.state = 'expired';
+        else if (entry.state === 'done') entry.fileUrl = backend.fileUrl(entry.id);
       }
     }),
   );
@@ -717,7 +829,9 @@ async function restoreQueue() {
 /* ------------------------------------------------------------------ backend */
 
 function applyBackend() {
-  backend = makeBackend(settings);
+  // The new backend takes over the old one's jobs: a download running on
+  // this device when settings are saved keeps its row and finishes.
+  backend = makeBackend(settings, backend);
   $('privacyNote').textContent = privacyNote(settings.helper);
 }
 
@@ -758,6 +872,7 @@ async function runProbe(url) {
     const info = await backend.probe(url);
     if (token !== probeToken) return; // a newer paste won the race
     lastProbe = info;
+    probedUrl = url;
     renderPreview(info);
     if (info?.isLive) {
       renderFeedback(
@@ -780,13 +895,21 @@ async function runProbe(url) {
 function openSettings() {
   $('endpoint').value = settings.endpoint;
   $('endpointKey').value = settings.key;
+  // Nothing saved, nothing to keep from another address: a key that turns
+  // up in the field, typed or filled in, is for the address that follows.
+  keyOrigin = settings.endpoint || settings.key ? originOf(settings.endpoint) : null;
+  keyHeld = '';
   const options = { ...DEFAULT_SETTINGS.ytdlp, ...(settings.ytdlp || {}) };
   $('optSponsor').checked = options.sponsorblock === true;
   $('optClipStart').value = options.clipStart;
   $('optClipEnd').value = options.clipEnd;
   $('optRate').value = options.rateLimit;
   $('optClient').value = options.client;
-  reflectHelper(settings.helper, hostOf(settings.endpoint));
+  // A client no longer offered — tv_embedded, saved before yt-dlp retired
+  // it — would leave the list showing nothing. The server takes it as no
+  // preference, and so does the sheet.
+  if ($('optClient').selectedIndex < 0) $('optClient').value = '';
+  reflectHelper(settings.helper, settings.endpoint);
   renderSuggested();
   $('settings').showModal();
 }
@@ -807,11 +930,34 @@ function readYtdlp() {
  * runs there — so with any other helper they wait, greyed but kept.
  */
 function scopeYtdlp(helper) {
-  const yours = helper?.kind === 'siphon';
+  // A server without ffmpeg only resolves: this device downloads, and has no
+  // yt-dlp to hand a clip or a speed limit to.
+  const thin = helper?.kind === 'siphon' && helper.ffmpeg === false;
+  const yours = helper?.kind === 'siphon' && !thin;
   $('ytdlpBlock').classList.toggle('off', !yours);
   $('ytdlpScope').textContent = yours
     ? 'Applied by your server, which runs yt-dlp, to every download it makes.'
-    : 'These apply when the helper is your own siphon server, which runs yt-dlp. They are kept until then.';
+    : thin
+      ? 'Your server has no ffmpeg, so it only resolves links and this device downloads: these need the server to make the download. They are kept until it does.'
+      : 'These apply when the helper is your own siphon server, which runs yt-dlp. They are kept until then.';
+  offerClients(helper);
+}
+
+/**
+ * Offer the YouTube clients your server's yt-dlp has, and only those. yt-dlp
+ * drops the ones YouTube retires, and asked for one it no longer knows it
+ * skips it without a word: a choice that does nothing. A server that does
+ * not say which it has, and any other helper, leaves them all.
+ */
+function offerClients(helper) {
+  const has = helper?.kind === 'siphon' && Array.isArray(helper.ytClients) ? new Set(helper.ytClients) : null;
+  const select = $('optClient');
+  for (const option of select.options) {
+    const gone = Boolean(option.value) && has !== null && !has.has(option.value);
+    option.hidden = gone;
+    option.disabled = gone;
+  }
+  if (select.selectedOptions[0]?.disabled) select.value = '';
 }
 
 /** How many instances to offer as chips; the rest are one "Find" away. */
@@ -854,12 +1000,12 @@ async function renderSuggested() {
  * the same description otherwise, and switching from one to the other then
  * reads as the sheet not having noticed.
  */
-function reflectHelper(helper, host = '') {
-  setStatus(helper.kind === 'none' ? '' : 'ok', named(host, describeEndpoint(helper)));
+function reflectHelper(helper, address = '') {
+  setStatus(helper.kind === 'none' ? '' : 'ok', named(address ? hostOf(address) : '', describeEndpoint(helper)));
   // Only our own server has a cookie store to write to.
   $('cookiesBlock').hidden = helper.kind !== 'siphon';
   if (helper.kind === 'siphon') setCookieState(helper.hasCookies === true);
-  showPhoneHint(helper.lanUrls || []);
+  showPhoneHint(helper, address);
   scopeYtdlp(helper);
 }
 
@@ -873,10 +1019,49 @@ function setStatus(kind, text) {
 function draftSettings() {
   return {
     ...settings,
-    endpoint: $('endpoint').value.trim().replace(/\/+$/, ''),
+    // "inv.nadeko.net", as a phone keyboard leaves it, with its scheme.
+    endpoint: withScheme($('endpoint').value).replace(/\/+$/, ''),
     key: $('endpointKey').value.trim(),
     ytdlp: readYtdlp(),
   };
+}
+
+/**
+ * The origin the access key in the sheet was entered for.
+ *
+ * A key is the password of one server. The field is a password field, so a
+ * key saved for your own server is still in it, unseen, when another address
+ * is typed above it — and would go to that address, a stranger's instance
+ * perhaps, with every probe and every download. So it goes with the address
+ * it was entered for: an address on another origin empties it, as a chip or
+ * Find already did, and the same origin typed back brings it back.
+ *
+ * A key typed while the address box is empty and nothing is saved was
+ * entered for no address yet, as a password manager fills it: it is null
+ * then, and the key stays for whatever address is typed after it. Bound to
+ * this page's own origin, the first letter of that address took it away.
+ */
+let keyOrigin = '';
+/** That origin's key, while the field is emptied for another. */
+let keyHeld = '';
+
+const originOf = (address) => {
+  try {
+    return new URL(withScheme(address) || location.href, location.href).origin;
+  } catch {
+    return '';
+  }
+};
+
+function guardKey() {
+  const field = $('endpointKey');
+  if (keyOrigin === null) return;
+  if (originOf($('endpoint').value) === keyOrigin) {
+    if (!field.value) field.value = keyHeld;
+  } else if (field.value) {
+    keyHeld = field.value;
+    field.value = '';
+  }
 }
 
 /**
@@ -894,6 +1079,8 @@ let probeSeq = 0;
 async function probeDraft() {
   const seq = ++probeSeq;
   const draft = draftSettings();
+  // The address as it is asked and saved, scheme and all, is what the box shows.
+  if ($('endpoint').value.trim() !== draft.endpoint) $('endpoint').value = draft.endpoint;
   const host = draft.endpoint ? hostOf(draft.endpoint) : '';
   setStatus('', host ? `Checking ${host}…` : 'Checking…');
   try {
@@ -908,11 +1095,11 @@ async function probeDraft() {
         named(host, draft.key ? 'Your server, but it rejected that access key. It is the AUTH_TOKEN the server was started with.' : 'Your server, and it wants an access key — the AUTH_TOKEN it was started with.'),
       );
       $('cookiesBlock').hidden = true;
-      showPhoneHint(helper.lanUrls || []);
+      showPhoneHint(helper, draft.endpoint);
       scopeYtdlp(null);
       return null;
     }
-    reflectHelper(helper, host);
+    reflectHelper(helper, draft.endpoint);
     // Recognising an instance is its stats endpoint answering, which every
     // public one still does. The endpoint a download needs is another door,
     // shut to pages on most of them now — so it is asked here, once, and the
@@ -936,7 +1123,7 @@ async function probeDraft() {
     if (seq !== probeSeq) return null;
     setStatus('bad', named(host, error?.message || 'Could not reach it.'));
     $('cookiesBlock').hidden = true;
-    showPhoneHint([]);
+    showPhoneHint(null);
     scopeYtdlp(null);
     return null;
   }
@@ -947,21 +1134,37 @@ const testConnection = probeDraft;
 /**
  * Answer "how do I use this from my phone?" with the actual address, rather
  * than sending the user off to find their own IP. Only shown for a server on
- * this network — a deployed one is already reachable from anywhere.
+ * this network — a deployed one is already reachable from anywhere. When the
+ * server could not tell its address (a container sees only its own network),
+ * it says how to find it and how to have it named here.
+ *
+ * Plain http on a phone is not a secure context: the page works there, but
+ * installs as no app and takes no links from the share sheet. That takes
+ * HTTPS, so it says where HTTPS is.
  */
-function showPhoneHint(urls) {
+function showPhoneHint(helper, address = '') {
   const host = $('phoneHint');
   const body = $('phoneHintBody');
-  if (!urls.length) {
-    host.hidden = true;
-    return;
-  }
-  host.hidden = false;
-  body.innerHTML =
-    'On the same Wi-Fi, open this in the phone\'s browser — it serves the app itself, ' +
-    'so there is nothing else to set up:<br>' +
-    urls.map((url) => `<strong style="font-family:var(--mono)">${escapeHtml(url)}</strong>`).join('<br>') +
-    '<br>Away from home, put it behind a tunnel or a VPN — see the README.';
+  const route = phoneRoute(helper, address);
+  host.hidden = !route;
+  if (!route) return;
+  const code = (text) => `<strong style="font-family:var(--mono)">${escapeHtml(text)}</strong>`;
+  const port = route.port ? `:${route.port}` : '';
+  const where = route.urls
+    ? 'On the same Wi-Fi, open this in the phone\'s browser — it serves the app itself, ' +
+      `so there is nothing else to set up:<br>${route.urls.map(code).join('<br>')}`
+    : `On the same Wi-Fi, open this computer's network address${port && ` with port ${route.port}`} in the phone's browser, ` +
+      `something like <code>http://192.168.1.42${port}</code>. The server could not tell which it is: set ` +
+      '<code>LAN_URL</code> on it and Test names it here. Started by hand, it also needs <code>--host 0.0.0.0</code>.';
+  const plain = !route.urls || route.urls.some((url) => /^http:/i.test(url));
+  const https = location.protocol === 'https:'
+    ? 'this page'
+    : '<a href="https://maxgfr.github.io/siphon/" target="_blank" rel="noopener">the hosted page</a>';
+  body.innerHTML = `${where}<br>${
+    plain
+      ? `Plain http works, but will not install as an app or appear in the share sheet. For that, and away from home, use ${https} with an HTTPS helper — a tunnel or tailscale serve; see the README.`
+      : 'Away from home, put it behind a tunnel or a VPN — see the README.'
+  }`;
 }
 
 /* ------------------------------------------------------------------ cookies */
@@ -1078,7 +1281,11 @@ function clearInput() {
   input.value = '';
   lastProbe = null;
   wantPlaylist = false;
-  probeToken += 1; // abandon any probe still in flight for the old link
+  // Abandon any probe for the old link, in flight or still waiting to start:
+  // one that started now would put back the preview of a link already queued.
+  clearTimeout(probeTimer);
+  probeTimer = null;
+  probeToken += 1;
   renderPreview(null);
   renderFeedback('');
   renderAction();
@@ -1161,6 +1368,13 @@ function init() {
     saveQueue();
     renderQueue();
   });
+  // One listener for every row's buttons: rows are patched in place, and a
+  // listener added at each render would pile up on the buttons that stay.
+  $('queueList').addEventListener('click', (event) => {
+    const button = event.target.closest?.('[data-cancel], [data-retry]');
+    if (button?.dataset.cancel) cancelEntry(button.dataset.cancel);
+    else if (button?.dataset.retry) retryEntry(button.dataset.retry);
+  });
 
   // Subtitles: remembered like the quality, since it is the same kind of
   // standing preference rather than a per-download decision.
@@ -1180,7 +1394,17 @@ function init() {
   syncSubFields();
 
   const urlInput = $('url');
-  urlInput.addEventListener('input', () => {
+  urlInput.addEventListener('input', (event) => {
+    // "Title https://…" put in whole — a paste into the field, a keyboard's
+    // clipboard chip, dictation — becomes just the link, as it does through
+    // the Paste button. Only text put in at once: a link typed by hand is
+    // left as typed, stray space and all, rather than cut short under the
+    // fingers.
+    const whole = /^insertFrom|^insertReplacementText$/.test(event.inputType || '') || (event.inputType === 'insertText' && (event.data || '').length > 1);
+    if (whole && !event.isComposing && !looksLikeUrl(urlInput.value)) {
+      const links = urlsIn(urlInput.value);
+      if (links.length === 1) urlInput.value = links[0];
+    }
     $('go') && ($('go').disabled = !looksLikeUrl(urlInput.value));
     renderFeedback('');
     scheduleProbe();
@@ -1195,7 +1419,8 @@ function init() {
   });
 
   // A paste into the field of a whole list queues the lot; one link, or
-  // anything else, is left to the field itself.
+  // anything else, is left to the field itself — and to the input handler
+  // above, which keeps just the link of "Title https://…".
   urlInput.addEventListener('paste', (event) => {
     const links = urlsIn(event.clipboardData?.getData('text') || '');
     if (links.length > 1) {
@@ -1234,11 +1459,18 @@ function init() {
 
   $('openSettings').addEventListener('click', openSettings);
   $('closeSettings').addEventListener('click', () => $('settings').close());
+  $('endpoint').addEventListener('input', guardKey);
+  $('endpointKey').addEventListener('input', () => {
+    const unbound = !$('endpoint').value.trim() && !settings.endpoint && !settings.key;
+    keyOrigin = unbound ? null : originOf($('endpoint').value);
+    keyHeld = '';
+  });
   $('useLocalhost').addEventListener('click', () => {
     // 8000 is what docker-compose publishes, so this is the right guess far
     // more often than not — and it is one tap instead of typing a URL on a
     // keyboard that wants to autocapitalise it.
     $('endpoint').value = 'http://127.0.0.1:8000';
+    guardKey();
     testConnection();
   });
 
@@ -1389,12 +1621,22 @@ async function fillTour() {
       `A public instance is set (<strong>${host}</strong>) and YouTube is tried through it. Public instances are ` +
       'closing their doors one by one, so if a link fails, one of these makes it work for good:';
   } else {
-    const { relay } = await siteConfig();
+    // Nothing is set. On a site with a relay, that is someone who cleared it
+    // (it is never adopted twice) or one it has not reached yet: either way
+    // the relay is named, and taken with one tap rather than an address to
+    // find and type. Whose it is is said before the tap, as the notice after
+    // it says: the owner's own, or a public proxy that sees the links.
+    const { relay, relayKind } = await siteConfig();
+    const at = `at <strong>${escapeHtml(hostOf(relay))}</strong>`;
     text = relay
-      ? 'This site has a relay for YouTube. It is applied when nothing else is set; clear the helper in settings to use it.'
+      ? (relayKind === 'own'
+        ? `This site runs a relay for YouTube, ${at}, and it is not in use. `
+        : `This site offers a public proxy for YouTube, ${at}, which sees the links it carries, and it is not in use. `) +
+        '<button class="chip-btn" type="button" id="useSiteRelay">Use it</button> Or one of these, each about a minute:'
       : 'YouTube refuses web pages, so it needs one thing that is yours. Each takes about a minute:';
   }
   status.innerHTML = text;
+  $('useSiteRelay')?.addEventListener('click', useSiteRelay);
   options.hidden = settled;
 }
 

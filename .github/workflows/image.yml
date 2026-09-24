@@ -69,7 +69,18 @@ jobs:
             type=ref,event=tag
             type=sha,format=short
 
-      - uses: docker/build-push-action@v6
+      # The newest yt-dlp on PyPI, for the build argument that keys the pip
+      # layer (see the Dockerfile). Without it that layer came from the cache
+      # whenever the base images had not moved, and the weekly rebuild
+      # republished the yt-dlp it already had. PyPI not answering is no
+      # reason to trust the cache: the run's id stands in, and pip runs.
+      - id: ytdlp
+        run: |
+          latest=$(curl -fsS --retry 3 https://pypi.org/pypi/yt-dlp/json | jq -r '.info.version // empty') || true
+          echo "latest=${latest:-unknown-${{ github.run_id }}}" >> "$GITHUB_OUTPUT"
+
+      - id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: server/Dockerfile
@@ -77,7 +88,26 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            YTDLP_LATEST=${{ steps.ytdlp.outputs.latest }}
           # Without a cache every push re-installs ffmpeg and the Python
-          # dependencies twice over, once per architecture.
+          # dependencies twice over, once per architecture. With it, the
+          # Python ones are reinstalled when yt-dlp releases, and only then.
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # What the rebuild is for, checked in what was pushed: the yt-dlp inside
+      # is the one PyPI named. Its metadata, not `yt-dlp --version`, which
+      # writes 2026.08.19 where PyPI writes 2026.8.19.
+      - if: ${{ !startsWith(steps.ytdlp.outputs.latest, 'unknown-') }}
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          LATEST: ${{ steps.ytdlp.outputs.latest }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}@${DIGEST}"
+          got=$(docker run --rm --entrypoint python "$image" -c "import importlib.metadata as m; print(m.version('yt-dlp'))")
+          echo "yt-dlp in the image: $got; newest on PyPI: $LATEST"
+          if [ "$got" != "$LATEST" ]; then
+            echo "::error::the image just pushed carries yt-dlp $got, not the newest ($LATEST)"
+            exit 1
+          fi

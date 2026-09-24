@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         siphon bridge
 // @namespace    https://github.com/maxgfr/siphon
-// @version      1.1.0
+// @version      1.2.0
 // @description  Lets siphon fetch from hosts that refuse a web page — YouTube included — using your userscript manager's privileges. No server anywhere.
 // @author       siphon
+// @downloadURL  https://raw.githubusercontent.com/maxgfr/siphon/main/bridge/siphon-bridge.user.js
+// @updateURL    https://raw.githubusercontent.com/maxgfr/siphon/main/bridge/siphon-bridge.user.js
 // @match        https://maxgfr.github.io/siphon/*
 // @match        http://localhost:8000/*
 // @match        http://127.0.0.1:8000/*
@@ -106,13 +108,24 @@
     return host.includes('.') && !/(^|\.)(localhost|local|internal|lan|home\.arpa)$/.test(host);
   };
 
-  const announce = () => window.postMessage({ siphon: 'ready', version: '1.1.0' }, '*');
+  const announce = () => window.postMessage({ siphon: 'ready', version: '1.2.0' }, '*');
+
+  /**
+   * Requests still running, by the page's id, so the page can call one off.
+   * A cancelled download otherwise went on in the manager to the last byte.
+   */
+  const running = new Map();
 
   window.addEventListener('message', (event) => {
     if (event.source !== window || !event.data || event.data.siphon === undefined) return;
     const message = event.data;
 
     if (message.siphon === 'hello') return announce();
+    if (message.siphon === 'abort') {
+      running.get(message.id)?.abort();
+      running.delete(message.id);
+      return;
+    }
     if (message.siphon !== 'fetch') return;
 
     const { id, url, method = 'GET', headers = {}, body = null } = message;
@@ -120,7 +133,13 @@
       window.postMessage({ siphon: 'error', id, message: 'the bridge only fetches public http(s) addresses, with GET, HEAD or POST' }, '*');
       return;
     }
-    gm({
+    let over = false;
+    const finish = (reply, transfer) => {
+      over = true;
+      running.delete(id);
+      if (reply) window.postMessage(reply, '*', transfer || []);
+    };
+    const handle = gm({
       method,
       url,
       headers,
@@ -129,15 +148,21 @@
       anonymous: true, // never send the user's cookies for a site to a fetch the page asked for
       onload: (response) => {
         const buffer = response.response instanceof ArrayBuffer ? response.response : new ArrayBuffer(0);
-        window.postMessage(
-          { siphon: 'response', id, status: response.status, statusText: response.statusText, headers: parseHeaders(response.responseHeaders), body: buffer },
-          '*',
+        // finalUrl is where the redirects ended: what a playlist's relative
+        // addresses are relative to, and something only the manager saw.
+        finish(
+          { siphon: 'response', id, status: response.status, statusText: response.statusText, headers: parseHeaders(response.responseHeaders), finalUrl: response.finalUrl || '', body: buffer },
           [buffer],
         );
       },
-      onerror: (error) => window.postMessage({ siphon: 'error', id, message: error?.error || error?.statusText || 'request failed' }, '*'),
-      ontimeout: () => window.postMessage({ siphon: 'error', id, message: 'timed out' }, '*'),
+      onerror: (error) => finish({ siphon: 'error', id, message: error?.error || error?.statusText || 'request failed' }),
+      ontimeout: () => finish({ siphon: 'error', id, message: 'timed out' }),
+      onabort: () => finish(null),
     });
+    // GM_xmlhttpRequest returns an object with abort(); GM.xmlHttpRequest a
+    // promise with one, whose rejection the callbacks above already report.
+    if (typeof handle?.catch === 'function') handle.catch(() => {});
+    if (!over && typeof handle?.abort === 'function') running.set(id, handle);
   });
 
   // Say hello whether or not the page asked yet: installed after the page

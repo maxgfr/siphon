@@ -42,7 +42,9 @@ const MEDIA_PORT = 8788;
 const INV_PORT = 8789;
 const PIPED_PORT = 8792;
 const COBALT_PORT = 8793;
+const OWN_PORT = 8794;
 const MEDIA = `http://127.0.0.1:${MEDIA_PORT}`;
+const OWN = `http://127.0.0.1:${OWN_PORT}`;
 const INV = `http://127.0.0.1:${INV_PORT}`;
 const PIPED = `http://127.0.0.1:${PIPED_PORT}`;
 const COBALT = `http://127.0.0.1:${COBALT_PORT}`;
@@ -80,6 +82,11 @@ function buildFixtures() {
   ffmpeg(['-i', at('clip.mp4'), '-vframes', '1', '-vf', 'scale=320:180', at('cover.jpg')]);
   // A song as a site would link it: the file is the link, whatever preset is set.
   ffmpeg(['-f', 'lavfi', '-i', 'sine=frequency=330:duration=3', '-c:a', 'libmp3lame', at('song.mp3')]);
+  // Half an hour of sound, for a conversion long enough to be cancelled
+  // part-way. One minute encoded and looped by copying: encoding thirty
+  // would cost this suite more time than the check does.
+  ffmpeg(['-f', 'lavfi', '-i', 'sine=frequency=220:duration=60', '-c:a', 'aac', '-b:a', '32k', at('minute.m4a')]);
+  ffmpeg(['-stream_loop', '29', '-i', at('minute.m4a'), '-c', 'copy', at('long.m4a')]);
 
   const rendition = (name, scale, prefix) =>
     ffmpeg([
@@ -92,6 +99,11 @@ function buildFixtures() {
   rendition('index.m3u8', null, 'seg');
   rendition('low.m3u8', '320:180', 'low');
   rendition('hi.m3u8', '1280:720', 'hi');
+  // The audio-only rung Apple's authoring spec asks every ladder to carry.
+  ffmpeg([
+    '-i', at('clip.mp4'), '-vn', '-c:a', 'copy', '-f', 'hls', '-hls_time', '2', '-hls_playlist_type', 'vod',
+    '-hls_segment_filename', at('aud%d.ts'), at('aud.m3u8'),
+  ]);
 
   writeFileSync(
     at('master.m3u8'),
@@ -103,6 +115,8 @@ function buildFixtures() {
       'index.m3u8',
       '#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2"',
       'hi.m3u8',
+      '#EXT-X-STREAM-INF:BANDWIDTH=70000,CODECS="mp4a.40.2"',
+      'aud.m3u8',
       '',
     ].join('\n'),
   );
@@ -131,12 +145,14 @@ const TYPES = {
   '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json',
   '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml', '.png': 'image/png',
   '.jpg': 'image/jpeg', '.mp4': 'video/mp4', '.ts': 'video/mp2t', '.m3u8': 'application/vnd.apple.mpegurl',
-  '.wasm': 'application/wasm', '.key': 'application/octet-stream', '.mp3': 'audio/mpeg',
+  '.wasm': 'application/wasm', '.key': 'application/octet-stream', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4',
 };
 
 /** A static server that allows cross-origin reads, which is what the media host must do. */
 /** How many times the flaky route has been asked for, and with what. */
 const flaky = { asks: [], cut: false, downUntil: 0, refused: 0 };
+/** How many times the slow route has been asked for its bytes. */
+const slow = { gets: 0 };
 
 function serve(root, port, prefix) {
   const server = createServer((request, response) => {
@@ -206,11 +222,13 @@ function serve(root, port, prefix) {
       return createReadStream(source, { start: from }).pipe(response);
     }
 
-    // A download slow enough to be interrupted: 64 KB every 200 ms.
+    // A download slow enough to be interrupted: 64 KB every 200 ms, 4 MB
+    // unless `kb` says otherwise.
     if (path.endsWith('/slow.mp4')) {
-      const size = 4 * 1024 * 1024;
+      const size = (Number(new URL(request.url, 'http://x').searchParams.get('kb')) || 4096) * 1024;
       response.writeHead(200, { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': size });
       if (request.method === 'HEAD') return response.end();
+      slow.gets += 1;
       let sent = 0;
       const timer = setInterval(() => {
         if (response.destroyed || sent >= size) return clearInterval(timer);
@@ -272,6 +290,8 @@ function serveInvidious(port) {
     if (video) {
       const local = url.searchParams.get('local') === 'true';
       invidious.videos.push({ id: video[1], local });
+      // How videos.cr refuses: a status, and the reason as JSON beside it.
+      if (video[1] === 'PRIVATEvid0') return json(response, 500, { error: 'This video is private' });
       const media = local ? '/videoplayback?expire=1&itag=18' : 'https://rr1---sn-example.googlevideo.com/videoplayback?itag=18';
       return json(response, 200, {
         title: 'A clip through Invidious', videoId: video[1], author: 'the fixture', lengthSeconds: 6, liveNow: false,
@@ -307,7 +327,7 @@ function serveInvidious(port) {
 /* ----------------------------------------------------------------- a fake Piped */
 
 /** What the fake Piped instance was asked. */
-const piped = { streams: [], proxied: 0 };
+const piped = { streams: [], proxied: 0, captions: [] };
 
 /**
  * A Piped instance, as far as this app can tell one apart: `/config` naming
@@ -335,8 +355,24 @@ function servePiped(port) {
         thumbnailUrl: `${PIPED}/proxy/cover.jpg?host=i.ytimg.com`,
         videoStreams: [{ url: `${PIPED}/proxy/clip.mp4?host=rr1---sn-example.googlevideo.com`, format: 'MPEG_4', quality: '360p', mimeType: 'video/mp4', codec: 'avc1.42001E', videoOnly: false, bitrate: 600000, contentLength: size, width: 640, height: 360, fps: 25 }],
         audioStreams: [],
-        subtitles: [],
+        // As a real instance lists them: NewPipe's default format, TTML, on
+        // YouTube's timedtext URL, proxied with the format in `fmt`.
+        subtitles: [{
+          url: `${PIPED}/api/timedtext?v=${streams[1]}&lang=en&fmt=ttml&host=www.youtube.com`,
+          mimeType: 'application/ttml+xml', name: 'English', code: 'en', autoGenerated: false,
+        }],
       });
+    }
+    if (url.pathname === '/api/timedtext') {
+      // YouTube's timedtext answers in whichever format it is asked for.
+      const format = url.searchParams.get('fmt');
+      piped.captions.push(format);
+      if (format === 'vtt') {
+        return response.writeHead(200, { ...cors, 'Content-Type': 'text/vtt' })
+          .end('WEBVTT\n\n00:00:00.000 --> 00:00:03.000\nhello from piped\n');
+      }
+      return response.writeHead(200, { ...cors, 'Content-Type': 'application/ttml+xml' })
+        .end('<?xml version="1.0" encoding="utf-8" ?><tt xml:lang="en" xmlns="http://www.w3.org/ns/ttml"><body><div><p begin="0s" end="3s">hello from piped</p></div></body></tt>');
     }
     if (url.pathname === '/proxy/cover.jpg') {
       const cover = readFileSync(join(MEDIA_DIR, 'cover.jpg'));
@@ -358,8 +394,11 @@ function servePiped(port) {
 
 /* ---------------------------------------------------------------- a fake cobalt */
 
-/** What the fake cobalt instance was asked: every POST body, and the tunnel reads. */
-const cobalt = { asks: [], tunnel: 0 };
+/**
+ * What the fake cobalt instance was asked: every POST body, the tunnel reads,
+ * and every request that carried a key or asked leave to send one.
+ */
+const cobalt = { asks: [], tunnel: 0, keyed: [] };
 
 /**
  * A cobalt instance, as far as this app can tell one apart: its root is JSON
@@ -373,6 +412,9 @@ function serveCobalt(port) {
     response.writeHead(status, { ...cors, 'Content-Type': 'application/json' }).end(JSON.stringify(body));
   const server = createServer((request, response) => {
     const url = new URL(request.url, 'http://x');
+    if (request.headers.authorization || /authorization/i.test(request.headers['access-control-request-headers'] || '')) {
+      cobalt.keyed.push(`${request.method} ${url.pathname} ${request.headers.authorization || '(preflight)'}`);
+    }
     if (request.method === 'OPTIONS') return response.writeHead(204, cors).end();
     if (url.pathname === '/' && request.method === 'GET') {
       return json(response, 200, { cobalt: { version: '11.0', url: COBALT, startTime: '1', durationLimit: 10800, services: ['youtube'] }, git: { commit: 'abc', branch: 'main' } });
@@ -384,6 +426,12 @@ function serveCobalt(port) {
         let body = {};
         try { body = JSON.parse(raw); } catch { /* not JSON */ }
         cobalt.asks.push(body);
+        // cobalt's schema is strict: one value it does not list, and the
+        // whole request is refused.
+        const allowed = { downloadMode: ['auto', 'audio', 'mute'], audioFormat: ['best', 'mp3', 'ogg', 'wav', 'opus'], videoQuality: ['max', '4320', '2160', '1440', '1080', '720', '480', '360', '240', '144'] };
+        if (Object.entries(body).some(([field, value]) => field !== 'url' && !allowed[field]?.includes(value))) {
+          return json(response, 400, { status: 'error', error: { code: 'error.api.invalid_body' } });
+        }
         if (String(body.url || '').includes('scriptURL01')) {
           return json(response, 200, { status: 'tunnel', url: 'javascript:window.__fromInstance=1;void 0', filename: 'x.mp4' });
         }
@@ -403,6 +451,38 @@ function serveCobalt(port) {
   return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
 }
 
+/* ------------------------------------------------------- a fake siphon server */
+
+const OWN_KEY = 'MY-AUTH-TOKEN';
+
+/**
+ * What it says in health: no address for a phone, as in a container, and the
+ * YouTube clients its yt-dlp has — which, as with a real one, is not every
+ * name a page has ever offered.
+ */
+const ownHealth = { lanUrls: [], ytClients: ['android_vr', 'mweb', 'tv', 'web', 'web_safari'] };
+
+/**
+ * Your own server, started with AUTH_TOKEN, as far as the settings sheet can
+ * tell: health answers everyone and says a key is wanted, and the gated
+ * check takes only the right one. Nothing is downloaded through it here.
+ */
+function serveSiphon(port) {
+  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS' };
+  const json = (response, status, body) =>
+    response.writeHead(status, { ...cors, 'Content-Type': 'application/json' }).end(JSON.stringify(body));
+  const server = createServer((request, response) => {
+    const url = new URL(request.url, 'http://x');
+    if (request.method === 'OPTIONS') return response.writeHead(204, cors).end();
+    if (url.pathname === '/api/health') {
+      return json(response, 200, { service: 'siphon', ytDlpVersion: '2026.09.01', ffmpeg: true, requiresKey: true, capabilities: ['jobs', 'resolve', 'tunnel'], lanUrls: ownHealth.lanUrls, ytClients: ownHealth.ytClients });
+    }
+    if (request.headers.authorization !== `Bearer ${OWN_KEY}`) return json(response, 401, { detail: 'This server needs an access key.' });
+    return json(response, 404, { detail: 'No such download.' });
+  });
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
+}
+
 /* ---------------------------------------------------------------------- checking */
 
 const results = [];
@@ -411,12 +491,21 @@ function check(name, condition, detail = '') {
   console.log(`${condition ? 'ok  ' : 'FAIL'} ${name}${detail ? ` — ${detail}` : ''}`);
 }
 
+/** The first subtitle track of a file, as SRT text: empty when it has no cues. */
+function subtitleText(file) {
+  try {
+    return String(execFileSync(FFMPEG, ['-v', 'error', '-i', file, '-map', '0:s:0', '-f', 'srt', '-'], { stdio: ['pipe', 'pipe', 'pipe'] }));
+  } catch {
+    return '';
+  }
+}
+
 const resolutionIn = (report) => (/\b(\d{3,4}x\d{3,4})\b/.exec(report) || [])[1] || '?';
 
 /* ------------------------------------------------------------------------- run */
 
 buildFixtures();
-const servers = [await serve(WEB, APP_PORT, '/app'), await serve(WORK, MEDIA_PORT, ''), await serveInvidious(INV_PORT), await servePiped(PIPED_PORT), await serveCobalt(COBALT_PORT)];
+const servers = [await serve(WEB, APP_PORT, '/app'), await serve(WORK, MEDIA_PORT, ''), await serveInvidious(INV_PORT), await servePiped(PIPED_PORT), await serveCobalt(COBALT_PORT), await serveSiphon(OWN_PORT)];
 const browser = await chromium.launch(process.env.CHROMIUM ? { executablePath: process.env.CHROMIUM } : {});
 const context = await browser.newContext({ acceptDownloads: true });
 const page = await context.newPage();
@@ -434,6 +523,13 @@ page.on('console', (message) => {
   // stats endpoint says what it is, and Chrome reports each miss here. Those
   // three, on that one origin, are the probe doing its job.
   if (/^http:\/\/127\.0\.0\.1:(8789|8792|8793)\/(api\/health|config)?$/.test(at) && /status of 404/.test(message.text())) return;
+  // Your own server takes a key by answering its gated check "no such job".
+  if (at === `${OWN}/api/jobs/key-check` && /status of 404/.test(message.text())) return;
+  // Saving an empty helper asks this page's own origin whether a server
+  // answers there, as a first visit does; a static host says no.
+  if (at === `http://127.0.0.1:${APP_PORT}/api/health` && /status of 404/.test(message.text())) return;
+  // The private video is refused with a 500 on purpose, as a real instance does.
+  if (at.includes('/api/v1/videos/PRIVATEvid0') && /status of 500/.test(message.text())) return;
   consoleErrors.push(`${message.text()} <${at}>`);
 });
 page.on('pageerror', (error) => consoleErrors.push(`pageerror: ${error.message}`));
@@ -523,6 +619,117 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   }
 }
 
+/* More links than the queue keeps rows for: none of the downloads is cancelled
+   to make room. Each link on its own host, so the browser's six connections
+   per host do not hold the later ones back, and slow enough that the first
+   are still running when the last is queued. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  const cut = [];
+  const hosts = await Promise.all(Array.from({ length: 25 }, () => new Promise((resolve) => {
+    const server = createServer((request, response) => {
+      const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Expose-Headers': '*' };
+      if (request.method === 'OPTIONS') return response.writeHead(204, cors).end();
+      const size = 24 * 16384;
+      response.writeHead(200, { ...cors, 'Content-Type': 'video/mp4', 'Content-Length': size });
+      if (request.method === 'HEAD') return response.end();
+      let sent = 0;
+      const timer = setInterval(() => {
+        response.write(Buffer.alloc(16384, 7));
+        sent += 16384;
+        if (sent >= size) {
+          clearInterval(timer);
+          response.end();
+        }
+      }, 250);
+      response.on('close', () => {
+        clearInterval(timer);
+        if (!response.writableEnded) cut.push(request.url);
+      });
+      return undefined;
+    });
+    server.listen(0, '127.0.0.1', () => resolve(server));
+  })));
+  const links = hosts.map((server, i) => `http://127.0.0.1:${server.address().port}/file${String(i + 1).padStart(2, '0')}.mp4`);
+  const landed = [];
+  const collect = (event) => landed.push(event.suggestedFilename());
+  page.on('download', collect);
+  await page.evaluate((text) => {
+    const dt = new DataTransfer();
+    dt.setData('text/plain', text);
+    document.getElementById('url').dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+  }, links.join('\n'));
+  await page.waitForFunction(() => !document.querySelector('#queueList li .q-msg')?.textContent.includes('Starting'), null, { timeout: 30_000 }).catch(() => {});
+  const rows = await page.$$eval('#queueList li .q-title', (titles) => titles.map((title) => title.textContent));
+  check('25 links pasted are 25 rows, none dropped to keep the list short', rows.length === 25 && links.every((link) => rows.some((row) => link.endsWith(`${row}.mp4`) || row === link)),
+    `${rows.length} rows, oldest ${rows.at(-1)}`);
+  await page.waitForFunction(() => document.querySelectorAll('#queueList li a.q-act').length >= 25, null, { timeout: 60_000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  page.off('download', collect);
+  const finished = await page.locator('#queueList li a.q-act').count();
+  check('and every one of them finishes, none cancelled to make room', finished === 25 && cut.length === 0,
+    `${finished} finished, ${landed.length} handed over; cut off: ${cut.join(' ') || 'none'}`);
+  for (const server of hosts) server.close();
+}
+
+/* The queue while settings change: a download on this device keeps going
+   through a Save that changes nothing, and through a change of helper — the
+   job it is has nothing to do with what the next one will use. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  slow.gets = 0;
+  await page.fill('#url', `${MEDIA}/media/slow.mp4?kb=2048`);
+  const waiting = page.waitForEvent('download', { timeout: 60_000 });
+  await page.click('#go');
+  await page.waitForFunction(() => /\d+%/.test(document.querySelector('#queueList li')?.textContent || ''), null, { timeout: 20_000 });
+
+  await page.click('#openSettings');
+  await page.click('#saveSettings');
+  await page.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 15_000 });
+  await page.waitForTimeout(1500);
+  const after = (await page.textContent('#queueList li')) || '';
+  check('a Save that changes nothing leaves a running download running', /\d+%/.test(after) && !/interrupted/i.test(after), after.replace(/\s+/g, ' ').slice(0, 70));
+
+  await page.click('#openSettings');
+  await page.fill('#endpoint', COBALT);
+  await page.click('#saveSettings');
+  await page.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 15_000 });
+  await page.waitForTimeout(1500);
+  const switched = (await page.textContent('#queueList li')) || '';
+  check('and so does a change of helper', !/interrupted/i.test(switched), switched.replace(/\s+/g, ' ').slice(0, 70));
+  const event = await waiting.catch(() => null);
+  const saved = event ? join(DOWNLOADS, `kept-${event.suggestedFilename()}`) : '';
+  if (event) await event.saveAs(saved);
+  check('it finishes, and its file is whole', saved && statSync(saved).size === 2048 * 1024, saved ? `${statSync(saved).size} bytes` : 'no download');
+  check('from the one request it started with', slow.gets === 1, `${slow.gets} requests for the file`);
+}
+
+/* A probe for a link already queued lands on nothing: the box stays empty,
+   and the next link is not given its title. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.fill('#url', `${MEDIA}/media/page.html`);
+  await page.click('#go');
+  await page.waitForTimeout(1200);
+  check('a link queued at once leaves no preview behind it', await page.evaluate(() => document.getElementById('preview').hidden),
+    ((await page.textContent('#preview')) || '').replace(/\s+/g, ' ').slice(0, 60));
+  const next = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+  await page.fill('#url', next);
+  await page.click('#go');
+  await page.waitForSelector('.q-error', { timeout: 20_000 });
+  const title = (await page.textContent('.q-error .q-title')) || '';
+  check('and the next link keeps its own name, not the last one\'s title', title === next, title);
+  // The first one's file, landed, so no later check takes it for its own.
+  await page.waitForSelector('#queueList li a.q-act', { timeout: 20_000 });
+  await page.waitForTimeout(500);
+}
+
 /* A progressive MP4 that already meets the preset: no conversion at all. */
 {
   coreRequests = 0;
@@ -539,6 +746,15 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   const song = readFileSync(join(MEDIA_DIR, 'song.mp3'));
   check('a direct mp3 under "Best" arrives byte-identical, as an mp3', file.endsWith('.mp3') && Buffer.compare(song, readFileSync(file)) === 0, file.split('/').pop());
   check('and never loads the converter to rewrap it', coreRequests === 0, `${coreRequests} core requests`);
+}
+
+/* The same .mp3 with MP3 asked for: it already is one, so it is not encoded again. */
+{
+  coreRequests = 0;
+  const file = await download(`${MEDIA}/media/song.mp3`, 'audio_mp3');
+  const song = readFileSync(join(MEDIA_DIR, 'song.mp3'));
+  check('a direct mp3 asked for as mp3 arrives byte-identical, not re-encoded', file.endsWith('.mp3') && Buffer.compare(song, readFileSync(file)) === 0, file.split('/').pop());
+  check('and never loads the converter', coreRequests === 0, `${coreRequests} core requests`);
 }
 
 /* A connection that dies mid-download is resumed, not restarted. */
@@ -569,6 +785,18 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   check('a capped preset takes the best rendition under it', resolutionIn(report) === '640x360', resolutionIn(report));
 }
 
+/* MP3 from a ladder: its audio-only rung, not the top video rung for its sound. */
+{
+  const segments = [];
+  const record = (request) => /\.ts$/.test(request.url()) && segments.push(request.url().split('/').pop());
+  page.on('request', record);
+  const report = inspect(await download(`${MEDIA}/media/master.m3u8`, 'audio_mp3'));
+  page.off('request', record);
+  check('mp3 from an hls ladder is really mp3', /Audio: mp3/.test(report) && !/Video: h264/.test(report));
+  check('and only the audio-only rendition was fetched for it',
+    segments.length > 0 && segments.every((name) => /^aud\d+\.ts$/.test(name)), [...new Set(segments.map((name) => name.replace(/\d+\.ts$/, '')))].join(', '));
+}
+
 /* AES-128 encrypted HLS, decrypted in the page with WebCrypto. */
 {
   const report = inspect(await download(`${MEDIA}/media/enc.m3u8`, 'video_best'));
@@ -586,6 +814,40 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   const report = inspect(await download(`${MEDIA}/media/clip.mp4`, 'audio_m4a'));
   check('m4a is aac in an mp4 container', /Audio: aac/.test(report) && /Input #0, mov,mp4/.test(report));
   check('m4a has no video stream left', !/Video: h264/.test(report));
+}
+
+/* Cancelling a conversion stops it: the next one does not wait for it to finish. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  const timings = await page.evaluate(async ({ media, coreUrl }) => {
+    const { BrowserBackend } = await import('./inbrowser.js');
+    const converter = await import('./media.js');
+    const backend = new BrowserBackend({ coreUrl });
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const finish = async (id) => {
+      const started = performance.now();
+      for (;;) {
+        const state = await backend.poll(id);
+        if (state.state !== 'running') return { state: state.state, error: state.error, ms: Math.round(performance.now() - started) };
+        await sleep(25);
+      }
+    };
+    await converter.ensureFfmpeg();
+    const alone = await finish((await backend.start(`${media}/media/clip.mp4`, 'audio_mp3')).id);
+    const long = await backend.start(`${media}/media/long.m4a`, 'audio_mp3');
+    while ((await backend.poll(long.id)).stage !== 'processing') await sleep(25);
+    await sleep(300);
+    await backend.cancel(long.id);
+    const stopped = !converter.isLoaded();
+    const after = await finish((await backend.start(`${media}/media/clip.mp4`, 'audio_mp3')).id);
+    return { alone, after, stopped };
+  }, { media: MEDIA, coreUrl: VENDORED && !process.env.SIPHON_CORE_URL ? '' : CORE_URL });
+  // The half hour left to encode takes several seconds even natively; the
+  // short job alone takes a fraction of one. A fresh core costs a moment.
+  const bound = 2 * timings.alone.ms + 3000;
+  check('a conversion cancelled part-way does not hold up the next one',
+    timings.after.state === 'done' && timings.after.ms < bound,
+    `${timings.alone.ms} ms alone, ${timings.after.ms} ms after the cancel (under ${bound}); converter stopped: ${timings.stopped}`);
 }
 
 /* A plain HTML page whose markup declares its video — and its artwork. */
@@ -670,6 +932,63 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   check('it says it was interrupted, and offers to try again', /interrupted/i.test(label) && retry === 1, label.slice(0, 60));
 }
 
+/* A row is changed in place as its download moves, never drawn again: a
+   keyboard on Cancel is still there after a poll, a press held across one is
+   still a press, and how a download ended is said to a screen reader. */
+{
+  await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => localStorage.removeItem('siphon:queue'));
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.fill('#url', `${MEDIA}/media/slow.mp4`);
+  await page.click('#go');
+  await page.waitForFunction(() => /\d+%/.test(document.querySelector('#queueList li')?.textContent || ''), null, { timeout: 20_000 });
+  await page.evaluate(() => {
+    window.__row = document.querySelector('#queueList li');
+    window.__dropped = 0;
+    new MutationObserver((records) => { window.__dropped += records.reduce((n, record) => n + record.removedNodes.length, 0); })
+      .observe(document.getElementById('queueList'), { childList: true });
+  });
+  await page.focus('#queueList [data-cancel]');
+  const before = (await page.textContent('#queueList li .q-pct')) || '';
+  await page.waitForTimeout(2000);
+  const held = await page.evaluate(() => ({
+    focus: document.activeElement?.hasAttribute('data-cancel') ? 'Cancel' : document.activeElement?.tagName,
+    same: document.querySelector('#queueList li') === window.__row,
+    dropped: window.__dropped,
+    pct: document.querySelector('#queueList li .q-pct')?.textContent || '',
+  }));
+  check('a keyboard on Cancel is still on it after a few polls', held.focus === 'Cancel', `focus on ${held.focus}`);
+  check('the row moved on in place, not drawn again', held.same && held.dropped === 0 && held.pct !== before, `${before} → ${held.pct}, ${held.dropped} rows dropped`);
+
+  // A deliberate tap, or a slow click: down and up either side of a poll.
+  const box = await page.locator('#queueList [data-cancel]').boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.waitForTimeout(900);
+  await page.mouse.up();
+  await page.waitForTimeout(400);
+  const left = await page.locator('#queueList li').count();
+  check('a press held across a poll still cancels', left === 0, `${left} rows left`);
+
+  await download(`${MEDIA}/media/clip.mp4`, 'video_best');
+  await page.waitForTimeout(500);
+  // Read without waiting for it, so a page with no such region is a failed
+  // check rather than a suite stuck on a selector.
+  const said = () => page.evaluate(() => {
+    const region = document.getElementById('queueStatus');
+    return { text: region?.textContent || '', role: region?.getAttribute('role') || 'none' };
+  });
+  const ready = await said();
+  check('a finished download is said, by name, to a screen reader', /^Ready: clip\.mp4/.test(ready.text) && ready.role === 'status', `${ready.role}: ${ready.text}`);
+  await page.fill('#url', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+  await page.click('#go');
+  await page.waitForSelector('.q-error', { timeout: 20_000 });
+  await page.waitForTimeout(300);
+  const failed = (await said()).text;
+  check('and so is a failed one, with the reason', /^Failed: /.test(failed) && /relay|web page/i.test(failed), failed.slice(0, 90));
+  check('and the settings sheet\'s verdict is announced too', (await page.getAttribute('#statusText', 'role')) === 'status');
+}
+
 /* An Invidious instance, given as the one address, carries YouTube for the device. */
 {
   await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
@@ -680,13 +999,21 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   // Through the settings sheet, the way a person does it: type the address,
   // watch it be recognised, save. No reload afterwards — the init script
   // above would put the no-helper settings back.
+  // Typed as a phone keyboard leaves it, with no scheme: probed at that
+  // address, not as a path under this page.
   await page.click('#openSettings');
-  await page.fill('#endpoint', INV);
+  const underPage = [];
+  const watch = (request) => request.url().startsWith(`http://127.0.0.1:${APP_PORT}/app/127.0.0.1`) && underPage.push(request.url());
+  page.on('request', watch);
+  await page.fill('#endpoint', `127.0.0.1:${INV_PORT}`);
   await page.click('#testConnection');
   await page.waitForFunction(
     () => !/checking|not checked/i.test(document.getElementById('statusText').textContent || ''), null, { timeout: 15_000 });
+  page.off('request', watch);
   const verdict = (await page.textContent('#statusText')) || '';
   check('an Invidious instance is recognised from its address alone', /An Invidious instance/.test(verdict), verdict.slice(0, 70));
+  check('an address typed without http:// is given it, and never asked of this page\'s own host',
+    (await page.inputValue('#endpoint')) === INV && underPage.length === 0, `${await page.inputValue('#endpoint')}; ${underPage.length} requests under the page`);
   await page.click('#saveSettings');
   await page.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 15_000 });
   const header = (await page.textContent('#backendLabel')) || '';
@@ -725,6 +1052,16 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
     /Subtitle: mov_text/.test(report) && /Video: h264/.test(report) && /Audio: aac/.test(report),
     (report.match(/Stream #0:\d[^\n]*/g) || []).map((line) => line.replace(/\s+/g, ' ').slice(0, 50)).join(' | '));
   check('the page itself never touched googlevideo or youtube.com', strangers.length === 0, strangers.slice(0, 2).join(' ; '));
+
+  // A private video: the row has to say so in the instance's words, and no
+  // other instance is asked, since none would answer differently.
+  const asked = invidious.videos.length;
+  await page.fill('#url', 'https://www.youtube.com/watch?v=PRIVATEvid0');
+  await page.click('#go');
+  await page.waitForSelector('.q-error', { timeout: 60_000 });
+  const refusal = (await page.textContent('.q-error .q-msg')) || '';
+  check('a private video is reported as private, not as instances that did not answer', /private/i.test(refusal), refusal.slice(0, 90));
+  check('and it is asked of the instance once', invidious.videos.length - asked === 1, `${invidious.videos.length - asked} asks`);
 }
 
 /* A Piped instance, the same way: recognised from its address, YouTube through its proxy. */
@@ -756,6 +1093,17 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   check('a YouTube link is resolved by the Piped instance', piped.streams.includes('dQw4w9WgXcQ'), piped.streams.join(','));
   check("the file arrives through the instance's proxy, byte-identical", piped.proxied >= 1 && Buffer.compare(source, readFileSync(saved)) === 0, `${piped.proxied} proxy reads`);
   check('named after the video', /clip through Piped/i.test(event.suggestedFilename()), event.suggestedFilename());
+
+  // With subtitles in the video: Piped lists its captions as TTML, which
+  // ffmpeg would take for an empty WebVTT file — a subtitle track that never
+  // shows a word. They have to be asked for as WebVTT, and have their cue.
+  await page.check('input[name="subs"][value="embed"]');
+  await page.fill('#url', 'https://youtu.be/jNQXAC9IVRw');
+  const subbedEvent = await Promise.all([page.waitForEvent('download', { timeout: 180_000 }), page.click('#go')]).then(([e]) => e);
+  const subbed = join(DOWNLOADS, `piped-subs-${subbedEvent.suggestedFilename()}`);
+  await subbedEvent.saveAs(subbed);
+  check("Piped's TTML caption is asked for as WebVTT", piped.captions.includes('vtt') && !piped.captions.includes('ttml'), JSON.stringify(piped.captions));
+  check('and the embedded track carries its words, not nothing', /hello from piped/.test(subtitleText(subbed)), subtitleText(subbed).replace(/\s+/g, ' ').slice(0, 60) || 'empty');
   check('the page itself never touched googlevideo or youtube.com', strangers.length === 0, strangers.slice(0, 2).join(' ; '));
 }
 
@@ -766,12 +1114,66 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   await page.reload({ waitUntil: 'networkidle' });
   strangers.length = 0;
 
+  // Your own server first, saved with its key. The key field is a password
+  // field, so a key left in it is invisible — and the instance typed in next
+  // is someone else's.
+  // The key is typed before the address, as a password manager fills it:
+  // with nothing saved it belongs to the address typed next, not to this
+  // page's own origin, which the first letter of that address left behind.
   await page.click('#openSettings');
+  await page.fill('#endpoint', '');
+  await page.fill('#endpointKey', OWN_KEY);
+  await page.locator('#endpoint').pressSequentially(OWN);
+  const typedFirst = await page.inputValue('#endpointKey');
+  check('a key typed before the address is kept for the address typed after it', typedFirst === OWN_KEY, JSON.stringify(typedFirst));
+  await page.click('#saveSettings');
+  await page.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 15_000 });
+  check('your own server is saved with its access key', /your server/.test((await page.textContent('#backendLabel')) || ''), await page.textContent('#backendLabel'));
+  await page.click('#openSettings');
+  const kept = await page.inputValue('#endpointKey');
+
+  // On your phone. This server is on this computer and could not name its
+  // address on the network — a container cannot see it — so the sheet says
+  // how to find it rather than saying nothing.
+  const phone = () => page.evaluate(() => ({ shown: !document.getElementById('phoneHint').hidden, text: document.getElementById('phoneHintBody').textContent || '' }));
+  const unnamed = await phone();
+  check('a server on this computer that cannot name its network address still says how to reach it from a phone',
+    unnamed.shown && /network address/.test(unnamed.text) && /port 8794/.test(unnamed.text) && /LAN_URL/.test(unnamed.text), unnamed.shown ? unnamed.text.slice(0, 90) : 'hidden');
+  check('and that plain http will not install or take links from the share sheet, and what will',
+    /install/.test(unnamed.text) && /share sheet/.test(unnamed.text) && /HTTPS helper/.test(unnamed.text) && /tailscale serve/.test(unnamed.text), unnamed.text.slice(-120));
+
+  // YouTube clients: the ones this server's yt-dlp has, and no others. A
+  // client yt-dlp dropped is skipped without a word, so offering it would
+  // be a choice that does nothing.
+  const clients = () => page.evaluate(() => [...document.getElementById('optClient').options].filter((option) => option.value && !option.hidden && !option.disabled).map((option) => option.value));
+  const offered = await clients();
+  check('the YouTube clients offered are the ones your server has', JSON.stringify(offered) === JSON.stringify(['tv', 'web_safari', 'android_vr', 'mweb', 'web']), offered.join(', '));
+  check('and tv_embedded, which yt-dlp retired, is not one of them anywhere', (await page.locator('#optClient option[value="tv_embedded"]').count()) === 0);
+
+  // A server that does name its address: shown as it is, with the same word on http.
+  ownHealth.lanUrls = ['http://192.168.1.42:8794'];
+  ownHealth.ytClients = ['android_vr', 'ios', 'mweb', 'tv', 'web', 'web_safari'];
+  await page.click('#testConnection');
+  await page.waitForFunction(() => !/checking|not checked/i.test(document.getElementById('statusText').textContent || ''), null, { timeout: 15_000 });
+  const named = await phone();
+  check('a server that names its address on the network is shown with it, and the same note on plain http',
+    named.shown && named.text.includes('http://192.168.1.42:8794') && !/LAN_URL/.test(named.text) && /share sheet/.test(named.text), named.text.slice(0, 90));
+  check('and a server whose yt-dlp has another client offers it', (await clients()).includes('ios'), (await clients()).join(', '));
+  ownHealth.lanUrls = [];
+  ownHealth.ytClients = ['android_vr', 'mweb', 'tv', 'web', 'web_safari'];
+
   await page.fill('#endpoint', COBALT);
+  check("typing another address lets go of the last server's key", kept === OWN_KEY && (await page.inputValue('#endpointKey')) === '', `${kept ? 'key shown on reopening' : 'no key on reopening'}, then ${JSON.stringify(await page.inputValue('#endpointKey'))}`);
+  await page.fill('#endpoint', `${OWN}/`);
+  const back = await page.inputValue('#endpointKey');
+  await page.fill('#endpoint', COBALT);
+  check('and typing your server back brings it back, for that server only', back === OWN_KEY && (await page.inputValue('#endpointKey')) === '', `${back ? 'back' : 'not back'}, then ${JSON.stringify(await page.inputValue('#endpointKey'))}`);
+
   await page.click('#testConnection');
   await page.waitForFunction(() => !/checking|not checked/i.test(document.getElementById('statusText').textContent || ''), null, { timeout: 15_000 });
   const verdict = (await page.textContent('#statusText')) || '';
   check('a cobalt instance is recognised from its address alone', /cobalt 11\.0 instance/.test(verdict), verdict.slice(0, 70));
+  check('and there is nothing to say about phones for it, nor clients to hide', (await phone()).shown === false && (await clients()).join() === 'tv,web_safari,android_vr,mweb,web,ios', (await clients()).join(', '));
   await page.click('#saveSettings');
   await page.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 15_000 });
   check('and the header names it', /cobalt 11\.0 for the rest/.test((await page.textContent('#backendLabel')) || ''), await page.textContent('#backendLabel'));
@@ -803,6 +1205,12 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   check("the finished file arrives from the instance's tunnel, byte-identical", cobalt.tunnel >= 1 && Buffer.compare(source, readFileSync(saved)) === 0, `${cobalt.tunnel} tunnel reads`);
   check('under the name the instance gave it', /clip through cobalt/i.test(event.suggestedFilename()), event.suggestedFilename());
 
+  // Every quality the page offers has to be a request cobalt takes. It has
+  // no "m4a": the M4A preset is its "best" audio, which for YouTube is AAC.
+  cobalt.asks.length = 0;
+  const m4a = await take('https://youtu.be/jNQXAC9IVRw', 'audio_m4a').catch((error) => ({ error }));
+  check('M4A through the instance is a request it accepts', !m4a.error && cobalt.asks[0]?.audioFormat === 'best', JSON.stringify(cobalt.asks[0]));
+
   // An instance is someone else's server. What it hands back goes into a
   // link this page clicks by itself, so a script URL from it would run as
   // this page, settings, keys and all.
@@ -818,6 +1226,7 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   check("a cobalt answer that is not a download link is refused, not clicked", /not a download link/i.test(refused), refused.slice(0, 70));
   check('and nothing it sent ran in this page', (await page.evaluate(() => window.__fromInstance)) === undefined);
   check('the page itself never touched googlevideo or youtube.com', strangers.length === 0, strangers.slice(0, 2).join(' ; '));
+  check('the instance never saw your server\'s key, not in a probe and not with a download', cobalt.keyed.length === 0, cobalt.keyed.slice(0, 3).join(' ; '));
 }
 
 check('no uncaught errors in the page', consoleErrors.length === 0, consoleErrors.slice(0, 2).join(' ; '));

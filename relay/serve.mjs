@@ -16,9 +16,12 @@
  *   allowed — the same rule the README leans on for "you are the client".
  * - Your home IP, not a datacentre's. YouTube treats those very differently.
  *
- * It is still a server, and it is running on the machine you are sitting at;
- * a phone cannot use it unless it can reach that machine. It is also what CI
- * uses to drive a real YouTube download, which is the reason it exists.
+ * It is for the browser on this machine. A phone on the same Wi-Fi can reach
+ * the machine and still not use it: the hosted page is HTTPS, and a browser
+ * lets an HTTPS page call plain http on loopback only — anything else is
+ * mixed content, blocked however reachable it is. A phone needs the Worker,
+ * or an HTTPS address in front of this. It is also what CI uses to drive a
+ * real YouTube download, which is the reason it exists.
  *
  * ALLOWED_HOSTS and ALLOWED_ORIGINS are read from the environment, exactly as
  * the Worker reads them from its bindings.
@@ -66,11 +69,28 @@ const server = createServer(async (req, res) => {
   }
 });
 
+const address = (host) => `http://${host.includes(':') ? `[${host}]` : host}:${PORT}`;
+const loopback = /^(127\.|localhost$|::1$)/i.test(HOST);
+const everywhere = HOST === '0.0.0.0' || HOST === '::';
+
 server.listen(PORT, HOST, () => {
   const hosts = process.env.ALLOWED_HOSTS || '(youtube defaults)';
   const origins = process.env.ALLOWED_ORIGINS || '(any — set ALLOWED_ORIGINS before exposing this)';
-  console.log(`relay listening on http://${HOST}:${PORT}`);
+  console.log(`relay listening on ${address(HOST)}`);
   console.log(`  hosts:   ${hosts}`);
   console.log(`  origins: ${origins}`);
-  console.log(`paste http://${HOST}:${PORT} into siphon under Settings → Helper`);
+  // The address to paste is one the HTTPS page may call, which is loopback
+  // only. Listening everywhere includes it; listening on one LAN address
+  // does not, and reachable from the LAN is not usable from it.
+  if (loopback) {
+    console.log(`paste ${address(HOST)} into siphon under Settings → Helper`);
+  } else if (everywhere) {
+    console.log(`paste ${address('127.0.0.1')} into siphon under Settings → Helper, on this machine`);
+    console.log('  other devices cannot use it from the hosted page: that page is HTTPS, and a browser');
+    console.log('  lets it call plain http on 127.0.0.1 only. A phone needs the Worker (relay/README.md).');
+  } else {
+    console.log(`the hosted page cannot use ${address(HOST)}: it is HTTPS, and a browser lets it call`);
+    console.log('  plain http on 127.0.0.1 only. Leave HOST unset for this machine; a phone needs the');
+    console.log('  Worker (relay/README.md).');
+  }
 });
