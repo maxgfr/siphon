@@ -1,4 +1,13 @@
-# Deploy: fly launch --no-deploy && fly secrets set AUTH_TOKEN=$(openssl rand -hex 16) && fly deploy
+# Deploy:
+#
+#   fly launch --no-deploy
+#   TOKEN=$(openssl rand -hex 16); echo "Access key: $TOKEN"
+#   fly secrets set AUTH_TOKEN="$TOKEN"
+#   fly deploy
+#
+# Keep the key the second line prints and paste it into the app's settings:
+# once it is set, Fly shows a secret's digest, never its value.
+
 app = "siphon"
 primary_region = "cdg"
 

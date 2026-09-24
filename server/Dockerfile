@@ -20,6 +20,13 @@ COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 WORKDIR /app
 
 COPY server/requirements.txt ./requirements.txt
+# Read by nothing, and part of the cache key of every RUN below. yt-dlp is
+# unpinned so a rebuild takes the newest, but a layer is keyed on its command
+# and what came before it, never on PyPI: with the build cache warm, the
+# weekly rebuild would republish the yt-dlp it already had. The image
+# workflow passes the newest version PyPI names, so the install is reused
+# until yt-dlp releases and redone the first build after.
+ARG YTDLP_LATEST
 RUN pip install --no-cache-dir -r requirements.txt
 
 # The proof-of-origin plugin. Installed unconditionally but inert unless

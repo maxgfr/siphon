@@ -26,6 +26,9 @@ jobs:
       # Installing from the file, not a hand-picked subset, is the whole point:
       # the file has to resolve, or the Dockerfile cannot build.
       - run: pip install -r server/requirements.txt pytest httpx
+      # Some of the server's tests run the real yt-dlp against a real ffmpeg:
+      # where ffmpeg connects, and what a clip cuts, no stub can show.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
       - run: pytest server/tests -q
       - uses: actions/setup-node@v4
         with:
@@ -52,6 +55,27 @@ jobs:
       - run: npm run test:deployed
       - run: npm run test:bridge
       - run: npm run test:split
+
+  # A few minutes. The image as it is published, started the way it starts:
+  # as root, through the entrypoint, down to the app user. What only the
+  # image can get wrong is checked in it — the entrypoint once left HOME at
+  # /root, which the app user cannot write, and yt-dlp's cache (the YouTube
+  # player it otherwise fetches and solves again for every job) went nowhere.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -f server/Dockerfile -t siphon:ci .
+      - name: The app user can keep yt-dlp's cache
+        run: |
+          docker run --rm -i siphon:ci python - <<'EOF'
+          import os, yt_dlp
+          assert os.getuid() != 0, "the server is still root"
+          with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+              ydl.cache.store("siphon-ci", "probe", 1)
+              assert ydl.cache.load("siphon-ci", "probe") == 1, f"yt-dlp cannot keep a cache under HOME={os.environ.get('HOME')}"
+          print("cache kept, HOME =", os.environ.get("HOME"))
+          EOF
 
   # Informative, not gating. A runner is a datacentre IP, and whether YouTube
   # answers one on a given day is YouTube's decision, not this code's. What it

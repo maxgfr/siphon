@@ -31,7 +31,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      # With the Origin of this repository's page, as relay-config.yml sends it.
       - run: node scripts/instances.mjs
+        env:
+          SIPHON_ORIGIN: ${{ vars.SIPHON_ORIGIN || format('https://{0}.github.io', github.repository_owner) }}
       - id: diff
         run: |
           if git diff --quiet -- web/instances.json; then

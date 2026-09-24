@@ -11,6 +11,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { createServer } from 'node:net';
 
 const PORT = 18787;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -70,6 +71,9 @@ test('a refused host is a JSON 403, body intact', async () => {
     headers: { Origin: 'https://maxgfr.github.io' },
   });
   assert.equal(response.status, 403);
+  // The mark that says the relay refused, not the host: a header Node's
+  // writeHead could drop, and the page's only way to tell the two apart.
+  assert.equal(response.headers.get('x-relay-error'), 'host not allowed');
   assert.equal((await response.json()).error, 'host not allowed');
 });
 
@@ -126,5 +130,45 @@ test('an upstream that drops mid-body does not take the relay down with it', asy
     assert.equal(dropping.exitCode, null);
   } finally {
     dropping.kill();
+  }
+});
+
+test('listening on every interface, it names the address this machine can paste, and says a phone cannot', async () => {
+  // The hosted page is HTTPS, and a browser lets it call plain http on
+  // loopback only. HOST=0.0.0.0 is what someone tries in order to reach this
+  // from a phone, and the line it printed — paste http://0.0.0.0:… — is an
+  // address no browser will call from that page, this machine's included.
+  const port = await new Promise((resolve) => {
+    const probe = createServer().listen(0, '127.0.0.1', () => {
+      const { port: free } = probe.address();
+      probe.close(() => resolve(free));
+    });
+  });
+  const wide = spawn(process.execPath, ['relay/serve.mjs'], {
+    env: { ...process.env, HOST: '0.0.0.0', PORT: String(port) },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  try {
+    // Everything it says at startup, which is everything up to a quiet moment
+    // after the paste line.
+    const said = await new Promise((resolve, reject) => {
+      let seen = '';
+      const timer = setTimeout(() => reject(new Error(`no paste line within 10s: ${seen}`)), 10_000);
+      wide.stdout.on('data', (chunk) => {
+        seen += String(chunk);
+        if (seen.includes('into siphon')) {
+          clearTimeout(timer);
+          setTimeout(() => resolve(seen), 300);
+        }
+      });
+      wide.on('exit', (code) => reject(new Error(`relay exited with ${code}: ${seen}`)));
+    });
+    assert.doesNotMatch(said, /paste http:\/\/0\.0\.0\.0/);
+    assert.match(said, new RegExp(`paste http://127\\.0\\.0\\.1:${port} into siphon`));
+    assert.match(said, /phone/);
+    const response = await fetch(`http://127.0.0.1:${port}/`);
+    assert.equal(response.status, 400, 'and 127.0.0.1 does reach it');
+  } finally {
+    wide.kill();
   }
 });

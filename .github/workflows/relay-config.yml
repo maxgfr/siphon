@@ -30,9 +30,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      # Asked as this repository's page, which is the one a relay here lets
+      # in: <owner>.github.io, or the SIPHON_ORIGIN variable for a custom
+      # domain. Asked as another page, a fork's own relay was measured shut.
       - run: node scripts/relay-config.mjs
         env:
           SIPHON_RELAY_URL: ${{ vars.SIPHON_RELAY_URL }}
+          SIPHON_ORIGIN: ${{ vars.SIPHON_ORIGIN || format('https://{0}.github.io', github.repository_owner) }}
       - id: diff
         run: |
           if git diff --quiet -- web/config.json; then

@@ -79,6 +79,12 @@ const TYPES = {
 
 let root = WEB;
 let hasApi = false;
+/** A server run without ffmpeg: it resolves, and the device downloads. */
+let thin = false;
+/** A server that answers 503 for its jobs, as one does for a moment when it is busy or restarting. */
+let jobsDown = false;
+/** Every job the page asked the stub server to delete. */
+const deleted = [];
 /** Files answered with test content instead of what is on disk, by path. */
 const overrides = new Map();
 /** Every job body the page posted to the stub server. */
@@ -98,6 +104,14 @@ const server = createServer(
     if (path === '/__api') {
       hasApi = url.searchParams.get('on') === '1';
       return response.writeHead(200).end(String(hasApi));
+    }
+    if (path === '/__thin') {
+      thin = url.searchParams.get('on') === '1';
+      return response.writeHead(200).end(String(thin));
+    }
+    if (path === '/__jobs') {
+      jobsDown = url.searchParams.get('down') === '1';
+      return response.writeHead(200).end(String(jobsDown));
     }
 
     // A test's own answer for a file — through the service worker too, which
@@ -144,13 +158,24 @@ const server = createServer(
       return response.writeHead(200, { 'Content-Type': 'application/json' })
         .end('{"id":"stub1","state":"error","stage":"failed","progress":0,"error":"a stub server, with no yt-dlp behind it"}');
     }
+    // Two jobs a page restores after a reload: one still running, one done.
+    if (path.startsWith('/api/jobs/') && request.method === 'DELETE') {
+      deleted.push(path.slice('/api/jobs/'.length));
+      return response.writeHead(200, { 'Content-Type': 'application/json' }).end('{"ok":true}');
+    }
+    if (path === '/api/jobs/r1' || path === '/api/jobs/d1') {
+      if (jobsDown) return response.writeHead(503, { 'Content-Type': 'application/json' }).end('{"detail":"busy"}');
+      return response.writeHead(200, { 'Content-Type': 'application/json' }).end(path.endsWith('r1')
+        ? '{"id":"r1","state":"running","stage":"downloading","progress":0.4}'
+        : '{"id":"d1","state":"done","stage":"ready","progress":1,"filename":"Finished film.mp4"}');
+    }
 
     // The one endpoint that tells a container apart from a static host.
     if (path === '/api/health') {
       if (!hasApi) return response.writeHead(404, { 'Content-Type': 'text/plain' }).end('not found');
       return response.writeHead(200, { 'Content-Type': 'application/json' })
         .end(JSON.stringify({
-          service: 'siphon', ytDlpVersion: '2026.08.19', ffmpeg: true,
+          service: 'siphon', ytDlpVersion: '2026.08.19', ffmpeg: !thin,
           capabilities: ['jobs', 'resolve', 'tunnel'], presets: [], hasCookies: false, lanUrls: [],
         }));
     }
@@ -179,6 +204,8 @@ await new Promise((resolve) => server.listen(PORT, '127.0.0.1', resolve));
 
 const serve = (build) => fetch(`${BASE}/__serve?build=${build}`).then((r) => r.text());
 const setApi = (on) => fetch(`${BASE}/__api?on=${on ? 1 : 0}`).then((r) => r.text());
+const setThin = (on) => fetch(`${BASE}/__thin?on=${on ? 1 : 0}`).then((r) => r.text());
+const setJobsDown = (down) => fetch(`${BASE}/__jobs?down=${down ? 1 : 0}`).then((r) => r.text());
 
 /* -------------------------------------------------------------------- checks */
 
@@ -415,6 +442,10 @@ for (const [old, expected] of [
   await page.click('#advanced summary');
   await page.waitForTimeout(200);
   check('there is no converter field to configure: the converter ships beside the app', (await page.locator('#coreUrl').count()) === 0);
+  // A clip is typed as 1:23. A phone's number pad has no colon — iOS shows
+  // digits and nothing else — so the form the hint asks for could not be typed.
+  const clipKeyboards = await page.evaluate(() => ['optClipStart', 'optClipEnd'].map((id) => document.getElementById(id).inputMode));
+  check('the clip fields bring up a keyboard with a colon on it', clipKeyboards.every((mode) => !['numeric', 'decimal', 'tel'].includes(mode)), clipKeyboards.join(', '));
   check('with your own server set, the yt-dlp options are live', !(await page.evaluate(() => document.getElementById('ytdlpBlock').classList.contains('off'))) && /Applied by your server/.test((await page.textContent('#ytdlpScope')) || ''),
     ((await page.textContent('#ytdlpScope')) || '').slice(0, 60));
   await page.check('#optSponsor');
@@ -453,8 +484,17 @@ for (const [old, expected] of [
   check('with no server set they are greyed, and say what they wait for', (await page.evaluate(() => document.getElementById('ytdlpBlock').classList.contains('off'))) && /your own siphon server/.test((await page.textContent('#ytdlpScope')) || ''),
     ((await page.textContent('#ytdlpScope')) || '').slice(0, 70));
   check('but not lost', (await page.inputValue('#optRate')) === '2M');
+  // Your own server without ffmpeg only resolves: the device downloads, and
+  // yt-dlp's options have nothing to apply them. Live-looking options there
+  // would clip nothing and cut no sponsor, silently.
   await setApi(true);
+  await setThin(true);
   await page.fill('#endpoint', BASE);
+  await page.click('#testConnection');
+  await page.waitForTimeout(1200);
+  check('with a server that has no ffmpeg they are greyed too, and say why', (await page.evaluate(() => document.getElementById('ytdlpBlock').classList.contains('off'))) && /ffmpeg/.test((await page.textContent('#ytdlpScope')) || ''),
+    ((await page.textContent('#ytdlpScope')) || '').slice(0, 90));
+  await setThin(false);
   await page.click('#testConnection');
   await page.waitForTimeout(1200);
 
@@ -472,6 +512,76 @@ for (const [old, expected] of [
   // subpath, as deployed — so a static host serves it with nothing configured.
   const core = await page.evaluate(async () => (await import('./media.js')).DEFAULT_CORE_URL);
   check('the converter defaults to the app\'s own origin', core.startsWith(`${BASE}/siphon/vendor/ffmpeg/`), core);
+  await context.close();
+}
+
+/* 4b. The queue after a reload, against a server that does not answer for a moment. */
+{
+  const { context, page } = await fresh();
+  await setApi(true);
+  await page.goto(APP, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(1500);
+  // A row saved while it was still being identified has no job behind it;
+  // the other two are jobs on the server, one running and one done.
+  await page.evaluate(() => localStorage.setItem('siphon:queue', JSON.stringify([
+    { key: 'k0', url: 'https://slow.example/page', title: 'Still being identified', preset: 'video_best', state: 'starting' },
+    { key: 'k1', id: 'r1', url: 'https://example.com/1', title: 'Long film', preset: 'video_best', state: 'running' },
+    { key: 'k2', id: 'd1', url: 'https://example.com/2', title: 'Finished film', preset: 'video_best', state: 'done', filename: 'Finished film.mp4' },
+  ])));
+  deleted.length = 0;
+  await setJobsDown(true);
+  await page.reload({ waitUntil: 'load' });
+  await page.waitForTimeout(1500);
+  await setJobsDown(false);
+  await page.waitForTimeout(2500);
+  const rows = await page.$$eval('#queueList li', (items) => items.map((li) => ({
+    text: li.innerText.replace(/\s+/g, ' '),
+    save: Boolean(li.querySelector('a.q-act')),
+    retry: Boolean(li.querySelector('[data-retry]')),
+  })));
+  const row = (title) => rows.find((entry) => entry.text.startsWith(title)) || { text: '(no row)' };
+  check('a row saved before its job started comes back offering Try again, not working forever',
+    row('Still being identified').retry && !/Working|Starting/.test(row('Still being identified').text), row('Still being identified').text.slice(0, 70));
+  check('a running job the server did not answer for a moment is followed again, not given up on',
+    /Downloading/.test(row('Long film').text) && !/no longer/i.test(row('Long film').text), row('Long film').text.slice(0, 70));
+  check('and a finished one keeps its Save link', row('Finished film').save && !/no longer/i.test(row('Finished film').text), row('Finished film').text.slice(0, 70));
+  check('only the job that runs is counted as running', (await page.textContent('#queueLabel')) === 'Downloads — 1 running', await page.textContent('#queueLabel'));
+  await page.click('#queueClear');
+  await page.waitForTimeout(800);
+  const left = await page.$$eval('#queueList li .q-title', (titles) => titles.map((title) => title.textContent));
+  check('Clear finished lets go of what finished, and leaves the running job alone on the server',
+    deleted.join(',') === 'd1' && left.join(',') === 'Long film', `deleted: ${deleted.join(',') || 'nothing'}; left: ${left.join(',')}`);
+  await context.close();
+}
+
+/* 4c. Rows at phone width, titled with their links. A row is titled with its
+   link until a title arrives — a link shared and downloaded at once, every
+   row of a pasted list, every link that fails before it is identified — and
+   a link is one long word. */
+{
+  const WIDTH = 360;
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: WIDTH, height: 740 }, isMobile: true, hasTouch: true });
+  const page = await context.newPage();
+  await setApi(true);
+  await page.goto(APP, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(1500);
+  const shared = 'https://youtu.be/jNQXAC9IVRw?si=Xq3bU8m2zK1pLr7T';
+  const listed = 'https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PLbpi6ZahtOH6Ar_3GPy3workDGf1MuVXJ&index=3&pp=iAQB';
+  await page.evaluate((rows) => localStorage.setItem('siphon:queue', JSON.stringify(rows)), [
+    { key: 'w1', url: shared, title: shared, preset: 'video_best', state: 'error', error: 'YouTube refuses web pages, so it needs one thing that is yours: a relay, your own server, or an instance. Open settings.' },
+    { key: 'w2', url: listed, title: listed, preset: 'video_best', state: 'error', error: `Could not read ${listed}: the host answered 403.` },
+    { key: 'w3', id: 'd1', url: listed, title: listed, preset: 'video_best', state: 'done', filename: 'Finished film.mp4' },
+  ]);
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForSelector('#queueList li a.q-act', { timeout: 10_000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  const laid = await page.evaluate(() => ({
+    page: document.documentElement.scrollWidth,
+    rows: Math.max(...[...document.querySelectorAll('#queueList li')].map((li) => li.getBoundingClientRect().right)),
+    buttons: [...document.querySelectorAll('#queueList [data-retry], #queueList a.q-act')].map((b) => Math.round(b.getBoundingClientRect().right)),
+  }));
+  check('a row titled with a long link does not push the page sideways at phone width', laid.page <= WIDTH && laid.rows <= WIDTH, `page ${laid.page}px, rows to ${Math.round(laid.rows)}px, on a ${WIDTH}px screen`);
+  check('and Try again and Save stay on screen', laid.buttons.length === 3 && laid.buttons.every((right) => right <= WIDTH), laid.buttons.join(', '));
   await context.close();
 }
 
@@ -513,6 +623,18 @@ for (const [old, expected] of [
   await page.waitForTimeout(1500);
   const again = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:settings') || '{}'));
   check('a helper the visitor cleared is not put back', again.helper?.kind === 'none' && !again.endpoint, JSON.stringify(again.helper));
+  // But it is not lost either: the guide names it, and one tap takes it back.
+  await page.click('#openTour');
+  await page.waitForTimeout(300);
+  const offered = (await page.textContent('#tourYoutube')) || '';
+  check('the guide names the relay the visitor cleared, rather than saying to clear the helper', offered.includes('127.0.0.1:8443') && !/clear the helper/i.test(offered) && (await page.locator('#tourYoutube button').count()) === 1,
+    offered.replace(/\s+/g, ' ').slice(0, 100));
+  await page.click('#tourYoutube button', { timeout: 3000 }).catch(() => {});
+  await page.waitForFunction(() => /relay for YouTube/.test(document.getElementById('backendLabel').textContent || ''), null, { timeout: 10_000 }).catch(() => {});
+  const retaken = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:settings') || '{}'));
+  check('and one tap on it makes it the helper again', retaken.helper?.kind === 'relay' && retaken.endpoint === `${BASE}/relay` && /relay for YouTube/.test((await page.textContent('#backendLabel')) || ''),
+    `${JSON.stringify({ helper: retaken.helper?.kind, endpoint: retaken.endpoint })} ${await page.textContent('#backendLabel')}`);
+  check('and the guide says it is ready', /Ready/.test((await page.textContent('#tourYoutube')) || ''), ((await page.textContent('#tourYoutube')) || '').slice(0, 60));
   check('nothing was contacted off this machine', context.__offsite.length === 0, context.__offsite.slice(0, 3).join(', '));
   await context.close();
   overrides.delete('/siphon/config.json');
@@ -544,8 +666,13 @@ for (const [old, expected] of [
   const youtube = (await page.textContent('#tourYoutube')) || '';
   check('the guide says YouTube needs one thing that is yours', /needs one thing that is yours/.test(youtube), youtube.slice(0, 80));
   const options = await page.$$eval('#tourOptions a', (links) => links.map((a) => a.href));
-  check('and offers the relay deploy and the bridge, with links', options.some((h) => h.includes('deploy.workers.cloudflare.com')) && options.some((h) => h.includes('/bridge')), options.join(' '));
-  check('and the docker command to copy', /docker run .*ghcr\.io\/maxgfr\/siphon/.test((await page.textContent('#dockerCmd')) || ''));
+  // The bridge's link is the script itself: a userscript manager offers to
+  // install from an address ending in .user.js, and from nothing else.
+  check('and offers the relay deploy and the bridge, with links', options.some((h) => h.includes('deploy.workers.cloudflare.com')) && options.some((h) => h.endsWith('/bridge/siphon-bridge.user.js')), options.join(' '));
+  check('and says what Chrome needs before the bridge can run', /Allow User Scripts/.test((await page.textContent('#tourOptions')) || ''));
+  // Named, so the update the settings sheet describes — pull, remove, run
+  // again — can find it.
+  check('and the docker command to copy, its container named', /docker run -d --name siphon .*ghcr\.io\/maxgfr\/siphon/.test((await page.textContent('#dockerCmd')) || ''), await page.textContent('#dockerCmd'));
   await context.close();
 }
 
@@ -577,6 +704,32 @@ for (const [old, expected] of [
     document.body.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
   }, pasted);
   check('Ctrl+V with nothing focused takes the link out of the text', (await page.inputValue('#url')) === pasted, await page.inputValue('#url'));
+
+  // Into the field itself, which is what a long-press and Paste on a phone
+  // does: the text of a share is still just its link, and Download is live.
+  const titled = `${BASE}/zoo/clip.mp4?si=abc123`;
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: BASE });
+  await page.fill('#url', '');
+  await page.evaluate((text) => navigator.clipboard.writeText(text), `Me at the zoo ${titled}`);
+  await page.focus('#url');
+  await page.keyboard.press('Control+V');
+  await page.waitForTimeout(200);
+  check('a title and its link pasted into the field become just the link', (await page.inputValue('#url')) === titled && !(await page.isDisabled('#go')),
+    `${JSON.stringify(await page.inputValue('#url'))}, Download ${(await page.isDisabled('#go')) ? 'disabled' : 'enabled'}`);
+  // A keyboard's clipboard chip, or dictation, puts the text in with one
+  // input event and no paste event at all.
+  await page.fill('#url', '');
+  await page.evaluate((text) => {
+    const input = document.getElementById('url');
+    input.value = text;
+    input.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: text, bubbles: true }));
+  }, `Me at the zoo ${titled}`);
+  check('and so does the same text put in by the keyboard in one go', (await page.inputValue('#url')) === titled && !(await page.isDisabled('#go')), JSON.stringify(await page.inputValue('#url')));
+  // Typed a character at a time, what is typed stays, a stray space and all:
+  // cutting it down to "https://you" would throw the rest of it away.
+  await page.fill('#url', '');
+  await page.type('#url', 'https://you tu.be/x');
+  check('while a link typed by hand is left as typed', (await page.inputValue('#url')) === 'https://you tu.be/x', JSON.stringify(await page.inputValue('#url')));
 
   // A share arrives as ?text=, and the text is a sentence: its full stop is
   // not part of the link, and a YouTube id with a dot on the end is no id.
@@ -617,6 +770,19 @@ for (const [old, expected] of [
   await page.waitForTimeout(2000);
   check('and still on the visit after that', (await page.locator('#endpoint').count()) === 1);
 
+  // A share or the bookmarklet opens the page as ./?text=… or ./?url=…, and
+  // the page takes the link out of the address bar at once. The worker must
+  // not keep it either, as the key of one more copy of the page.
+  const secret = `${BASE}/private/v.mp4?token=s3cr3t`;
+  await page.goto(`${APP}?text=${encodeURIComponent(`Look ${secret}`)}`, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(1500);
+  const queried = await page.evaluate(async () => {
+    const urls = [];
+    for (const name of await caches.keys()) for (const request of await (await caches.open(name)).keys()) urls.push(request.url);
+    return urls.filter((url) => new URL(url).search);
+  });
+  check('a shared link is not kept in Cache Storage', queried.length === 0 && (await page.inputValue('#url')) === secret, queried.join(' ; ').slice(0, 120));
+
   /* 6. Offline, which is the only reason the worker exists at all. */
   await context.setOffline(true);
   let broke = null;
@@ -628,6 +794,15 @@ for (const [old, expected] of [
   await page.waitForTimeout(1200);
   check('the shell still opens with no network',
     broke === null && (await page.locator('#url').count()) === 1, broke || '');
+  broke = null;
+  try {
+    await page.goto(`${APP}?url=${encodeURIComponent(`${BASE}/shared.mp4`)}`, { waitUntil: 'domcontentloaded', timeout: 20000 });
+  } catch (error) {
+    broke = error.message;
+  }
+  await page.waitForTimeout(1200);
+  check('and so does a shared link, with no network',
+    broke === null && (await page.locator('#url').count()) === 1 && (await page.inputValue('#url')) === `${BASE}/shared.mp4`, broke || '');
   await context.setOffline(false);
   await context.close();
 }

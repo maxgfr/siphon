@@ -1,16 +1,18 @@
 # What was verified
 
-Every number here comes from a run, and the last section says plainly what is
-still unproven.
+Every claim here is checked by one of these suites, and the last section says
+plainly what is still unproven. How many checks each suite makes is counted in
+the README's [Development](../README.md#development) section and nowhere else:
+this file used to repeat the counts, and fell behind them.
 
-| suite | what it is | result |
+| suite | what it is | in CI |
 |---|---|---|
-| `pytest server/tests` | the server, including two against real yt-dlp on loopback, the per-job yt-dlp options, the sweep that leaves a running job alone, the tunnel's answer for an upstream it cannot reach, and the converter vendoring | 162 pass |
-| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh and the daily measurement of which instances answer a page, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them, the links in a pasted or dropped text, the age of a server's yt-dlp, the access key checked before an address is saved, YouTube behind a tunnel answered by the server rather than by the tunnel's refusal, and the service worker's shell holding every module the app loads | 195 pass |
-| `npm run test:e2e` | the device alone, real Chromium, two origins; a fake Invidious, a fake Piped and a fake cobalt each carrying a YouTube link; a pasted list of links; the bundled converter | 54 pass |
-| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips from the measured list and none when it is empty, an instance whose video endpoint is shut, the yt-dlp options riding with a job, the guide and its bookmarklet, a dropped link, a paste with nothing focused, the site's relay taken and a cobalt instance in config.json left alone, Find offered on a day the measured list is empty | 73 pass |
-| `npm run test:bridge` | a userscript lifting CORS on a host that refuses | 8 pass |
-| `npm run test:split` | a server that only resolves, a device that downloads | 24 pass |
+| `pytest server/tests` | the server, including two against real yt-dlp on loopback, the per-job yt-dlp options, the sweep that leaves a running job alone, the tunnel's answer for an upstream it cannot reach, the converter vendoring, and the deploy commands the README and the deploy files give — the Fly steps run against a stub, the compose ones checked against the files they read | gating — `fast` |
+| `npm test` | the extractor, the relay, resuming, detection, instance finding, the list refresh and the daily measurement of which instances answer a page, the relay-side walk, the page check, the cobalt measurement, its directories' shapes and the source behind them, the links in a pasted or dropped text, the age of a server's yt-dlp, the access key checked before an address is saved, YouTube behind a tunnel answered by the server rather than by the tunnel's refusal, and the service worker's shell holding every module the app loads | gating — `fast` |
+| `npm run test:e2e` | the device alone, real Chromium, two origins; a fake Invidious, a fake Piped and a fake cobalt each carrying a YouTube link; a pasted list of links; the bundled converter | gating — `browser` |
+| `npm run test:deployed` | the app as a static deploy: HTTPS, subpath, service worker, the chips from the measured list and none when it is empty, an instance whose video endpoint is shut, the yt-dlp options riding with a job, the guide and its bookmarklet, a dropped link, a paste with nothing focused, the site's relay taken and a cobalt instance in config.json left alone, Find offered on a day the measured list is empty | gating — `browser` |
+| `npm run test:bridge` | a userscript lifting CORS on a host that refuses | gating — `browser` |
+| `npm run test:split` | a server that only resolves, a device that downloads | gating — `browser` |
 | `npm run test:youtube` | YouTube, for real, from the browser mode in CI — through the relay, Piped, and the bundled Invidious list | informative — see [youtube.md](youtube.md) |
 | `npm run test:server` | YouTube, for real, from `server/app.py` in CI — plain, then with the proof-of-origin provider | informative — the `server-youtube` job |
 
@@ -54,8 +56,11 @@ covered against a fixture of the API's pairs and one of the docs page's
 markup, Piped's directory and its seed; and its measurement against a fake
 internet of instances — one open, one refusing the video endpoint, one
 answering it without the cross-origin header, one whose proxy will not
-stream, a keyed cobalt — with each verdict said and only the open ones
-kept, with their kind. The measured list is probed first by the search, and
+stream, a keyed cobalt, a cobalt that answers a runner but refuses the
+preflight a page's POST needs — with each verdict said and only the open
+ones kept, with their kind. Both daily scripts ask with the Origin of the
+repository's own page, checked by running them as the workflow does, with
+the variable set, against the real relay locked to that page. The measured list is probed first by the search, and
 the file beside the app is read whole: the lists, the measured ones of a
 usable kind, the date.
 
@@ -64,7 +69,8 @@ byte-range continuation, IV derivation, YouTube URL shapes, page-scraping
 precedence, the whole preset → format decision table, and the InnerTube fetch
 wrapper. The relay is in there too — `relay/worker.js` is a plain module with a
 `fetch(request, env)` export and nothing Workers-specific inside, so `node
---test` calls it directly with a stubbed upstream.
+--test` calls it directly with a stubbed upstream, and with Node's real fetch
+against a local host that answers zstd to whoever offers it.
 
 `npm run test:e2e` then drives a real headless Chromium with the app on one
 origin and the media on another, so the CORS path under test is the real one:
@@ -121,8 +127,9 @@ lands on a screen that works; a first visit to a host that answers
 `/api/health` recognises your own server; settings written by the older
 three-mode version are migrated; the measured list becomes chips with the date it was
 measured, tapping one fills the address in and tests it, and on a day none
-answered there is no chip and no Find, only the field and a sentence saying
-so; an unreachable address is refused with
+answered there is no chip, only the field, a sentence saying so, and Find,
+which asks the live directory rather than the day's file; an unreachable
+address is refused with
 its reason and the sheet left open; **an Invidious instance whose video
 endpoint is shut is recognised and then said to be shut, with an amber light,
 before anyone saves it**, and every status names the address it is about, so
@@ -133,8 +140,9 @@ what is typed there — SponsorBlock, a clip, a speed limit, a client — rides
 with the job the page posts, in the server's vocabulary, and survives a
 reload; a first visit on a site whose owner set
 `SIPHON_RELAY_URL` takes the relay with nothing to do, is told whose it is,
-and the header says "relay for YouTube"; a measured cobalt instance in
-`config.json` is adopted when there is no relay and named as public; the guide
+and the header says "relay for YouTube"; a cobalt instance in `config.json`
+with no relay beside it is not adopted — the first visit stays on this device
+and never contacts it; the guide
 is on the first screen, says what is set and what would make YouTube work,
 stays closed once closed, and comes back from the ? in the header; **the
 bookmarklet it offers opens this very deploy, subpath and all**, and tapping

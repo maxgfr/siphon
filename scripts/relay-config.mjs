@@ -35,7 +35,14 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 export const TARGET = join(HERE, '..', 'web', 'config.json');
 const INSTANCES = join(HERE, '..', 'web', 'instances.json');
 
-export const ORIGIN = 'https://maxgfr.github.io';
+/**
+ * The page every check asks as. A relay's ALLOWED_ORIGINS and an instance's
+ * CORS answer are both about this origin, so it has to be the page that will
+ * use them: the workflows pass the repository's own (SIPHON_ORIGIN), and a
+ * fork measured as maxgfr.github.io found its own relay shut every day. Cut
+ * to an origin, which is all a browser sends of a page's address.
+ */
+export const ORIGIN = new URL(process.env.SIPHON_ORIGIN || 'https://maxgfr.github.io').origin;
 export const ROBOTS = 'https://www.youtube.com/robots.txt';
 export const VIDEO_ID = 'jNQXAC9IVRw';
 
@@ -242,9 +249,41 @@ export async function fromSource({ fetchImpl = globalThis.fetch, say = () => {},
   return candidates;
 }
 
-/** Ask one cobalt instance for the sample video, the way the app does. */
+/** Whether a page on ORIGIN may read this answer. */
+function pageMayRead(response) {
+  const allow = response.headers.get('access-control-allow-origin');
+  return allow === '*' || allow === ORIGIN;
+}
+
+const brief = (error) => (error?.name === 'TimeoutError' ? 'no answer in 30s' : String(error?.cause?.code || error?.message || error).slice(0, 80));
+
+/**
+ * Ask one cobalt instance for the sample video, the way the app does.
+ *
+ * The app POSTs JSON from the page, so the browser first asks the instance
+ * whether it may (a preflight naming content-type), then reads the answer
+ * only if it carries the header for this origin. A runner does neither, and
+ * an instance that keeps CORS to its own frontend passed here, was offered
+ * as a chip, and refused whoever tapped it. So both are asked for here. The
+ * tunnel needs no header: the browser saves it rather than reading it.
+ */
 export async function evaluateCobalt(api, { fetchImpl = globalThis.fetch } = {}) {
   const report = { api, answer: '', media: '', ok: false };
+  try {
+    const r = await fetchImpl(`${api}/`, {
+      method: 'OPTIONS',
+      headers: { Origin: ORIGIN, 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'content-type' },
+      signal: AbortSignal.timeout(30_000),
+    });
+    await r.arrayBuffer().catch(() => {});
+    const allowed = (r.headers.get('access-control-allow-headers') || '').toLowerCase().split(',').map((name) => name.trim());
+    if (!r.ok || !pageMayRead(r) || !(allowed.includes('*') || allowed.includes('content-type'))) {
+      const cors = r.headers.get('access-control-allow-origin') || 'NONE';
+      return { ...report, answer: `preflight HTTP ${r.status}, cors=${cors}, headers=${allowed.filter(Boolean).join(',') || 'NONE'}` };
+    }
+  } catch (error) {
+    return { ...report, answer: `preflight ${brief(error)}` };
+  }
   let body;
   try {
     const r = await fetchImpl(`${api}/`, {
@@ -256,9 +295,10 @@ export async function evaluateCobalt(api, { fetchImpl = globalThis.fetch } = {})
     body = await r.json().catch(() => ({}));
     if (body?.status === 'error' || !r.ok) return { ...report, answer: `HTTP ${r.status} ${body?.error?.code || ''}`.trim() };
     if (!['tunnel', 'redirect'].includes(body?.status) || !body?.url) return { ...report, answer: `status ${body?.status || '?'}` };
+    if (!pageMayRead(r)) return { ...report, answer: `${body.status}, but cors=NONE: a page cannot read it` };
     report.answer = `${body.status}`;
   } catch (error) {
-    return { ...report, answer: error?.name === 'TimeoutError' ? 'no answer in 30s' : String(error?.cause?.code || error?.message || error).slice(0, 80) };
+    return { ...report, answer: brief(error) };
   }
   try {
     const r = await fetchImpl(body.url, { headers: { Range: 'bytes=0-65535', Origin: ORIGIN }, redirect: 'follow', signal: AbortSignal.timeout(30_000) });

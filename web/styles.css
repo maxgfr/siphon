@@ -461,7 +461,13 @@ button, input, select, textarea { font: inherit; color: inherit; }
 /* ----------------------------------------------------------------- history */
 
 .history { margin-top: 26px; }
-.history ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.history ol {
+  list-style: none; margin: 0; padding: 0; display: grid; gap: 8px;
+  /* A track that may shrink. An auto one grows to a row's longest unbroken
+     line — a row is titled with its link until a title arrives — and takes
+     the page, and the row's buttons, past the edge of a phone. */
+  grid-template-columns: minmax(0, 1fr);
+}
 .history li {
   display: flex;
   align-items: center;
@@ -764,7 +770,8 @@ footer.legal p { margin: 0 0 7px; }
 .q-act.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
 li.q-error { border-color: var(--danger); background: var(--danger-wash); }
 li.q-error .q-msg { color: var(--danger); }
-.q-msg { font-size: 12px; line-height: 1.45; margin-top: 6px; color: var(--ink-2); }
+/* An error can quote a link, and a filename can be one long word. */
+.q-msg { font-size: 12px; line-height: 1.45; margin-top: 6px; color: var(--ink-2); overflow-wrap: anywhere; }
 
 /* The yt-dlp options apply to your own server; with any other helper they
    wait, greyed but kept, rather than vanish. */

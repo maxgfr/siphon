@@ -29,14 +29,17 @@ import { promises as dns } from 'node:dns';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { evaluateCobalt, fromSource } from './relay-config.mjs';
+import { evaluateCobalt, fromSource, ORIGIN } from './relay-config.mjs';
 
 export const API_URL = 'https://api.invidious.io/instances.json?sort_by=type,users';
 export const DOCS_URL = 'https://docs.invidious.io/instances/';
 export const PIPED_URL = 'https://piped-instances.kavin.rocks/';
 
-/** What a page sends, and the video it asks about: the first one ever uploaded. */
-export const ORIGIN = 'https://maxgfr.github.io';
+/**
+ * The page asked as — this repository's own, as relay-config.mjs reads it —
+ * and the video it asks about: the first one ever uploaded.
+ */
+export { ORIGIN };
 export const SAMPLE_ID = 'jNQXAC9IVRw';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -241,9 +244,10 @@ const readable = (response) => {
  * which must answer with a stream list and the header that lets a foreign
  * page read it; then the media it named, which must stream the first bytes
  * with that header too — an instance whose API is open but whose proxy is
- * not delivers nothing. cobalt is asked the one way the app asks it: a POST
- * of the link, then the tunnel it answers with, which needs no header
- * because the browser saves it as a download rather than reading it.
+ * not delivers nothing. cobalt is asked the one way the app asks it: the
+ * preflight a page's POST needs, the POST of the link, read only with the
+ * header, then the tunnel it answers with, which needs no header because
+ * the browser saves it as a download rather than reading it.
  *
  * @returns {Promise<{ ok: boolean, verdict: string }>}
  */

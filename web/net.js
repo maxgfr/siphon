@@ -169,22 +169,19 @@ export class Fetcher {
    *
    * A playlist or a page that was redirected is relative to where it landed,
    * not to what was asked for: a short link to `/cdn/path/master.m3u8` names
-   * `v360.m3u8` meaning `/cdn/path/v360.m3u8`. Only a direct fetch can say
-   * where it landed. Through the bridge or a relay the address it reports is
-   * the escape's, not the host's, so there the one asked for is the best
-   * there is.
+   * `v360.m3u8` meaning `/cdn/path/v360.m3u8`. A direct fetch says where it
+   * landed itself. Through the bridge or a relay the address the response
+   * carries is the escape's, not the host's; the escape followed the
+   * redirects, so it says where they went in a header of its own. One that
+   * does not — a public CORS proxy, an older bridge — leaves the one asked
+   * for, the best there is.
    */
   async document(url, options = {}) {
     const response = await this.request(url, options);
     if (!response.ok) throw httpError(response, url);
     const direct = this.verdicts.get(this.#origin(url)) === 'direct';
-    return { text: await response.text(), url: direct && response.redirected && response.url ? response.url : url };
-  }
-
-  async json(url, options = {}) {
-    const response = await this.request(url, options);
-    if (!response.ok) throw httpError(response, url);
-    return response.json();
+    const landed = direct ? (response.redirected && response.url) || url : reportedUrl(response) || url;
+    return { text: await response.text(), url: landed };
   }
 
   /** A HEAD that falls back to a one-byte GET, since plenty of CDNs refuse HEAD. */
@@ -199,9 +196,40 @@ export class Fetcher {
     }
     response = await this.request(url, { ...options, headers: { ...(options.headers || {}), Range: 'bytes=0-0' } });
     if (!response.ok && response.status !== 206) throw httpError(response, url);
-    // Drain, or the connection stays open for the life of the page.
-    await response.arrayBuffer().catch(() => {});
+    // Let go of the body, or the connection stays open for the life of the
+    // page. Cancelled rather than drained: a host that ignored the range is
+    // sending the whole file, and reading it here would pull all of it into
+    // the tab just to learn its headers.
+    await response.body?.cancel().catch(() => {});
     return headersOf(response);
+  }
+
+  /**
+   * The first bytes of a resource, to tell what it is when its headers do not.
+   *
+   * Asked for as a range, and read no further than that even from a host that
+   * ignores the range and starts on the whole file: the rest is cancelled, not
+   * drained. Through the bridge the body arrives whole, and is cut here.
+   */
+  async prefix(url, { length = 512, signal } = {}) {
+    const response = await this.request(url, { signal, headers: { Range: `bytes=0-${length - 1}` } });
+    if (!response.ok && response.status !== 206) throw httpError(response, url);
+    if (!response.body) return new Uint8Array(await response.arrayBuffer()).slice(0, length);
+    const out = new Uint8Array(length);
+    let filled = 0;
+    const reader = response.body.getReader();
+    try {
+      while (filled < length) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const take = value.subarray(0, length - filled);
+        out.set(take, filled);
+        filled += take.length;
+      }
+    } finally {
+      reader.cancel().catch(() => {});
+    }
+    return out.subarray(0, filled);
   }
 
   /**
@@ -312,10 +340,64 @@ export class Fetcher {
   }
 }
 
+/**
+ * Where an escape says a request ended up after the redirects it followed
+ * itself. The bridge's answers carry it, and a relay can send it: ours follows
+ * redirects by hand, so it knows the last hop.
+ */
+export const FINAL_URL_HEADER = 'X-Siphon-Final-URL';
+
+function reportedUrl(response) {
+  try {
+    const url = new URL(response.headers.get(FINAL_URL_HEADER) || '');
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
 /* ------------------------------------------------------------------- bridge */
 
 /** Statuses whose response carries no body, by definition. */
 const NULL_BODY = new Set([204, 205, 304]);
+
+/**
+ * How much of a file one request through the bridge asks for.
+ *
+ * A userscript manager hands a response over only once all of it is in, so
+ * a file asked for in one request arrived in one piece: the bar at 0% until
+ * the end, the whole file in memory twice (the manager's, then the page's),
+ * a cancel that stopped nothing, and a cut at 90% with nothing handed over
+ * to resume from. Asked for a window at a time instead, each window is a
+ * step of progress and a chunk written to disk, a cancel calls off the one
+ * in flight, and a cut costs one window. The first is small, so a short file
+ * shows progress at all and an HLS segment usually fits in it; after that
+ * they double, since each one is a round trip.
+ */
+const FIRST_WINDOW = 2 * 1024 * 1024;
+const LAST_WINDOW = 8 * 1024 * 1024;
+
+/** `bytes 0-1023/4096`, as numbers; the total is null when the host says `*`. */
+function contentRange(response) {
+  const match = /^bytes (\d+)-(\d+)\/(\d+|\*)$/i.exec(String(response.headers.get('content-range') || '').trim());
+  return match ? { from: Number(match[1]), to: Number(match[2]), total: match[3] === '*' ? null : Number(match[3]) } : null;
+}
+
+/**
+ * What part of a resource a request wants, when that is worth splitting:
+ * a GET for all of it, or for a range that runs to the end or past a window.
+ * Anything else — HEAD, POST, the few bytes a peek wants, a suffix range —
+ * goes as it is.
+ */
+function spanOf(method, headers) {
+  if (String(method).toUpperCase() !== 'GET') return null;
+  const key = Object.keys(headers).find((name) => name.toLowerCase() === 'range');
+  if (!key) return { from: 0, to: null, ranged: false };
+  const match = /^bytes=(\d+)-(\d*)$/.exec(String(headers[key]).trim());
+  if (!match) return null;
+  const span = { from: Number(match[1]), to: match[2] ? Number(match[2]) : null, ranged: true };
+  return span.to === null || span.to - span.from + 1 > FIRST_WINDOW ? span : null;
+}
 
 /**
  * The bridge: a userscript on this page that fetches on the page's behalf.
@@ -339,6 +421,7 @@ function installBridge() {
   const state = { ready: false, version: null, request: null };
 
   if (typeof window === 'undefined') return state;
+  const aborted = () => new DOMException('Aborted', 'AbortError');
 
   window.addEventListener('message', (event) => {
     if (event.source !== window || !event.data || event.data.siphon === undefined) return;
@@ -352,6 +435,11 @@ function installBridge() {
     if (!waiting) return;
     if (message.siphon === 'response') {
       pending.delete(message.id);
+      // Where the manager's request landed, which only it saw. Set from the
+      // message alone: a host's own header of that name is not a report.
+      const headers = { ...(message.headers || {}) };
+      delete headers[FINAL_URL_HEADER.toLowerCase()];
+      if (message.finalUrl) headers[FINAL_URL_HEADER.toLowerCase()] = String(message.finalUrl);
       // A Response refuses a body alongside 204, 205 or 304, and any status
       // outside 200–599 at all (a manager reports 0 for some failures). The
       // constructor throwing here, inside a message listener, would leave the
@@ -362,7 +450,7 @@ function installBridge() {
           new Response(NULL_BODY.has(message.status) ? null : message.body, {
             status: message.status,
             statusText: message.statusText || '',
-            headers: message.headers || {},
+            headers,
           }),
         );
       } catch {
@@ -374,18 +462,100 @@ function installBridge() {
     }
   });
 
-  state.request = async (url, { signal, method = 'GET', headers = {}, body } = {}) => {
+  /** One request, answered whole when the manager has all of it. */
+  const once = async (url, { signal, method = 'GET', headers = {}, body } = {}) => {
     const id = nextId++;
     const payload = body instanceof ArrayBuffer ? body : body ? await new Response(body).arrayBuffer() : null;
+    if (signal?.aborted) throw aborted();
     return new Promise((resolve, reject) => {
-      pending.set(id, { resolve, reject });
-      signal?.addEventListener('abort', () => {
+      const abort = () => {
         pending.delete(id);
-        reject(new DOMException('Aborted', 'AbortError'));
-      });
-      const plainHeaders = headers instanceof Headers ? Object.fromEntries(headers) : { ...headers };
-      window.postMessage({ siphon: 'fetch', id, url, method, headers: plainHeaders, body: payload }, '*', payload ? [payload] : []);
+        // Without this the manager carries on downloading for nobody.
+        window.postMessage({ siphon: 'abort', id }, '*');
+        reject(aborted());
+      };
+      const settle = (then) => (value) => {
+        signal?.removeEventListener('abort', abort);
+        then(value);
+      };
+      pending.set(id, { resolve: settle(resolve), reject: settle(reject) });
+      signal?.addEventListener('abort', abort, { once: true });
+      window.postMessage({ siphon: 'fetch', id, url, method, headers, body: payload }, '*', payload ? [payload] : []);
     });
+  };
+
+  /**
+   * A GET for a span of a resource, a window per request, answered as one
+   * response whose body arrives as the windows do. It says what a single
+   * request would have: 200 and the whole length for a whole file, 206 and
+   * the range for a range. A host that ignores ranges answers the first
+   * window with everything, and that answer is passed on as it is.
+   */
+  const windowed = async (url, span, headers, signal) => {
+    const rest = Object.fromEntries(Object.entries(headers).filter(([name]) => name.toLowerCase() !== 'range'));
+    let size = FIRST_WINDOW;
+    const upTo = (from) => (span.to === null ? from + size - 1 : Math.min(span.to, from + size - 1));
+    const ask = (from, over) => once(url, { signal: over, headers: { ...rest, Range: `bytes=${from}-${upTo(from)}` } });
+
+    let first = await ask(span.from, signal);
+    // A whole file asked for from its first byte, answered "nothing there":
+    // an empty file. Asked again as it was, it is one.
+    if (first.status === 416 && !span.ranged) return once(url, { signal, headers: rest });
+    if (first.status !== 206) return first;
+    // A range of a compressed body is a range of compressed bytes, which the
+    // manager then decodes: the pieces would not join up into the file. Such
+    // a resource is asked for as it was, in one request.
+    if (!/^(identity)?$/i.test((first.headers.get('content-encoding') || '').trim())) return once(url, { signal, headers });
+    const range = contentRange(first);
+    if (range?.from !== span.from) throw new BackendError(`${hostOf(url)} sent a different part of the file than the one asked for.`);
+
+    const end = range.total === null ? span.to : Math.min(span.to ?? Infinity, range.total - 1);
+    const out = new Headers(first.headers);
+    out.delete('content-range');
+    out.delete('content-length');
+    if (end !== null) out.set('content-length', String(end - span.from + 1));
+    if (span.ranged && end !== null) out.set('content-range', `bytes ${span.from}-${end}/${range.total ?? '*'}`);
+
+    // Reading stops when the reader does: a cancel calls off the window in flight.
+    const stop = new AbortController();
+    const quit = () => stop.abort();
+    signal?.addEventListener('abort', quit, { once: true });
+    let next = span.from;
+    const body = new ReadableStream({
+      async pull(stream) {
+        const from = next;
+        const wanted = upTo(from) - from + 1;
+        let response = first;
+        first = null;
+        if (!response) {
+          response = await ask(from, stop.signal);
+          if (response.status !== 206 || contentRange(response)?.from !== from) {
+            throw new BackendError(`${hostOf(url)} answered ${response.status} part-way through the file.`);
+          }
+        }
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        next += bytes.length;
+        size = Math.min(size * 2, LAST_WINDOW);
+        if (bytes.length > 0) stream.enqueue(bytes);
+        // The end is where the host said it is. A host that did not say ends
+        // where a window comes back short. One that sends a window short of
+        // an end it did state is capping its ranges, and the next asks on.
+        if (end !== null ? next > end : bytes.length < wanted) {
+          signal?.removeEventListener('abort', quit);
+          stream.close();
+        } else if (bytes.length === 0) {
+          throw new BackendError(`${hostOf(url)} sent an empty part of the file.`);
+        }
+      },
+      cancel: quit,
+    });
+    return new Response(body, { status: span.ranged ? 206 : 200, headers: out });
+  };
+
+  state.request = async (url, { signal, method = 'GET', headers = {}, body } = {}) => {
+    const plain = headers instanceof Headers ? Object.fromEntries(headers) : { ...headers };
+    const span = body ? null : spanOf(method, plain);
+    return span ? windowed(url, span, plain, signal) : once(url, { signal, method, headers: plain, body });
   };
 
   // Ask whether a bridge is listening. A script installed after this page

@@ -10,6 +10,14 @@
 #
 # Costs a container and some memory. Try cookies first — they are free and fix
 # the same failure more often.
+#
+# Every later compose command needs the same files, the update included. A
+# bare `docker compose up -d` recreates siphon without POT_PROVIDER_URL and
+# leaves the provider running for nothing; compose only mentions an orphan
+# container. Naming the files once in a .env beside them makes every command
+# read them (on Windows the separator is ; rather than :):
+#
+#   echo COMPOSE_FILE=docker-compose.yml:docker-compose.potoken.yml >> .env
 services:
   potoken:
     image: brainicism/bgutil-ytdlp-pot-provider:latest

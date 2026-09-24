@@ -19,7 +19,8 @@ import { BrowserBackend } from './inbrowser.js';
 import { pipedResolver, invidiousResolver, invidiousWalk } from './extract.js';
 import { invidiousInstances } from './instances.js';
 import { relayEscape } from './net.js';
-export { detectEndpoint, privacyNote, describeEndpoint } from './endpoint.js';
+import { isLoopback } from './endpoint.js';
+export { detectEndpoint, privacyNote, describeEndpoint, withScheme } from './endpoint.js';
 export { bundledInfo, findInstance, invidiousInstances, looksUnreachable, openInstances, servesPages } from './instances.js';
 
 /** The qualities the UI offers. The server validates against its own copy. */
@@ -45,15 +46,19 @@ async function readError(response, fallback) {
   return fallback;
 }
 
-/** Turn a fetch rejection into something that names the likely cause. */
+/**
+ * Turn a fetch rejection into something that names the likely cause. This
+ * computer is never mixed content, even from an HTTPS page (see isLoopback).
+ */
 function networkError(base) {
-  const secureMismatch = location.protocol === 'https:' && base.startsWith('http://');
+  const secureMismatch = location.protocol === 'https:' && base.startsWith('http://') && !isLoopback(base);
   return new BackendError(
     secureMismatch ? 'Blocked: this page is HTTPS and the server is plain HTTP.' : 'Could not reach the server.',
     {
       hint: secureMismatch
         ? 'Browsers refuse mixed content. Put the server behind HTTPS, or open this page over plain HTTP too.'
-        : 'Check the address in settings, and that the server is running and allows this page in ALLOWED_ORIGINS.',
+        : 'Check the address in settings, and that the server is running and allows this page in ALLOWED_ORIGINS.' +
+          (isLoopback(base) ? ' If the browser asked whether this page may reach apps on this device, allow it.' : ''),
     },
   );
 }
@@ -177,14 +182,22 @@ export class ServerBackend {
 
 /* ------------------------------------------------------------------- public */
 
-/** Map our preset ids onto cobalt's request shape. */
+/**
+ * Map our preset ids onto cobalt's request shape.
+ *
+ * cobalt checks a request against a strict list of values and refuses the
+ * whole of it over one it does not know, so there is no asking for "m4a":
+ * its audio formats are best, mp3, ogg, wav and opus. "best" is the site's
+ * own audio, untouched, and for YouTube — the one site a page mostly needs
+ * an instance for — that is AAC in an .m4a, with cobalt's default h264.
+ */
 const COBALT_REQUEST = {
   video_best: { downloadMode: 'auto', videoQuality: 'max' },
   video_1080: { downloadMode: 'auto', videoQuality: '1080' },
   video_720: { downloadMode: 'auto', videoQuality: '720' },
   video_480: { downloadMode: 'auto', videoQuality: '480' },
   audio_mp3: { downloadMode: 'audio', audioFormat: 'mp3' },
-  audio_m4a: { downloadMode: 'audio', audioFormat: 'm4a' },
+  audio_m4a: { downloadMode: 'audio', audioFormat: 'best' },
 };
 
 /** cobalt's error codes are namespaced strings; these are the ones users hit. */
@@ -192,6 +205,10 @@ const COBALT_MESSAGES = {
   'error.api.auth.key.missing': 'This instance requires an API key.',
   'error.api.auth.key.invalid': 'This instance rejected that API key.',
   'error.api.auth.turnstile.missing': 'This instance requires a captcha, which only its own website can show.',
+  'error.api.auth.jwt.missing': 'This instance answers only its own website, which holds a session from its captcha.',
+  'error.api.auth.jwt.invalid': 'This instance answers only its own website, which holds a session from its captcha.',
+  'error.api.invalid_body': 'This instance did not accept the request: it runs a cobalt this app does not speak.',
+  'error.api.youtube.login': 'YouTube asked this instance to sign in, so it cannot fetch that video. Your own server, with your cookies, can.',
   'error.api.service.unsupported': 'This instance does not support that site.',
   'error.api.service.disabled': 'This instance has that site turned off.',
   'error.api.link.invalid': 'That link was not understood.',
@@ -199,7 +216,11 @@ const COBALT_MESSAGES = {
   'error.api.content.video.age': 'That video is age-restricted.',
   'error.api.content.video.private': 'That video is private.',
   'error.api.content.too_long': 'That video is longer than this instance allows.',
+  'error.api.content.video.region': 'That video is not available where this instance runs.',
   'error.api.fetch.rate': 'This instance is rate-limiting you. Wait a bit, or use your own server.',
+  'error.api.fetch.fail': 'This instance could not get that link from the site.',
+  'error.api.fetch.critical': 'This instance could not get that link from the site.',
+  'error.api.fetch.empty': 'This instance found nothing to download at that link.',
 };
 
 export class PublicBackend {
@@ -261,7 +282,9 @@ export class PublicBackend {
 
     if (body.status === 'error' || !response.ok) {
       const code = body?.error?.code || '';
-      throw new BackendError(COBALT_MESSAGES[code] || code || `That instance answered ${response.status}.`, {
+      // A code with no sentence here is still named, so it can be looked up.
+      const message = COBALT_MESSAGES[code] || (code ? `This instance refused: ${code}.` : `That instance answered ${response.status}.`);
+      throw new BackendError(message, {
         hint: code.includes('auth') ? 'Add the key in settings, or switch to your own server.' : '',
       });
     }
@@ -313,7 +336,13 @@ function serverResolver(server) {
  * Piped or Invidious instance, a relay. Everything below follows from that.
  */
 export class Siphon {
-  constructor({ endpoint = '', key = '', helper = null, coreUrl = '', firstInstance = '' } = {}) {
+  /**
+   * @param {object} options
+   * @param {Siphon|null} [options.previous]  the backend this one replaces:
+   *   its device and its record of who owns which job carry over, so a
+   *   download already running outlives a change of settings
+   */
+  constructor({ endpoint = '', key = '', helper = null, coreUrl = '', firstInstance = '', previous = null } = {}) {
     this.helper = helper || { kind: 'none', label: 'this device only' };
     const kind = this.helper.kind;
 
@@ -322,7 +351,7 @@ export class Siphon {
     /** Whether the server takes the whole job. */
     this.full = Boolean(this.server && this.helper.ffmpeg !== false);
 
-    this.device = new BrowserBackend({
+    const way = {
       coreUrl,
       escape: this.server ? this.server.escape : kind === 'relay' ? relayEscape(endpoint) : null,
       resolvers: [
@@ -340,13 +369,17 @@ export class Siphon {
             })
           : null,
       ],
-    });
+    };
+    // A fresh device would have an empty job table: the next poll of a
+    // download still running on this one would find nothing and call it
+    // gone, while it carried on unseen.
+    this.device = previous?.device ? previous.device.configure(way) : new BrowserBackend(way);
 
     this.supportsProgress = true;
     this.supportsProbe = true;
     this.supportsPlaylist = this.full;
     /** @type {Map<string, object>} which backend owns a job id */
-    this.owners = new Map();
+    this.owners = previous?.owners || new Map();
   }
 
   /** Where a job id came from, including ones started before a reload. */
@@ -427,13 +460,14 @@ export class Siphon {
   }
 }
 
-/** Build the backend the saved settings describe. */
-export function makeBackend(settings) {
+/** Build the backend the saved settings describe, taking over the jobs of `previous`. */
+export function makeBackend(settings, previous = null) {
   return new Siphon({
     endpoint: settings.endpoint,
     key: settings.key,
     helper: settings.helper,
     coreUrl: settings.coreUrl,
     firstInstance: settings.siteInstance || '',
+    previous,
   });
 }

@@ -27,6 +27,45 @@ const ROBOTS = 'https://www.youtube.com/robots.txt';
 
 const NONE = Object.freeze({ kind: 'none', label: 'this device only' });
 
+/** The host of an address, lower-cased, without its port or IPv6 brackets. */
+const bareHost = (address) =>
+  String(address || '')
+    .replace(/^[a-z][a-z\d+.-]*:\/\//i, '')
+    .split(/[/?#]/)[0]
+    .replace(/^[^@]*@/, '')
+    .replace(/:\d*$/, '')
+    .replace(/^\[|\]$/g, '')
+    .toLowerCase();
+
+/**
+ * Whether an address is this machine. A browser counts http://127.0.0.1 and
+ * http://localhost as secure, so an HTTPS page may call them: when one does
+ * not answer, mixed content is never the reason.
+ */
+export function isLoopback(address) {
+  return loopbackHost(bareHost(address));
+}
+
+const loopbackHost = (host) => host === 'localhost' || host.endsWith('.localhost') || /^127\./.test(host) || host === '::1';
+
+/** Addresses on this machine or this network, which a server there answers on in plain http. */
+const LOCAL = [/^10\./, /^192\.168\./, /^172\.(1[6-9]|2\d|3[01])\./, /^169\.254\./, /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./, /\.local$/, /^f[cd][\da-f]{2}:/, /^fe[89ab][\da-f]:/, /^[^.:]+$/];
+
+/**
+ * An address as a phone keyboard leaves it — "inv.nadeko.net",
+ * "192.168.1.42:8000" — with the scheme it most likely has. Without one it is
+ * a path under this page, and every probe would ask the page's own host.
+ * A server on this machine or this network is plain http, the way one docker
+ * run starts it; anything else is https. An address that already has a
+ * scheme, or is a path on this page's own host, is left as it is.
+ */
+export function withScheme(address) {
+  const text = String(address || '').trim();
+  if (!text || /^[a-z][a-z\d+.-]*:\/\//i.test(text) || /^[/.]/.test(text)) return text;
+  const host = bareHost(text);
+  return `${loopbackHost(host) || LOCAL.some((pattern) => pattern.test(host)) ? 'http' : 'https'}://${text}`;
+}
+
 /**
  * @param {string} address  '' means "wherever this page came from"
  * @param {string} key
@@ -34,6 +73,11 @@ const NONE = Object.freeze({ kind: 'none', label: 'this device only' });
  * @returns {Promise<Endpoint>}
  */
 export async function detectEndpoint(address, key = '', fetchImpl = globalThis.fetch) {
+  // The sheet adds the scheme before it asks. A bare host from anywhere else
+  // is refused rather than probed as a path under this page's own host.
+  if (withScheme(address) !== String(address || '').trim()) {
+    throw new Error('Include the https:// at the start of the address.');
+  }
   // A template — `{url}` or `{raw}` where the target goes — can only be a
   // relay, and is probed the one way a relay can be: by fetching through it.
   if (/\{(url|raw)\}/.test(String(address || ''))) {
@@ -51,12 +95,16 @@ export async function detectEndpoint(address, key = '', fetchImpl = globalThis.f
   const base = trimSlash(address);
   const sameOrigin = !base;
   const root = sameOrigin ? '' : base;
+  // The key goes to one request only: the gated check below, once health has
+  // said this is a siphon server. The key in the sheet may be the one saved
+  // for another address, and a cobalt instance or a stranger's relay
+  // answering the other probes has no business receiving it.
   const auth = key ? { Authorization: `Bearer ${key}` } : {};
   const get = async (path, init = {}) => {
     try {
       const response = await fetchImpl(`${root}${path}`, {
         ...init,
-        headers: { Accept: 'application/json, text/plain, */*', ...auth, ...(init.headers || {}) },
+        headers: { Accept: 'application/json, text/plain, */*', ...(init.headers || {}) },
         credentials: 'omit',
         signal: AbortSignal.timeout(8000),
       });
@@ -84,7 +132,7 @@ export async function detectEndpoint(address, key = '', fetchImpl = globalThis.f
     // first visit at a keyed server adopts it and asks for the key later.
     let keyAccepted = true;
     if (body.requiresKey === true) {
-      const gate = await get('/api/jobs/key-check');
+      const gate = await get('/api/jobs/key-check', { headers: auth });
       keyAccepted = gate?.status !== 401;
     }
     return {
@@ -134,8 +182,18 @@ export async function detectEndpoint(address, key = '', fetchImpl = globalThis.f
   }
 
   if (!health && !cobalt && !piped && !invidious && !relay) {
+    const page = typeof location !== 'undefined' ? location : null;
+    // This computer is not mixed content, even from an HTTPS page. What stops
+    // it is a server not started yet, one that does not name this page, or
+    // the browser's own question about letting a page reach this device.
+    if (isLoopback(base)) {
+      throw new Error(
+        `Could not reach it. Is the server running, and does its ALLOWED_ORIGINS name this page${page ? ` (${page.origin})` : ''}? ` +
+          'If the browser asked whether this page may reach apps on this device, allow it.',
+      );
+    }
     throw new Error(
-      typeof location !== 'undefined' && location.protocol === 'https:' && base.startsWith('http://')
+      page?.protocol === 'https:' && base.startsWith('http://')
         ? 'Blocked: this page is HTTPS and the address is plain HTTP. Browsers refuse mixed content.'
         : 'Could not reach that address.',
     );
@@ -190,7 +248,9 @@ export function describeEndpoint(endpoint, now = new Date()) {
       }
       const age = ytdlpAge(endpoint.ytDlpVersion, now);
       if (age !== null && age > STALE_AFTER_DAYS) {
-        text += ` Its yt-dlp is ${age} days old, and YouTube changes often: the image is rebuilt every week, so pull it again (docker compose pull) when a download fails.`;
+        // Both ways of starting it: the guide's one docker run has no compose
+        // file to pull with, and a pull alone leaves the old container running.
+        text += ` Its yt-dlp is ${age} days old, and YouTube changes often: the image is rebuilt every week, so when a download fails, take the new one — docker compose pull && docker compose up -d, or docker pull ghcr.io/maxgfr/siphon, then docker rm -f siphon and the same docker run.`;
       }
       return text;
     }

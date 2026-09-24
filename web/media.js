@@ -74,13 +74,38 @@ function spawn() {
   return created;
 }
 
-function send(type, payload, transfer, onProgress) {
+const aborted = () => new DOMException('Aborted', 'AbortError');
+
+/**
+ * Hand the worker one message and wait for its answer.
+ *
+ * A signal that fires while the answer is outstanding stops the worker
+ * outright. That is the only way to stop ffmpeg: exec is synchronous inside
+ * it, so a message asking it to stop would be read only once it had finished
+ * on its own. The next conversion starts a fresh one from the cached core.
+ */
+function send(type, payload, transfer, onProgress, signal) {
   const id = nextId++;
   if (onProgress) watchers.set(id, onProgress);
+  const stop = () => {
+    const settle = pending.get(id);
+    if (!settle) return;
+    pending.delete(id);
+    worker?.terminate();
+    worker = null;
+    loading = null;
+    settle.reject(aborted());
+    for (const other of pending.values()) other.reject(new BackendError('The converter was restarted.'));
+    pending.clear();
+  };
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve, reject });
     worker.postMessage({ id, type, payload }, transfer || []);
-  }).finally(() => watchers.delete(id));
+    signal?.addEventListener('abort', stop, { once: true });
+  }).finally(() => {
+    watchers.delete(id);
+    signal?.removeEventListener('abort', stop);
+  });
 }
 
 /** The load message for one core location; the other two files sit beside the .js. */
@@ -138,15 +163,56 @@ export async function ensureFfmpeg() {
 }
 
 /**
+ * Settles once the latest conversion to ask for the converter, and every one
+ * before it, is over.
+ *
+ * The converter does one thing at a time, and conversions wait their turn
+ * here rather than in the worker's message queue. In there a cancelled one
+ * could not be taken back, and stopping the worker for the one it is running
+ * would take everything queued behind it down too. Out here, one cancelled
+ * while it waits simply leaves the line, and the one in the worker is always
+ * alone there.
+ */
+let line = Promise.resolve();
+
+/** Resolves when `turn` does, or rejects the moment `signal` fires. */
+function waitFor(turn, signal) {
+  if (!signal) return turn;
+  if (signal.aborted) return Promise.reject(aborted());
+  return new Promise((resolve, reject) => {
+    const leave = () => reject(aborted());
+    signal.addEventListener('abort', leave, { once: true });
+    turn.then(() => {
+      signal.removeEventListener('abort', leave);
+      resolve();
+    });
+  });
+}
+
+/**
  * Run one ffmpeg invocation.
  *
  * Inputs are transferred rather than copied — the caller must not touch the
  * arrays afterwards — because copying a 300 MB video to hand it over is the
  * difference between working and an out-of-memory tab on a phone.
  */
-async function transform({ inputs, args, output, onProgress }) {
-  await ensureFfmpeg();
-  return send('run', { inputs, args, output }, inputs.map((input) => input.data.buffer), onProgress);
+async function transform({ inputs, args, output, onProgress, signal }) {
+  const before = line;
+  let done;
+  line = new Promise((resolve) => {
+    done = resolve;
+  });
+  try {
+    await waitFor(before, signal);
+    await ensureFfmpeg();
+    if (signal?.aborted) throw aborted();
+    return await send('run', { inputs, args, output }, inputs.map((input) => input.data.buffer), onProgress, signal);
+  } finally {
+    // The next in line goes when this one is over *and* so is every one
+    // before it: leaving early must not let it jump ahead of a conversion
+    // still in the worker.
+    before.then(done);
+  }
 }
 
 const metadataArgs = (tags = {}) =>
@@ -165,7 +231,7 @@ const metadataArgs = (tags = {}) =>
  * `+faststart` moves the index to the front, which is what lets a phone's
  * player start the file without reading all of it first.
  */
-export async function mux({ video, audio, subtitle = null, ext = 'mp4', tags = {}, onProgress }) {
+export async function mux({ video, audio, subtitle = null, ext = 'mp4', tags = {}, onProgress, signal }) {
   const inputs = [];
   const args = [];
   const index = { video: -1, audio: -1, subtitle: -1 };
@@ -212,7 +278,7 @@ export async function mux({ video, audio, subtitle = null, ext = 'mp4', tags = {
   if (ext === 'mp4') args.push('-movflags', '+faststart');
   args.push(...metadataArgs(tags), '-y', output);
 
-  return transform({ inputs, args, output, onProgress });
+  return transform({ inputs, args, output, onProgress, signal });
 }
 
 /**
@@ -222,7 +288,7 @@ export async function mux({ video, audio, subtitle = null, ext = 'mp4', tags = {
  * M4A: changing the container keeps the original samples, where re-encoding
  * would throw away quality to arrive at the same format.
  */
-export async function toAudio({ source, ext = 'mp3', copy = false, tags = {}, cover = null, onProgress }) {
+export async function toAudio({ source, ext = 'mp3', copy = false, tags = {}, cover = null, onProgress, signal }) {
   const inputs = [{ name: `source.${source.ext || 'mp4'}`, data: source.data }];
   const args = ['-i', `source.${source.ext || 'mp4'}`];
 
@@ -251,5 +317,5 @@ export async function toAudio({ source, ext = 'mp3', copy = false, tags = {}, co
 
   const output = `out.${ext}`;
   args.push(...metadataArgs(tags), '-y', output);
-  return transform({ inputs, args, output, onProgress });
+  return transform({ inputs, args, output, onProgress, signal });
 }

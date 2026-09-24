@@ -187,10 +187,17 @@ function instances(table) {
       if (spec.media === 403) return new Response('forbidden', { status: 403, headers: cors(true) });
       return new Response(new Uint8Array(4096), { status: 206, headers: { ...cors(spec.mediaCors !== false), 'content-type': 'video/mp4' } });
     }
+    // cobalt's own CORS, on by default: the page's preflight answered, and
+    // the header on the answer. `cobaltCors: false` is an instance that
+    // keeps it to its own frontend.
+    if (pathname === '/' && init.method === 'OPTIONS') {
+      if (spec.cobaltCors === false) return new Response('forbidden', { status: 403 });
+      return new Response(null, { status: 204, headers: { ...cors(true), 'access-control-allow-headers': 'content-type' } });
+    }
     if (pathname === '/' && init.method === 'POST') {
       return spec.cobalt === 'keyed'
-        ? new Response(JSON.stringify({ status: 'error', error: { code: 'error.api.auth.key.missing' } }), { status: 401 })
-        : new Response(JSON.stringify({ status: 'tunnel', url: `https://${host}/tunnel?id=1` }), { status: 200 });
+        ? new Response(JSON.stringify({ status: 'error', error: { code: 'error.api.auth.key.missing' } }), { status: 401, headers: cors(spec.cobaltCors !== false) })
+        : new Response(JSON.stringify({ status: 'tunnel', url: `https://${host}/tunnel?id=1` }), { status: 200, headers: cors(spec.cobaltCors !== false) });
     }
     if (pathname === '/tunnel') return new Response(new Uint8Array(2048), { status: 200, headers: { 'content-type': 'video/mp4' } });
     return new Response('not found', { status: 404 });
@@ -239,6 +246,18 @@ test('a Piped instance is asked its own way, and cobalt for a tunnel', async () 
   const keyed = await answersPage('https://keyed.example', 'cobalt', { fetchImpl });
   assert.equal(keyed.ok, false);
   assert.match(keyed.verdict, /error\.api\.auth\.key\.missing/);
+});
+
+test('a cobalt instance that keeps CORS to its own frontend is shut, however well it answers a runner', async () => {
+  // The chips are "these instances answered a web page for a video". A POST
+  // from a runner needs no preflight and reads any answer; the page's needs
+  // both, so the instance was offered and then failed on tap.
+  const { asked, fetchImpl } = instances({ 'private.example': { cobaltCors: false }, 'public.example': {} });
+  const lines = [];
+  const open = await measure({ cobalt: ['https://private.example', 'https://public.example'] }, { fetchImpl, say: (line) => lines.push(line) });
+  assert.deepEqual(open, [{ url: 'https://public.example', kind: 'cobalt' }]);
+  assert.match(lines[0], /^shut {2}cobalt {4}private\.example .*preflight HTTP 403, cors=NONE/);
+  assert.ok(!asked.some((a) => a.url.startsWith('https://private.example') && a.url.includes('/tunnel')), 'no tunnel asked of an instance a page cannot call');
 });
 
 test('the measurement walks every list, says each verdict, and keeps only the open ones with their kind', async () => {

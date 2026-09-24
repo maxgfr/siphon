@@ -8,7 +8,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { detectEndpoint, privacyNote, describeEndpoint, ytdlpAge, STALE_AFTER_DAYS } from '../web/endpoint.js';
+import { detectEndpoint, privacyNote, describeEndpoint, ytdlpAge, STALE_AFTER_DAYS, withScheme } from '../web/endpoint.js';
 
 /** A fetch that answers from a table of path → response, and records what was asked. */
 function stub(table) {
@@ -171,6 +171,127 @@ test('an address nothing answers at is "could not reach", not a guess', async ()
   await assert.rejects(() => detectEndpoint('https://down.example', '', fetchImpl), /could not reach/i);
 });
 
+/** A fetch that answers like `stub`, and records the headers each request carried. */
+function recording(table) {
+  const seen = [];
+  const { fetchImpl: answer } = stub(table);
+  const fetchImpl = async (url, init = {}) => {
+    seen.push({ url, authorization: new Headers(init.headers || {}).get('authorization') });
+    return answer(url, init);
+  };
+  return { fetchImpl, seen };
+}
+
+test('an access key is shown only to the server that asked for it, never to the probes', async () => {
+  // The key in the sheet may be the one saved for another address. A cobalt
+  // instance answering the probes must not receive it on the way to being
+  // recognised.
+  const cobalt = recording({
+    '/api/health': { status: 404, body: '' },
+    '/': { body: { cobalt: { version: '11.0' }, git: {} } },
+  });
+  assert.equal((await detectEndpoint('https://api.example', 'MY-AUTH-TOKEN', cobalt.fetchImpl)).kind, 'cobalt');
+  assert.deepEqual(cobalt.seen.filter((ask) => ask.authorization), [], 'no probe carried the key');
+
+  // Nothing recognised at all: five probes, and still no key on any of them.
+  const nobody = recording({ '/': { body: '<html>hello</html>' } });
+  await assert.rejects(() => detectEndpoint('https://blog.example', 'MY-AUTH-TOKEN', nobody.fetchImpl));
+  assert.ok(nobody.seen.length >= 5);
+  assert.deepEqual(nobody.seen.filter((ask) => ask.authorization), []);
+
+  // A siphon server that wants a key: only the gated check is asked with it.
+  const own = recording({
+    '/api/health': { body: { service: 'siphon', ytDlpVersion: '2026.09.01', ffmpeg: true, requiresKey: true } },
+    '/api/jobs/': { status: 404, body: { detail: 'No such download.' } },
+  });
+  assert.equal((await detectEndpoint('https://ytdl.example', 'MY-AUTH-TOKEN', own.fetchImpl)).keyAccepted, true);
+  assert.deepEqual(own.seen, [
+    { url: 'https://ytdl.example/api/health', authorization: null },
+    { url: 'https://ytdl.example/api/jobs/key-check', authorization: 'Bearer MY-AUTH-TOKEN' },
+  ]);
+});
+
+test('an address typed without its scheme gets the one it most likely has', () => {
+  assert.equal(withScheme('inv.nadeko.net'), 'https://inv.nadeko.net');
+  assert.equal(withScheme('  pipedapi.example/api  '), 'https://pipedapi.example/api');
+  assert.equal(withScheme('example.com:8443'), 'https://example.com:8443', 'a public host with a port is still https');
+  // Addresses on this machine or this network are plain http: that is how a
+  // server started with one docker run answers.
+  assert.equal(withScheme('192.168.1.42:8000'), 'http://192.168.1.42:8000');
+  assert.equal(withScheme('10.0.0.2:8000'), 'http://10.0.0.2:8000');
+  assert.equal(withScheme('172.20.1.5'), 'http://172.20.1.5');
+  assert.equal(withScheme('127.0.0.1:8000'), 'http://127.0.0.1:8000');
+  assert.equal(withScheme('localhost:8000'), 'http://localhost:8000');
+  assert.equal(withScheme('nas.local:8000'), 'http://nas.local:8000');
+  assert.equal(withScheme('raspberrypi:8000'), 'http://raspberrypi:8000');
+  assert.equal(withScheme('100.101.102.103:8000'), 'http://100.101.102.103:8000', 'a Tailscale address');
+  assert.equal(withScheme('[::1]:8000'), 'http://[::1]:8000');
+  assert.equal(withScheme('172.32.0.1'), 'https://172.32.0.1', 'just outside 172.16/12 is public');
+  // Anything that already says how to be reached is left as it is.
+  assert.equal(withScheme('http://inv.example'), 'http://inv.example');
+  assert.equal(withScheme('https://corsproxy.io/?url={url}'), 'https://corsproxy.io/?url={url}');
+  assert.equal(withScheme(''), '');
+  assert.equal(withScheme('/relay'), '/relay', 'a path on this page\'s own host');
+});
+
+test('an address with no scheme is never probed against this page\'s own host', async () => {
+  // fetch() reads "inv.nadeko.net/api/health" as a path under the page, and
+  // the page's own host answering 404 there read as "not recognised".
+  const { fetchImpl, asked } = stub({});
+  await assert.rejects(() => detectEndpoint('inv.nadeko.net', '', fetchImpl), /https:\/\//);
+  assert.deepEqual(asked, [], 'nothing was asked');
+});
+
+/** Run with the page at `origin`, as the browser would have it. */
+async function onPage(origin, run) {
+  const had = Object.getOwnPropertyDescriptor(globalThis, 'location');
+  Object.defineProperty(globalThis, 'location', { value: new URL(`${origin}/siphon/`), configurable: true });
+  try {
+    return await run();
+  } finally {
+    if (had) Object.defineProperty(globalThis, 'location', had);
+    else delete globalThis.location;
+  }
+}
+
+test('a server on this computer that does not answer is not blamed on mixed content', async () => {
+  // http://127.0.0.1 is a secure context: the HTTPS page may call it, and
+  // "browsers refuse mixed content" would send the person away from a route
+  // that works once the server is up and names this page.
+  const { fetchImpl } = stub({});
+  await onPage('https://maxgfr.github.io', async () => {
+    for (const address of ['http://127.0.0.1:8000', 'http://localhost:8000', 'http://[::1]:8000']) {
+      const error = await detectEndpoint(address, '', fetchImpl).catch((e) => e);
+      assert.doesNotMatch(error.message, /mixed content/i, address);
+      assert.match(error.message, /running/, address);
+      assert.match(error.message, /ALLOWED_ORIGINS/, address);
+      assert.match(error.message, /https:\/\/maxgfr\.github\.io/, `${address}: names the origin to allow`);
+    }
+    // A plain-HTTP address on the network is mixed content, and is still called that.
+    await assert.rejects(() => detectEndpoint('http://192.168.1.5:8000', '', fetchImpl), /mixed content/i);
+  });
+});
+
+test('the same goes for a download that cannot reach the server', async () => {
+  const { ServerBackend } = await import('../web/api.js');
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new TypeError('Failed to fetch');
+  };
+  try {
+    await onPage('https://maxgfr.github.io', async () => {
+      const local = await new ServerBackend({ base: 'http://127.0.0.1:8000' }).health().catch((e) => e);
+      assert.doesNotMatch(`${local.message} ${local.hint}`, /mixed content|plain HTTP/i);
+      assert.match(local.hint, /ALLOWED_ORIGINS/);
+      assert.match(local.hint, /this device/, 'and names the browser\'s permission prompt');
+      const lan = await new ServerBackend({ base: 'http://192.168.1.5:8000' }).health().catch((e) => e);
+      assert.match(`${lan.message} ${lan.hint}`, /mixed content/i);
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('the sentences follow from the kind', () => {
   assert.match(privacyNote({ kind: 'none' }), /this device/i);
   assert.match(privacyNote({ kind: 'siphon', ffmpeg: true }), /your server/i);
@@ -198,7 +319,12 @@ test('a server with a months-old yt-dlp is told to pull the image; a current one
   const today = new Date('2026-09-17T12:00:00Z');
   const stale = describeEndpoint({ kind: 'siphon', ffmpeg: true, label: 'yt-dlp 2026.05.01', ytDlpVersion: '2026.05.01' }, today);
   assert.match(stale, /139 days old/);
-  assert.match(stale, /docker compose pull/);
+  // The headline install is one `docker run`, with no compose file to pull
+  // with: both ways of starting it are told how to take the new image, and
+  // a pull alone replaces no running container.
+  assert.match(stale, /docker compose pull && docker compose up -d/);
+  assert.match(stale, /docker pull ghcr\.io\/maxgfr\/siphon/);
+  assert.match(stale, /docker rm -f siphon/);
   assert.match(stale, /^Your server — yt-dlp 2026\.05\.01, with ffmpeg\./, 'the rest of the sentence is unchanged');
   const fresh = describeEndpoint({ kind: 'siphon', ffmpeg: true, label: 'yt-dlp 2026.09.01', ytDlpVersion: '2026.09.01' }, today);
   assert.doesNotMatch(fresh, /days old/);

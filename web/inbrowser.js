@@ -36,8 +36,6 @@ export class BrowserBackend {
    * @param {import('./extract.js').Resolver[]} [options.resolvers]  who to ask when this page cannot read a link
    */
   constructor({ coreUrl = '', escape = null, resolvers = [] } = {}) {
-    this.net = new Fetcher({ escape });
-    this.resolvers = resolvers.filter(Boolean);
     this.mode = 'browser';
     this.supportsProgress = true;
     this.supportsProbe = true;
@@ -47,13 +45,28 @@ export class BrowserBackend {
     this.supportsPlaylist = false;
     /** @type {Map<string, object>} */
     this.jobs = new Map();
-    this.cache = new Map();
-    if (coreUrl) setCoreUrl(coreUrl);
+    this.configure({ coreUrl, escape, resolvers });
 
     // Clear out whatever a previous session left behind. Nothing is spared:
     // the server sweeps finished files on the same clock and a restored row
     // whose file is gone says so, which is the behaviour being matched.
     store.sweep(FILE_TTL_MS);
+  }
+
+  /**
+   * Take another way in — a new helper saved in settings — keeping the jobs.
+   *
+   * A job already running holds the Fetcher and the formats it started with,
+   * so it finishes the way it began; only what starts next goes the new way.
+   * What a probe learned is dropped, since another helper may read the same
+   * link differently.
+   */
+  configure({ coreUrl = '', escape = null, resolvers = [] } = {}) {
+    this.net = new Fetcher({ escape });
+    this.resolvers = resolvers.filter(Boolean);
+    this.cache = new Map();
+    if (coreUrl) setCoreUrl(coreUrl);
+    return this;
   }
 
   async health() {
@@ -239,11 +252,22 @@ async function runJob(backend, job) {
   // as it arrives, so a two-hour video never exists in the tab's heap. Anything
   // ffmpeg has to touch must be handed to it whole, and there the size is worth
   // warning about rather than pretending away.
-  if (plan.op === 'raw') return await runRaw(backend, job, info, plan, resolve);
+  if (plan.op === 'raw') return await runRaw(net, job, info, plan, resolve);
 
-  if (job.totalBytes > HEAVY_CONVERSION_BYTES) {
-    job.note = 'Large file: converting it here needs it in memory, which a phone may not have. Your own server does this on disk.';
-  }
+  // What each track will weigh: its stated size, or for a stream, what its
+  // playlist and then its segments suggest (see downloadHls). The total —
+  // and with it the row's percentage, its time left and this warning — is
+  // there as soon as every track has one.
+  const expected = [...sizes];
+  let warned = false;
+  const reckon = () => {
+    if (expected.every(Boolean)) job.totalBytes = expected.reduce((a, b) => a + b, 0);
+    if (!warned && expected.reduce((a, b) => a + b, 0) > HEAVY_CONVERSION_BYTES) {
+      warned = true;
+      job.note = 'Large file: converting it here needs it in memory, which a phone may not have. Your own server does this on disk.';
+    }
+  };
+  reckon();
 
   const started = nowSeconds();
   let doneWeight = 0;
@@ -276,8 +300,13 @@ async function runJob(backend, job) {
         ? await downloadHls(url, {
             net,
             signal,
+            bitrate: track.bitrate,
             onSegment: (done, count) => advance(done / count),
             onBytes: (received) => countBytes(received),
+            onEstimate: (bytes) => {
+              expected[index] = bytes;
+              reckon();
+            },
             onNote: (note) => {
               job.note = note;
             },
@@ -327,6 +356,7 @@ async function runJob(backend, job) {
       ext: plan.ext,
       tags,
       onProgress,
+      signal,
     });
   } else {
     const source = fetched[0];
@@ -338,17 +368,21 @@ async function runJob(backend, job) {
       tags,
       cover,
       onProgress,
+      signal,
     });
   }
 
   if (signal.aborted) return;
 
   const blob = new Blob([output], { type: plan.mime || MIME_FOR[plan.ext] || 'application/octet-stream' });
-  await store.put(job.id, blob);
+  // Once the file is on disk, the Save link points there: a blob URL keeps
+  // whatever it was made from alive until it is revoked, and this one would
+  // otherwise hold the whole converted file in memory until the row goes.
+  const stored = (await store.put(job.id, blob)) ? await store.get(job.id) : null;
 
   job.filename = safeFilename(info.title, plan.ext);
   job.totalBytes = blob.size;
-  job.objectUrl = URL.createObjectURL(blob);
+  job.objectUrl = URL.createObjectURL(stored ? stored.slice(0, stored.size, blob.type) : blob);
   job.progress = 1;
   job.stage = 'ready';
   job.state = 'done';
@@ -370,14 +404,14 @@ const HEAVY_CONVERSION_BYTES = 500 * 1024 * 1024;
  * moment is one chunk. This is the path a plain MP4 takes, which is most of
  * them.
  */
-async function runRaw(backend, job, info, plan, resolve) {
+async function runRaw(net, job, info, plan, resolve) {
   const signal = job.controller.signal;
   const sink = await store.writer(job.id);
   const started = nowSeconds();
 
   try {
     const url = await resolve(plan.video || plan.audio);
-    await backend.net.stream(url, {
+    await net.stream(url, {
       signal,
       onChunk: (chunk) => sink.write(chunk),
       onReset: () => sink.reset(),
@@ -451,13 +485,21 @@ export function pickSubtitle(tracks, langs = 'en') {
  * A missing subtitle must not fail a download that otherwise worked — the
  * video is what was asked for — so this swallows its own failure the way the
  * cover art does, and says so in the row.
+ *
+ * What is embedded is WebVTT, and only that is let through. ffmpeg handed
+ * anything else under a .vtt name — TTML, an error page — makes an empty
+ * track of it without complaint, and the video would carry a subtitle menu
+ * entry that never shows a word.
  */
-async function subtitleData(net, subtitle, signal) {
+export async function subtitleData(net, subtitle, signal) {
+  let data;
   try {
-    return await net.bytes(subtitle.url, { signal });
+    data = await net.bytes(subtitle.url, { signal });
   } catch {
     return null;
   }
+  // The decoder drops a byte-order mark, which WebVTT allows before its name.
+  return new TextDecoder().decode(data.subarray(0, 16)).startsWith('WEBVTT') ? data : null;
 }
 
 async function coverArt(net, info, signal) {
@@ -482,8 +524,14 @@ async function coverArt(net, info, signal) {
  * The bar is driven by segments, because a segment playlist states no total
  * size and a byte percentage would have to be invented. The running byte count
  * is reported separately, since that one is real and gives an honest speed.
+ *
+ * The size is still worth guessing — a time left needs one, and so does the
+ * warning that a two-hour stream will not fit in a phone's memory — and it is
+ * reported as an estimate: the bitrate the master playlist gave times the
+ * running time to begin with, then what the segments so far weigh, scaled up
+ * to the whole running time.
  */
-async function downloadHls(url, { net, signal, onSegment, onBytes, onNote }) {
+async function downloadHls(url, { net, signal, bitrate = null, onSegment, onBytes, onEstimate, onNote }) {
   // Segments are relative to where the playlist landed, which a redirect moves.
   const playlist = await net.document(url, { signal });
   const media = parseMedia(playlist.text, playlist.url);
@@ -529,12 +577,16 @@ async function downloadHls(url, { net, signal, onSegment, onBytes, onNote }) {
 
   const keys = new Map();
   const count = media.segments.length;
+  if (bitrate && media.duration) onEstimate?.(Math.round((bitrate * media.duration) / 8));
+  let seconds = 0;
 
   for (const [index, segment] of media.segments.entries()) {
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
     let bytes = await net.bytes(segment.url, { signal, range: segment.range });
     if (segment.key) bytes = await decryptSegment(bytes, segment, keys, net, signal);
     keep(bytes);
+    seconds += segment.duration;
+    onEstimate?.(Math.round(seconds && media.duration ? (total / seconds) * media.duration : (total / (index + 1)) * count));
     onSegment?.(index + 1, count);
   }
 

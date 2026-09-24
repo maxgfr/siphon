@@ -9,7 +9,9 @@
  * themselves. Caching a 400 MB video into the Cache API would fill the device's
  * storage quota and, on iOS, get the whole origin's storage evicted.
  */
-const CACHE = 'siphon-v5';
+// v6: v5 kept shared links as the keys of pages (see the fetch handler), and
+// a new name is what sweeps them from a phone that has them.
+const CACHE = 'siphon-v6';
 const SHELL = [
   './', './index.html', './styles.css', './manifest.webmanifest', './icon.svg',
   './app.js', './api.js', './errors.js', './links.js', './config.json', './instances.json',
@@ -44,17 +46,25 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin) return; // backends are never ours to cache
   if (url.pathname.includes('/api/')) return;
 
+  // A share or the bookmarklet opens the page as ./?text=… or ./?url=…, and
+  // the link in it — a signed address, a token — is out of the address bar
+  // the moment the page loads. Kept under that URL, it would sit in Cache
+  // Storage instead, one more copy of the page per link. So a page is kept
+  // under its bare address, and nothing else with a query is kept at all:
+  // the shell has none.
+  const key = request.mode === 'navigate' ? url.origin + url.pathname : url.search ? null : request;
+
   // Network first, so a deploy is picked up on the next load rather than
   // needing the user to clear site data; the cache is the fallback.
   event.respondWith(
     fetch(request)
       .then((response) => {
-        if (response.ok) {
+        if (response.ok && key) {
           const copy = response.clone();
-          caches.open(CACHE).then((cache) => cache.put(request, copy));
+          caches.open(CACHE).then((cache) => cache.put(key, copy));
         }
         return response;
       })
-      .catch(() => caches.match(request).then((hit) => hit || caches.match('./index.html'))),
+      .catch(() => caches.match(key || request).then((hit) => hit || caches.match('./index.html'))),
   );
 });

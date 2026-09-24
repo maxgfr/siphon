@@ -81,9 +81,20 @@ function hostAllowed(hostname, allowed) {
  * Loopback, private, link-local, CGNAT (100.64/10) and "this host" (0.x), by
  * name or number, plus every IPv6 literal: no media host is addressed by one,
  * and each of them can spell a private address.
+ *
+ * Names are matched whole and numbers only as numbers. One pattern for both,
+ * anchored at the start alone, refused www.local.ch and localtv.com as
+ * private. The URL parser has already turned every spelling of an IPv4
+ * address (0x7f.1, 2130706433) into four dotted decimals.
  */
-const PRIVATE_HOST =
-  /^(localhost|.+\.localhost|.+\.local|0\.|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|\[)/i;
+const PRIVATE_NAME = /(^|\.)(localhost|local)\.?$/i;
+const IPV4 = /^\d+\.\d+\.\d+\.\d+$/;
+const PRIVATE_IPV4 = /^(0\.|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/;
+
+function privateHost(hostname) {
+  if (hostname.startsWith('[')) return true;
+  return IPV4.test(hostname) ? PRIVATE_IPV4.test(hostname) : PRIVATE_NAME.test(hostname);
+}
 
 /**
  * Why a URL must not be fetched, or nothing.
@@ -95,7 +106,7 @@ const PRIVATE_HOST =
  */
 function refusal(target, allowedHosts) {
   if (target.protocol !== 'https:' && target.protocol !== 'http:') return 'only http(s)';
-  if (PRIVATE_HOST.test(target.hostname)) return 'not a public address';
+  if (privateHost(target.hostname)) return 'not a public address';
   if (!hostAllowed(target.hostname, allowedHosts)) return 'host not allowed';
   return null;
 }
@@ -113,13 +124,32 @@ function targetOf(request) {
 /** Enough for a CDN hand-off or two; a loop is refused rather than followed. */
 const MAX_REDIRECTS = 5;
 
+/**
+ * The origins allowed to call this, or null for anyone.
+ *
+ * A browser's Origin is scheme, host and port — no path, no trailing slash —
+ * so each entry is cut down to that. The page's address, as copied from the
+ * address bar (https://you.github.io/siphon/), was compared as written, and
+ * locked the page out of its own relay. `*` is anyone, as on the server.
+ */
+function allowedOrigins(env) {
+  const allowed = list(env.ALLOWED_ORIGINS).map((item) => {
+    try {
+      const { origin } = new URL(item);
+      return origin === 'null' ? item : origin;
+    } catch {
+      return item;
+    }
+  });
+  return allowed.length === 0 || allowed.includes('*') ? null : allowed;
+}
+
 function corsHeaders(request, env) {
   const origin = request.headers.get('Origin');
-  const allowed = list(env.ALLOWED_ORIGINS);
   return {
     // Echoing the caller's origin rather than `*` once an allow-list exists
     // keeps the answer specific to the page that asked for it.
-    'Access-Control-Allow-Origin': allowed.length === 0 ? '*' : origin || 'null',
+    'Access-Control-Allow-Origin': allowedOrigins(env) ? origin || 'null' : '*',
     // Range and Content-Range are the ones that matter: without them the
     // browser cannot read the byte offsets a partial download depends on.
     'Access-Control-Expose-Headers': '*',
@@ -129,16 +159,30 @@ function corsHeaders(request, env) {
 }
 
 function originAllowed(request, env) {
-  const allowed = list(env.ALLOWED_ORIGINS);
-  if (allowed.length === 0) return true; // unset means "anyone", which is why the README says to set it
+  const allowed = allowedOrigins(env);
+  if (!allowed) return true; // unset means "anyone", which is why the README says to set it
   const origin = (request.headers.get('Origin') || '').toLowerCase();
   return allowed.includes(origin);
 }
 
+/**
+ * The relay's own answer, marked as its own.
+ *
+ * A 403 from here (a host off the allow-list) and a 403 carried from
+ * upstream (googlevideo refusing a link bound to another IP) are the same
+ * status, and only the first is fixed by editing ALLOWED_HOSTS; a 502 from
+ * here is this hop failing, not the host answering 502. X-Relay-Error says
+ * which, and is never passed through from upstream. It holds the reason as
+ * one line of plain text, which is all a header may carry.
+ */
 const deny = (reason, request, env, status = 403) =>
   new Response(JSON.stringify({ error: reason }), {
     status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders(request, env) },
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Relay-Error': reason.replace(/[^\x20-\x7e]+/g, ' ').slice(0, 200),
+      ...corsHeaders(request, env),
+    },
   });
 
 export default {
@@ -171,6 +215,13 @@ export default {
       const name = key.toLowerCase();
       if (HOP_BY_HOP.has(name) || NEVER_FORWARD.has(name)) continue;
       if (name.startsWith('cf-') || name.startsWith('sec-') || name.startsWith('access-control-')) continue;
+      // Which encodings to ask for is the runtime's to say, since it is the
+      // runtime that decodes them. The browser's list names zstd, which Node's
+      // fetch cannot decode: a host that took the offer reached the page as
+      // compressed bytes, the encoding header dropped below as undone.
+      // Left to itself, fetch also asks for no encoding at all on a ranged
+      // request: a range is offsets into the bytes as sent.
+      if (name === 'accept-encoding') continue;
       headers.set(key, value);
     }
     // YouTube's own pages send these, and some of its clients check them.
@@ -230,7 +281,7 @@ export default {
       const name = key.toLowerCase();
       if (name === 'content-encoding' || name === 'set-cookie') continue;
       if (name === 'content-length' ? encoded : HOP_BY_HOP.has(name)) continue;
-      if (name.startsWith('access-control-')) continue; // ours are the ones that count
+      if (name.startsWith('access-control-') || name === 'x-relay-error') continue; // ours are the ones that count
       out.set(key, value);
     }
     for (const [key, value] of Object.entries(corsHeaders(request, env))) out.set(key, value);

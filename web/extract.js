@@ -20,7 +20,7 @@
  * to care which extractor produced them.
  */
 import { BackendError } from './errors.js';
-import { isMaster, parseMaster } from './m3u8.js';
+import { isMaster, looksLikePlaylist, parseMaster } from './m3u8.js';
 
 /** The youtubei.js browser bundle, pinned. It is only fetched for YouTube links. */
 const YOUTUBEI = 'https://cdn.jsdelivr.net/npm/youtubei.js@18.0.0/bundle/browser.js';
@@ -109,13 +109,76 @@ export function sniffType(contentType) {
   return null;
 }
 
+/**
+ * What a file is from its first bytes, for when neither its address nor its
+ * headers say. Only the signatures of what the planner can do something
+ * with; 'text' for anything with no NUL byte in it, which is a page or a
+ * playlist to be read; null for any other binary.
+ */
+export function sniffBytes(bytes) {
+  const at = (offset, signature) => [...signature].every((char, index) => bytes[offset + index] === char.charCodeAt(0));
+  const text = new TextDecoder('latin1').decode(bytes);
+  const progressive = (container, kind) => ({ protocol: 'progressive', container, kind });
+  if (text.replace(/^(?:\u00ef\u00bb\u00bf)?\s*/, '').startsWith('#EXTM3U')) return { protocol: 'hls', container: 'mp4', kind: 'muxed' };
+  if (at(4, 'ftyp')) return at(8, 'M4A ') || at(8, 'M4B ') ? progressive('m4a', 'audio') : progressive('mp4', 'muxed');
+  if (at(0, '\x1a\x45\xdf\xa3')) return progressive(text.includes('webm') ? 'webm' : 'mkv', 'muxed');
+  if (at(0, 'OggS')) return progressive('ogg', text.includes('theora') ? 'muxed' : 'audio');
+  if (at(0, 'fLaC')) return progressive('flac', 'audio');
+  if (at(0, 'RIFF') && at(8, 'WAVE')) return progressive('wav', 'audio');
+  // An MPEG audio frame and an ADTS one share the 0xFFF sync; the layer bits,
+  // zero for ADTS, tell them apart.
+  if (bytes[0] === 0xff && (bytes[1] & 0xf6) === 0xf0) return progressive('aac', 'audio');
+  if (at(0, 'ID3') || (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0 && (bytes[1] & 0x06) !== 0)) return progressive('mp3', 'audio');
+  return bytes.includes(0) ? null : 'text';
+}
+
+/** Content types that are something to read, not a file to save. */
+const TEXTUAL = /^(?:text\/|application\/(?:json|xml|javascript|[\w.+-]+\+(?:json|xml))$)/;
+
+/**
+ * Content types that are never the media, whatever the address says.
+ * text/plain is left out: it is also what a careless host sends for a file
+ * it has no type for.
+ */
+const NOT_MEDIA = /^(?:text\/(?!plain$)|image\/|application\/(?:xhtml\+xml|json)$)/;
+
+/**
+ * A link that answered with something that is not media.
+ *
+ * Not retryable, so that extract() moves on to a resolver that knows the site
+ * — and with none, the person reads what came back instead of getting a
+ * sign-in page saved as video.mp4.
+ */
+function notMedia(type) {
+  if (type.startsWith('image/')) {
+    return new BackendError('That link is an image, not audio or video.', { retryable: false });
+  }
+  return new BackendError('That link answered with a web page, not a file.', {
+    hint: 'A link that has expired, or needs a sign-in, lands on a page like that. A page with a player in it needs your own server.',
+    retryable: false,
+  });
+}
+
+/** What streaming servers name every playlist, which says nothing about what is in it. */
+const PLAYLIST_ROLE = /^(?:master|index|playlist|chunklist(?:_\w+)?|manifest|prog_index)$/i;
+
 /** A readable name for the finished file, from the URL when nothing better exists. */
 export function titleFromUrl(url) {
   try {
-    const path = decodeURIComponent(new URL(url).pathname);
-    const last = path.split('/').filter(Boolean).pop() || '';
-    const name = last.replace(/\.[a-z0-9]{1,5}$/i, '').replace(/[_+]+/g, ' ').trim();
-    return name || new URL(url).hostname;
+    const { pathname, hostname } = new URL(url);
+    const segments = decodeURIComponent(pathname).split('/').filter(Boolean).map((segment) => segment.replace(/\.[a-z0-9]{1,5}$/i, ''));
+    let name = segments.pop() || '';
+    // Named for its role, every stream on a CDN would be saved as master.mp4
+    // and collide with the last one. The folder it sits in names it instead,
+    // past any that only name a rendition (720p, 1080, hls).
+    if (PLAYLIST_ROLE.test(name)) {
+      name = '';
+      while (!name && segments.length) {
+        const up = segments.pop();
+        if (!PLAYLIST_ROLE.test(up) && !/^(?:\d+p?|hls|dash)$/i.test(up)) name = up;
+      }
+    }
+    return name.replace(/[_+]+/g, ' ').trim() || hostname;
   } catch {
     return 'download';
   }
@@ -137,6 +200,57 @@ export function safeFilename(name, extension) {
 // end — or `…/mp4:clip.mp4/playlist.m3u8`, how Wowza names its streams, is cut
 // off at the first `.mp4` into an address that is not a file.
 const MEDIA_IN_TEXT = /https?:\/\/[^\s"'<>\\)]+?\.(?:m3u8|mp4|webm|m4a|mp3)(?=[?#&"'\s<>\\),;]|$)(?:\?[^\s"'<>\\)]*)?/gi;
+
+/** The named references pages actually put in titles and addresses; numeric ones are worked out. */
+const ENTITIES = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0',
+  ndash: '\u2013', mdash: '\u2014', lsquo: '\u2018', rsquo: '\u2019', ldquo: '\u201c', rdquo: '\u201d',
+  hellip: '\u2026', laquo: '\u00ab', raquo: '\u00bb', copy: '\u00a9', reg: '\u00ae', trade: '\u2122',
+};
+
+/**
+ * Undo HTML's escaping, as a browser does before a page's own script sees a value.
+ *
+ * Every template engine writes `&` in an attribute as `&amp;`, and WordPress
+ * as `&#038;`. A signed address read without undoing that asks for a
+ * parameter called `amp;Signature`, and the CDN refuses it; a title keeps its
+ * `&#8211;` all the way into the filename.
+ */
+function decodeEntities(text) {
+  return String(text).replace(/&(?:#(\d+)|#x([0-9a-f]+)|([a-z]+));/gi, (whole, decimal, hex, name) => {
+    if (name) return ENTITIES[name] ?? whole;
+    const code = decimal ? parseInt(decimal, 10) : parseInt(hex, 16);
+    return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : whole;
+  });
+}
+
+/**
+ * A tag's attributes, read the way a browser reads them: double-quoted,
+ * single-quoted, or bare, as a minifier leaves them (`<video src=/a.mp4>`).
+ *
+ * Walking them in order, rather than searching the tag for `src=`, is what
+ * keeps `data-src` from being taken for `src`, and a `?src=` inside another
+ * attribute's value from being taken for either. A repeated name keeps its
+ * first value, as in a browser.
+ */
+function attributesOf(tag) {
+  const attributes = Object.create(null);
+  const list = tag.replace(/^<[^\s/>]*/, '');
+  for (const [, name, double, single, bare] of list.matchAll(/([^\s"'>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g)) {
+    const key = name.toLowerCase();
+    if (!(key in attributes)) attributes[key] = decodeEntities(double ?? single ?? bare ?? '');
+  }
+  return attributes;
+}
+
+const OG_VIDEO = new Set(['og:video:secure_url', 'og:video:url', 'og:video', 'twitter:player:stream']);
+
+/**
+ * The schema.org types whose `contentUrl` is the media itself. An
+ * ImageObject has one too, and Yoast puts one on almost every WordPress page:
+ * taken as a candidate, its featured JPEG was downloaded as the video.
+ */
+const MEDIA_OBJECT = /(?:^|[/:#])(?:VideoObject|AudioObject|MediaObject|Audiobook)$/;
 
 /**
  * Pull media URLs out of a page's markup.
@@ -164,25 +278,21 @@ export function scrapePage(html, baseUrl) {
     found.push({ url: absolute, source });
   };
 
-  const attribute = (tag, name) => {
-    const match = new RegExp(`${name}\\s*=\\s*["']([^"']+)["']`, 'i').exec(tag);
-    return match ? match[1] : null;
-  };
-
   for (const tag of html.match(/<meta\b[^>]*>/gi) || []) {
-    const property = (attribute(tag, 'property') || attribute(tag, 'name') || '').toLowerCase();
-    if (property === 'og:video:secure_url' || property === 'og:video:url' || property === 'og:video' || property === 'twitter:player:stream') {
-      add(attribute(tag, 'content'), 'og');
+    const attributes = attributesOf(tag);
+    if ([attributes.property, attributes.name].some((name) => OG_VIDEO.has(String(name || '').toLowerCase()))) {
+      add(attributes.content, 'og');
     }
   }
 
   for (const tag of html.match(/<(?:video|audio|source)\b[^>]*>/gi) || []) {
-    add(attribute(tag, 'src'), 'element');
+    add(attributesOf(tag).src, 'element');
   }
 
   for (const tag of html.match(/<link\b[^>]*>/gi) || []) {
-    const type = (attribute(tag, 'type') || '').toLowerCase();
-    if (HLS_MIMES.has(type) || type.startsWith('video/') || type.startsWith('audio/')) add(attribute(tag, 'href'), 'link');
+    const attributes = attributesOf(tag);
+    const type = (attributes.type || '').toLowerCase();
+    if (HLS_MIMES.has(type) || type.startsWith('video/') || type.startsWith('audio/')) add(attributes.href, 'link');
   }
 
   for (const block of html.match(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || []) {
@@ -191,7 +301,13 @@ export function scrapePage(html, baseUrl) {
       const walk = (node) => {
         if (!node || typeof node !== 'object') return;
         if (Array.isArray(node)) return node.forEach(walk);
-        if (typeof node.contentUrl === 'string') add(node.contentUrl, 'jsonld');
+        // A node that names no type at all is given the benefit of the doubt
+        // only when its address looks like media.
+        const types = [].concat(node['@type'] || []).map(String);
+        if (typeof node.contentUrl === 'string' &&
+            (types.some((type) => MEDIA_OBJECT.test(type)) || (types.length === 0 && sniffUrl(node.contentUrl)))) {
+          add(node.contentUrl, 'jsonld');
+        }
         if (typeof node.embedUrl === 'string' && sniffUrl(node.embedUrl)) add(node.embedUrl, 'jsonld');
         Object.values(node).forEach(walk);
       };
@@ -201,9 +317,14 @@ export function scrapePage(html, baseUrl) {
     }
   }
 
-  // Last resort: a media URL sitting in inline script JSON. Escaped slashes are
-  // the common form there, so undo them before matching.
-  for (const match of html.replace(/\\\//g, '/').match(MEDIA_IN_TEXT) || []) add(match, 'inline');
+  // Last resort: a media URL sitting in inline script JSON, or in a JSON
+  // attribute such as video.js's data-setup. Each escapes it its own way —
+  // HTML's &amp;, JSON's \/, and the \u0026 Go and Rails write for & — and
+  // left in, a match stops at the backslash with the signature cut off.
+  const unescaped = decodeEntities(html)
+    .replace(/\\\//g, '/')
+    .replace(/\\u([0-9a-f]{4})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+  for (const match of unescaped.match(MEDIA_IN_TEXT) || []) add(match, 'inline');
 
   return found;
 }
@@ -301,7 +422,22 @@ async function extractNative(url, context) {
   const typed = sniffType(head.type);
   if (typed?.protocol === 'hls') return extractHls(url, context, {});
   if (typed) return extractDirect(url, context, typed, head);
-  return extractPage(url, context);
+  const type = head.type || '';
+  if (TEXTUAL.test(type)) return extractPage(url, context);
+  if (type.startsWith('image/')) throw notMedia(type);
+
+  // A type that says nothing — application/octet-stream is what file hosts
+  // and S3 send by default — is no reason to read the whole thing as a page.
+  // The name it is sent under says what it is, and failing that, its first
+  // bytes do.
+  const shape = sniffUrl(head.filename || '') || sniffBytes(await context.net.prefix(url, { signal: context.signal }));
+  if (shape === 'text') return extractPage(url, context);
+  if (shape?.protocol === 'hls') return extractHls(url, context, {});
+  if (shape) return extractDirect(url, context, shape, head);
+  throw new BackendError('That link is a file, but not one siphon can tell is audio or video.', {
+    hint: head.filename ? `It is sent as "${head.filename}".` : '',
+    retryable: false,
+  });
 }
 
 async function extractDirect(url, context, shape, head = null) {
@@ -314,6 +450,9 @@ async function extractDirect(url, context, shape, head = null) {
     return null;
   }));
   const typed = headers ? sniffType(headers.type) : null;
+  // The address only guesses; a host that answers with a page or an image
+  // has said what it really is.
+  if (!typed && NOT_MEDIA.test(headers?.type || '')) throw notMedia(headers.type);
   const container = typed?.container || shape.container;
   const kind = typed?.kind || shape.kind;
 
@@ -346,9 +485,20 @@ async function extractDirect(url, context, shape, head = null) {
   };
 }
 
-async function extractHls(url, context, meta) {
+/** Codecs that carry sound only, as a master playlist's CODECS names them. */
+const AUDIO_CODEC = /^(?:mp4a|ac-3|ec-3|ac-4|opus|flac|alac|mp3|dts\w?)(?:\.|$)/i;
+
+/**
+ * A rung with sound and no picture: no RESOLUTION, and every codec it lists
+ * an audio one. Apple's authoring spec asks every ladder to carry one; one
+ * that lists no codecs at all could be anything, and stays a muxed rung.
+ */
+const isAudioVariant = (variant) =>
+  !variant.height && Boolean(variant.codecs) && variant.codecs.split(',').every((codec) => AUDIO_CODEC.test(codec.trim()));
+
+async function extractHls(url, context, meta, doc = null) {
   // Relative to where the playlist landed, which a redirect moves.
-  const { text, url: base } = await context.net.document(url, { signal: context.signal });
+  const { text, url: base } = doc || (await context.net.document(url, { signal: context.signal }));
   const formats = [];
 
   if (isMaster(text)) {
@@ -368,18 +518,22 @@ async function extractHls(url, context, meta) {
     for (const [index, variant] of variants.entries()) {
       const track = audioFor(variant);
       if (track && !tracks.includes(track)) tracks.push(track);
+      const audioOnly = isAudioVariant(variant);
+      // An audio-only rung whose group has a rendition of its own plays that
+      // rendition, which is listed below.
+      if (audioOnly && track) continue;
       formats.push({
         id: `hls-${index}`,
         url: variant.url,
         protocol: 'hls',
-        kind: track ? 'video' : 'muxed',
-        container: 'mp4',
+        kind: audioOnly ? 'audio' : track ? 'video' : 'muxed',
+        container: audioOnly ? 'm4a' : 'mp4',
         height: variant.height,
         width: variant.width,
         bitrate: variant.bandwidth,
         filesize: null,
         codecs: variant.codecs,
-        label: variant.height ? `${variant.height}p` : 'stream',
+        label: audioOnly ? 'audio' : variant.height ? `${variant.height}p` : 'stream',
       });
     }
     for (const [index, track] of tracks.entries()) {
@@ -434,6 +588,9 @@ async function extractPage(url, context) {
   // Relative to where the page landed: `/watch/1` redirected to
   // `/watch/1-some-slug/` names `media/clip.mp4` from there.
   const { text: html, url: base } = await context.net.document(url, { signal: context.signal });
+  // A playlist at an address with no extension, sent as text/plain, is only
+  // known to be one once it has been read.
+  if (looksLikePlaylist(html)) return extractHls(url, context, {}, { text: html, url: base });
   const candidates = scrapePage(html, base);
 
   if (candidates.length === 0) {
@@ -446,7 +603,9 @@ async function extractPage(url, context) {
   }
 
   const title = pageTitle(html) || titleFromUrl(url);
-  const thumbnail = metaContent(html, 'og:image');
+  // Relative to the page: left as it is, `/img/cover.jpg` is fetched from
+  // siphon's own origin, fails, and the cover art is silently dropped.
+  const thumbnail = absoluteUrl(metaContent(html, 'og:image'), base);
 
   // Try each candidate in order rather than trusting the first: an og:video
   // pointing at a dead CDN should not sink a page that also has a <video src>.
@@ -480,23 +639,29 @@ async function extractPage(url, context) {
 }
 
 const pageTitle = (html) =>
-  metaContent(html, 'og:title') ||
-  (/<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] || '').replace(/\s+/g, ' ').trim() ||
-  null;
+  (metaContent(html, 'og:title') || decodeEntities(/<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] || ''))
+    .replace(/\s+/g, ' ')
+    .trim() || null;
 
 function metaContent(html, property) {
   for (const tag of html.match(/<meta\b[^>]*>/gi) || []) {
-    const name = (/(?:property|name)\s*=\s*["']([^"']+)["']/i.exec(tag)?.[1] || '').toLowerCase();
-    if (name !== property) continue;
-    const content = /content\s*=\s*["']([^"']*)["']/i.exec(tag)?.[1];
-    if (content) return decodeEntities(content);
+    const attributes = attributesOf(tag);
+    if (![attributes.property, attributes.name].some((name) => String(name || '').toLowerCase() === property)) continue;
+    if (attributes.content) return attributes.content;
   }
   return null;
 }
 
-const decodeEntities = (text) =>
-  String(text).replace(/&(amp|lt|gt|quot|#39|apos);/g, (_, name) =>
-    ({ amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'", apos: "'" })[name]);
+/** An address from a page, made whole against where the page landed; null if it is not a web address. */
+function absoluteUrl(url, base) {
+  if (!url) return null;
+  try {
+    const href = new URL(url, base).href;
+    return /^https?:/.test(href) ? href : null;
+  } catch {
+    return null;
+  }
+}
 
 function hostOf(url) {
   try {
@@ -740,6 +905,30 @@ function bounded(signal, ms) {
   };
 }
 
+/**
+ * An instance's JSON answer, whatever status it came with.
+ *
+ * Invidious and Piped give their reason in the body: Invidious's videos.cr
+ * answers a private video with 500 {"error": "This video is private"}. A
+ * reader that stops at the status never hears it — the row blamed the
+ * instances, and a refusal that is the same everywhere was asked of every
+ * replica. A body with an `error` goes back for the caller to judge; any
+ * other answer that is not JSON from a 2xx is the instance not answering.
+ */
+async function instanceAnswer(net, url, signal) {
+  const response = await net.request(url, { signal });
+  let body = null;
+  try {
+    body = await response.json();
+  } catch (error) {
+    if (signal?.aborted) throw error;
+  }
+  if (body?.error) return body;
+  if (!response.ok) throw new BackendError(`${new URL(url).host} answered ${response.status}.`);
+  if (!body) throw new BackendError(`${new URL(url).host} answered with something other than JSON.`);
+  return body;
+}
+
 /* -------------------------------------------------------------------- piped */
 
 /**
@@ -789,16 +978,29 @@ export function pipedFormats(body) {
   return [...video, ...audio].filter((format) => format.url);
 }
 
-/** The subtitle tracks a Piped instance lists, in the shape the job runner embeds. */
+/**
+ * The subtitle tracks a Piped instance lists, in the shape the job runner embeds.
+ *
+ * Piped lists YouTube's captions as TTML — NewPipe's default, which it takes
+ * them from — and ffmpeg has no TTML reader to embed them with. The URL is
+ * YouTube's timedtext, proxied, which names its format in `fmt` and answers
+ * WebVTT when asked for `vtt`, so that is what is asked for. A track with no
+ * such parameter stays what it says it is; the runner embeds only WebVTT.
+ */
 export function pipedSubtitles(body) {
   return (body.subtitles || [])
     .filter((track) => track && track.url)
-    .map((track) => ({
-      lang: track.code || track.name || '',
-      ext: 'vtt',
-      url: track.url,
-      auto: Boolean(track.autoGenerated),
-    }));
+    .map((track) => {
+      const asked = /([?&]fmt=)ttml(?=&|$)/;
+      const url = asked.test(track.url) ? track.url.replace(asked, '$1vtt') : track.url;
+      const ttml = url === track.url && /ttml/i.test(String(track.mimeType || ''));
+      return {
+        lang: track.code || track.name || '',
+        ext: ttml ? 'ttml' : 'vtt',
+        url,
+        auto: Boolean(track.autoGenerated),
+      };
+    });
 }
 
 /**
@@ -828,7 +1030,7 @@ async function extractPiped(id, url, context) {
   let body;
   const bound = bounded(context.signal, context.instanceTimeout ?? INSTANCE_TIMEOUT_MS);
   try {
-    body = await context.net.json(`${base}/streams/${encodeURIComponent(id)}`, { signal: bound.signal });
+    body = await instanceAnswer(context.net, `${base}/streams/${encodeURIComponent(id)}`, bound.signal);
   } catch (error) {
     bound.release();
     if (context.signal?.aborted) throw error;
@@ -838,8 +1040,12 @@ async function extractPiped(id, url, context) {
   }
   bound.release();
   if (body?.error) {
-    throw new BackendError(`The Piped instance says: ${String(body.error).slice(0, 160)}`, {
-      hint: 'That is YouTube refusing the instance, not this app. Try another instance, a relay, or your own server.',
+    const reason = String(body.error).slice(0, 160);
+    throw new BackendError(`The Piped instance says: ${reason}`, {
+      hint: ABOUT_THE_VIDEO.test(reason)
+        ? 'That is about the video, and no instance will answer differently.'
+        : 'That is YouTube refusing the instance, not this app. Try another instance, a relay, or your own server.',
+      retryable: !ABOUT_THE_VIDEO.test(reason),
     });
   }
   const formats = pipedFormats(body);
@@ -1017,7 +1223,7 @@ async function extractInvidious(id, url, context) {
   try {
     // `local=true` is the whole point: without it the URLs are googlevideo's
     // own, and those refuse a page before the first byte.
-    body = await context.net.json(`${base}/api/v1/videos/${encodeURIComponent(id)}?local=true`, { signal: bound.signal });
+    body = await instanceAnswer(context.net, `${base}/api/v1/videos/${encodeURIComponent(id)}?local=true`, bound.signal);
   } catch (error) {
     bound.release();
     // The person cancelling is not the instance failing.
@@ -1078,6 +1284,23 @@ const better = (a, b) =>
 const betterAudio = (a, b) => (b.bitrate || 0) - (a.bitrate || 0) || (b.filesize || 0) - (a.filesize || 0);
 
 /**
+ * The rung of an HLS ladder to take the sound from when it has no audio-only
+ * one. Every segment is held in memory until ffmpeg has it, so the best rung
+ * would mean 45 MB a minute for half a megabyte of audio — and the soundtrack
+ * is normally the same all the way down. Only as far down as the top rung's
+ * audio codec goes, though: a ladder that drops to HE-AAC at the bottom has
+ * dropped its sound with it.
+ */
+function lightestHls(muxed) {
+  const ladder = muxed.filter((format) => format.protocol === 'hls');
+  if (ladder.length === 0) return null;
+  const audioCodec = (format) => (format.codecs || '').split(',').map((codec) => codec.trim()).find((codec) => AUDIO_CODEC.test(codec)) || '';
+  return ladder
+    .filter((format) => audioCodec(format) === audioCodec(ladder[0]))
+    .sort((a, b) => (a.bitrate || Infinity) - (b.bitrate || Infinity) || (a.height || 0) - (b.height || 0))[0];
+}
+
+/**
  * Decide what to download and what has to be done to it.
  *
  * The order of preference is not about quality alone: a single progressive
@@ -1099,9 +1322,14 @@ export function planDownload(extraction, preset) {
   const videoOnly = formats.filter((format) => format.kind === 'video').sort(better);
 
   if (preset === 'audio_mp3' || preset === 'audio_m4a') {
-    const source = audioOnly[0] || muxed[0] || videoOnly[0];
+    const source = audioOnly[0] || lightestHls(muxed) || muxed[0] || videoOnly[0];
     if (!source) throw new BackendError('That link has no audio to take.', { retryable: false });
     const wantM4a = preset === 'audio_m4a';
+    // An MP3 asked for as MP3 is already the file. Decoding and encoding it
+    // again would load the converter to make a second lossy copy of it.
+    if (!wantM4a && source.kind === 'audio' && source.protocol === 'progressive' && source.container === 'mp3') {
+      return { video: null, audio: source, ext: 'mp3', mime: 'audio/mpeg', op: 'raw' };
+    }
     // Re-encoding audio that is already AAC loses quality for nothing, so an
     // m4a request for an AAC source is a container change, not a conversion —
     // including when the AAC is sitting inside a muxed file, where dropping the
@@ -1127,8 +1355,17 @@ export function planDownload(extraction, preset) {
   const side = (format) => (format.width && format.height ? Math.min(format.width, format.height) : format.height);
   const fits = (format) => ceiling === null || !side(format) || side(format) <= ceiling;
 
-  const readyMade = muxed.filter(fits)[0] || null;
-  const bestVideo = videoOnly.filter(fits)[0] || videoOnly[videoOnly.length - 1] || null;
+  let readyMade = muxed.filter(fits)[0] || null;
+  let bestVideo = videoOnly.filter(fits)[0] || null;
+  // Nothing with a picture fits the ceiling: the smallest that has one is the
+  // nearest to what was asked. Only then — a sharper file that does not fit
+  // must not beat one that does, and audio alone "fits" any ceiling only
+  // because it has no height.
+  if (!readyMade && !bestVideo) {
+    const [lowMuxed, lowVideo] = [muxed[muxed.length - 1], videoOnly[videoOnly.length - 1]];
+    if (lowMuxed && (!lowVideo || side(lowMuxed) <= side(lowVideo))) readyMade = lowMuxed;
+    else bestVideo = lowVideo || null;
+  }
   const bestAudio = audioOnly[0] || null;
 
   // A muxed file is preferred when it is not obviously worse than the pair —
