@@ -71,6 +71,8 @@ function unreachable(error) {
 
 /* -------------------------------------------------------------- self-hosted */
 
+const POLL_TIMEOUT_MS = 15_000;
+
 export class ServerBackend {
   constructor({ base = '', key = '' } = {}) {
     // An empty base means "wherever this page came from", which is exactly the
@@ -163,8 +165,14 @@ export class ServerBackend {
     return { kind: 'job', id: job.id };
   }
 
+  /**
+   * A poll that has not answered in this long is a miss, like any other
+   * silence. Left to itself, on a network that swallows the packets, it
+   * waits out the system's own connect timeout: minutes of a row standing still.
+   */
   poll(id) {
-    return this.#json(`/api/jobs/${encodeURIComponent(id)}`);
+    const signal = typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(POLL_TIMEOUT_MS) : undefined;
+    return this.#json(`/api/jobs/${encodeURIComponent(id)}`, { signal });
   }
 
   /**

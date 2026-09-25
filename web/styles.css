@@ -443,6 +443,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
   line-height: 1.45;
 }
 .notice.error { border-color: var(--danger); background: var(--danger-wash); }
+.field-error { margin: 6px 0 0; font-size: 12.5px; line-height: 1.4; color: var(--danger); }
 .notice.error strong { color: var(--danger); }
 .notice p { margin: 0; }
 .notice p + p { margin-top: 6px; }

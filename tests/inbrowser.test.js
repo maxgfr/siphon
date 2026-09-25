@@ -92,3 +92,30 @@ test('a backend built over another keeps its jobs: saving settings does not orph
   }
   assert.equal(first.device.jobs.has(id), false, 'a cancel through the new backend stops it');
 });
+
+test('a list queued on this device without a probe says it is a list, not that it offered nothing', async () => {
+  // Your server's yt-dlp answers a playlist or a channel with the list and no
+  // formats. With a probe in hand the queue takes it one row each; queued
+  // without one — two lists pasted at once, a share — it reached the planner,
+  // which read the empty formats as a link with nothing to download.
+  const list = {
+    name: 'server',
+    generic: true,
+    resolve: async () => ({
+      title: 'A list',
+      extractor: 'youtube:tab',
+      formats: [],
+      playlist: { count: 2, limit: 2, entries: [{ url: 'https://www.youtube.com/watch?v=aaaaaaaaaaa', title: 'One' }, { url: 'https://www.youtube.com/watch?v=bbbbbbbbbbb', title: 'Two' }] },
+    }),
+  };
+  const backend = new BrowserBackend({ resolvers: [list] });
+  const { id } = await backend.start('https://www.youtube.com/playlist?list=PLxxxxxxxxxxxxxxxx', 'video_best');
+  let state = await backend.poll(id);
+  for (let tries = 0; state.state === 'running' && tries < 50; tries += 1) {
+    await sleep(20);
+    state = await backend.poll(id);
+  }
+  assert.equal(state.state, 'error');
+  assert.match(String(state.error), /is a list/);
+  assert.doesNotMatch(String(state.error), /no downloadable formats/);
+});

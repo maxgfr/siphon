@@ -231,6 +231,8 @@
           <input type="text" id="optClipEnd" inputmode="text" spellcheck="false" autocapitalize="off" autocorrect="off" placeholder="to 1:30" />
         </div>
         <p class="hint">As <code>1:23</code> or <code>01:02:03</code>. Leave both empty for the whole video.</p>
+        <!-- Why Save refused an option; moved under the field it is about. -->
+        <p class="field-error" id="ytdlpError" role="alert" hidden></p>
 
         <label class="lbl" for="optRate">Speed limit <span style="font-weight:400;color:var(--muted)">— optional</span></label>
         <input type="text" id="optRate" inputmode="text" spellcheck="false" autocapitalize="off" placeholder="e.g. 2M" />

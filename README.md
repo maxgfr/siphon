@@ -115,8 +115,10 @@ is one script that runs only on siphon's page and fetches on its behalf, so
 every extractor already here — direct, HLS, pages, YouTube through
 youtubei.js — works on hosts that refuse the page. Install it once, from
 that link: the manager opens its install page for it, and checks the same
-address for updates. The app then uses it automatically, ahead of any
-helper. Desktop Chrome and Firefox, and Firefox for Android. In Chrome, open
+address for updates. The app then uses it automatically: for hosts that
+refuse the page, ahead of any relay, and for YouTube once the helper has not
+answered; beside your own server with ffmpeg, which does all of it, only
+when that server cannot be reached. Desktop Chrome and Firefox, and Firefox for Android. In Chrome, open
 the manager's extension details and turn on **Allow User Scripts** as well:
 until it is on, Chrome runs no userscript at all, and the page carries on
 as if there were no bridge. It runs on your IP, which YouTube treats far
@@ -451,9 +453,10 @@ that are yours: the bridge, the relay, the server.
   included. The list holds 20 rows: the oldest finished one makes room for a
   new one, never one still running. Saving settings, a new helper included,
   leaves a running download to finish. More links than your server takes at
-  once wait their turn rather than fail. Closing or reloading the page while
-  a download runs on this device asks first, where the browser allows it:
-  that download lives in the tab. A row changes in place as it moves,
+  once wait their turn rather than fail, and a reload puts them back in line.
+  Closing or reloading the page while a download runs on this device, or
+  while links wait for your server, asks first, where the browser allows it:
+  those live in the tab. A row changes in place as it moves,
   so a keyboard or a finger on its button stays there, and a screen reader
   is told when a download is ready or has failed.
 - **Away from your server.** With your own server set and out of reach —
@@ -461,7 +464,9 @@ that are yours: the bridge, the relay, the server.
   downloaded on it instead, and its row says so.
 - **Several links at once.** Paste a whole list, drop a selection of links on
   the page, or share a message full of them: each becomes its own row, in
-  order, at the quality chosen. `Ctrl+V` with nothing focused lands in the
+  order, at the quality chosen. A shared message waits for one tap on
+  **Queue these links** first, since a share is only a link to the page and
+  any site could open one; it offers 20 at most. `Ctrl+V` with nothing focused lands in the
   field too, and "Title https://…" from a share — pasted into the field, or
   put in whole by the keyboard — becomes just the link.
 - **Send to siphon.** A bookmarklet in the guide: drag it to the bookmarks

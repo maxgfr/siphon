@@ -514,7 +514,7 @@ function serveSiphon(port) {
  * how long a job runs and how many it takes at once are the test's to set;
  * what it was asked is kept.
  */
-const full = { posts: [], files: 0, rtt: 0, jobMs: 1000, busyOver: Infinity, failPlaylistOnce: false, jobs: new Map(), cookies: false };
+const full = { posts: [], files: 0, rtt: 0, jobMs: 1000, busyOver: Infinity, failPlaylistOnce: false, hangNext: false, hung: [], jobs: new Map(), cookies: false };
 
 function serveFull(port) {
   const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS', 'Access-Control-Expose-Headers': '*' };
@@ -553,7 +553,9 @@ function serveFull(port) {
       const failed = body.playlist === true && full.failPlaylistOnce;
       if (failed) full.failPlaylistOnce = false;
       const id = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
-      full.jobs.set(id, { created: Date.now(), ms: full.jobMs, failed, playlist: body.playlist === true });
+      // The next job's polls go unanswered, as on a network that swallows them.
+      full.jobs.set(id, { created: Date.now(), ms: full.jobMs, failed, playlist: body.playlist === true, hang: full.hangNext });
+      full.hangNext = false;
       return json(response, 200, { id });
     }
     const asked = /^\/api\/jobs\/(\w+)(\/file)?$/.exec(url.pathname);
@@ -569,6 +571,7 @@ function serveFull(port) {
       const bytes = Buffer.alloc(1000, 7);
       return response.writeHead(200, { ...cors, 'Content-Type': 'application/octet-stream', 'Content-Length': bytes.length, 'Content-Disposition': `attachment; filename="${name}"` }).end(bytes);
     }
+    if (job.hang) return full.hung.push(response);
     await new Promise((resolve) => setTimeout(resolve, full.rtt));
     if (job.failed) return json(response, 200, { id: asked[1], state: 'error', stage: 'failed', progress: 0, error: 'HTTP Error 404: Not Found' });
     const done = Date.now() - job.created >= job.ms;
@@ -873,7 +876,9 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   }
 }
 
-/* A message with several links, shared into the app: each becomes its own row. */
+/* A message with several links, shared into the app: one tap queues them,
+   each its own row. A share is a plain link to the page, which any site can
+   open — so nothing starts until that tap. */
 {
   await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
   await page.evaluate(() => localStorage.removeItem('siphon:queue'));
@@ -882,10 +887,16 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   page.on('download', collect);
   const message = `Two clips: ${MEDIA}/media/clip.mp4 and ${MEDIA}/media/song.mp3`;
   await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html?text=${encodeURIComponent(message)}`, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(2000);
+  const early = await page.locator('#queueList li').count();
+  const offer = (await page.locator('#queueShared').textContent().catch(() => '')) || '';
+  check('a shared message with two links starts nothing on its own, and offers to queue them', early === 0 && landed.length === 0 && /2 links/.test(offer),
+    `${early} rows, ${landed.length} downloads; ${offer.trim() || 'no offer'}`);
+  await page.click('#queueShared');
   await page.waitForFunction(() => document.querySelectorAll('#queueList li').length === 2, null, { timeout: 15_000 }).catch(() => {});
   const rows = await page.locator('#queueList li').count();
   const said = (await page.textContent('#feedback')) || '';
-  check('a shared message with two links is two rows', rows === 2 && /2 links queued/.test(said), `${rows} rows; ${said.trim()}`);
+  check('and a tap makes them two rows', rows === 2 && /2 links queued/.test(said), `${rows} rows; ${said.trim()}`);
   const deadline = Date.now() + 60_000;
   while (landed.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 250));
   page.off('download', collect);
@@ -919,26 +930,24 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   check('leaving the page while a download runs on this device asks first, and only then', !idle && busy && !after, `idle ${idle}, running ${busy}, cancelled ${after}`);
 }
 
-/* The Advanced options are checked before they are saved. */
+/* The Advanced options are your server's. With no server to apply them they
+   are kept as they are, greyed, and never stand between you and a Save. */
 {
   await page.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
   await page.click('#openSettings');
   await page.click('#advanced summary');
-  await page.fill('#optClipStart', 'abc');
+  // A pair the server would refuse, as an older version saved it: greyed,
+  // the fields take no tap to change it.
+  await page.evaluate(() => {
+    document.getElementById('optSponsor').checked = true;
+    document.getElementById('optClipStart').value = '1:00';
+  });
   await page.click('#saveSettings');
-  await page.waitForTimeout(500);
+  await page.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 10_000 }).catch(() => {});
   const open = await page.evaluate(() => document.getElementById('settings').open);
-  const said = (await page.textContent('#statusText')) || '';
-  const focused = await page.evaluate(() => document.activeElement?.id);
-  check('a clip time that is not one keeps the sheet open, and says so beside it', open && /Clip times look like/.test(said) && focused === 'optClipStart', `${open ? 'open' : 'closed'}; ${said}; focus on ${focused}`);
-  await page.fill('#optClipStart', '0:05');
-  await page.fill('#optClipEnd', '0:02');
-  await page.click('#saveSettings');
-  await page.waitForTimeout(500);
-  check('and so does a clip that ends before it starts', /end after it starts/.test((await page.textContent('#statusText')) || '') && await page.evaluate(() => document.getElementById('settings').open));
-  await page.fill('#optClipStart', '');
-  await page.fill('#optClipEnd', '');
-  await page.click('#closeSettings');
+  const kept = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:settings')).ytdlp);
+  check('with no server to apply them, the Advanced options never hold up a Save, and are kept as typed', !open && kept?.sponsorblock === true && kept?.clipStart === '1:00',
+    `${open ? 'open' : 'closed'}; ${JSON.stringify(kept)}`);
 }
 
 /* A progressive MP4 that already meets the preset: no conversion at all. */
@@ -1469,7 +1478,35 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   await tab.waitForFunction(() => !/checking/i.test(document.getElementById('statusText').textContent || ''), null, { timeout: 20_000 });
   const box = await tab.locator('#statusText').boundingBox();
   const said = (await tab.textContent('#statusText')) || '';
-  check('on a phone, what "Use this computer" found is on screen', box && box.y >= 0 && box.y + box.height <= 664, `${box ? `${Math.round(box.y)}..${Math.round(box.y + box.height)} of 664` : 'no box'}: ${said.slice(0, 60)}`);
+  // Scrolled to the nearest edge, the line lands flush with the foot of the
+  // sheet, give or take the browser rounding the scroll to a whole pixel.
+  check('on a phone, what "Use this computer" found is on screen', box && box.y >= 0 && box.y + box.height <= 664 + 1, `${box ? `${Math.round(box.y)}..${Math.round(box.y + box.height)} of 664` : 'no box'}: ${said.slice(0, 60)}`);
+  await phone.close();
+}
+
+/* On a phone, an Advanced option your server would refuse is said beside it,
+   in view, not in the status line at the sheet's foot. */
+{
+  const phone = await browser.newContext({ viewport: { width: 390, height: 664 }, isMobile: true, hasTouch: true });
+  await phone.addInitScript((endpoint) => {
+    localStorage.setItem('siphon:settings', JSON.stringify({
+      endpoint, key: '', helper: { kind: 'siphon', label: 'yt-dlp 2026.09.01', ffmpeg: true, keyAccepted: true, hasCookies: false, capabilities: ['jobs', 'resolve', 'tunnel'] },
+      preset: 'video_best', subs: 'off',
+    }));
+    localStorage.setItem('siphon:install-dismissed', '1');
+    localStorage.setItem('siphon:tour-seen', '1');
+  }, FULL);
+  const tab = await phone.newPage();
+  await tab.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await tab.click('#openSettings');
+  await tab.click('#advanced summary');
+  await tab.fill('#optClipStart', '1:99');
+  await tab.click('#saveSettings');
+  await tab.waitForFunction(() => document.getElementById('ytdlpError').textContent, null, { timeout: 10_000 }).catch(() => {});
+  const box = await tab.locator('#ytdlpError').boundingBox();
+  const said = (await tab.textContent('#ytdlpError')) || '';
+  check('on a phone, an Advanced option your server would refuse is said in view, beside it', box && box.y >= 0 && box.y + box.height <= 664 && /Clip times look like/.test(said),
+    `${box ? `${Math.round(box.y)}..${Math.round(box.y + box.height)} of 664` : 'no box'}: ${said.slice(0, 60)}`);
   await phone.close();
 }
 
@@ -1514,6 +1551,9 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   tab.on('pageerror', (error) => errors.push(error.message));
   const handed = [];
   tab.on('download', (event) => handed.push(event.suggestedFilename()));
+  // A reload while a link waits for room asks first; the checks that reload
+  // on purpose say yes.
+  tab.on('dialog', (dialog) => dialog.accept());
   const fresh = async () => {
     await tab.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
     await tab.evaluate(() => localStorage.removeItem('siphon:queue'));
@@ -1535,6 +1575,20 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   await tab.waitForTimeout(3000);
   check('on a slow connection a finished download is saved once, not once per poll that was waiting', handed.length === 1 && full.files === 1, `${handed.length} handed over, ${full.files} fetched`);
   full.rtt = 0;
+
+  // A poll your server never answers holds up its own row and no other: the
+  // next one is still followed, and its file handed over.
+  await fresh();
+  Object.assign(full, { jobMs: 1000, hangNext: true });
+  await tab.evaluate((links) => {
+    const dt = new DataTransfer();
+    dt.setData('text/plain', links.join('\n'));
+    document.getElementById('url').dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+  }, [`${MEDIA}/media/stuck.mp4`, `${MEDIA}/media/clip.mp4`]);
+  const handedBy = Date.now() + 6000;
+  while (handed.length === 0 && Date.now() < handedBy) await tab.waitForTimeout(250);
+  check('a poll that never answers holds up only its own row: the next one is still handed over', handed.length === 1, `${handed.length} handed over`);
+  for (const response of full.hung.splice(0)) response.destroy();
 
   // "All" of a list is one row on your server; trying it again asks for the
   // list again, after a reload too.
@@ -1565,13 +1619,58 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   await tab.waitForFunction(() => document.querySelectorAll('#queueList li').length === 5, null, { timeout: 15_000 }).catch(() => {});
   await tab.waitForTimeout(500);
   const waiting = (await tab.textContent('#queueList')) || '';
+  // They live in this tab until your server takes them: leaving asks first,
+  // and a reload puts them back in line rather than dropping them.
+  const asks = await tab.evaluate(() => {
+    const event = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
+  await tab.reload({ waitUntil: 'networkidle' });
   await settled(5);
   const states = await tab.$$eval('#queueList li', (rows) => rows.map((row) => row.dataset.state));
   const text = (await tab.textContent('#queueList')) || '';
   check('five links pasted to a server that takes two at a time all finish, none refused', states.length === 5 && states.every((state) => state === 'done') && !/Too many downloads/.test(text),
     `${states.join(', ')}; ${full.posts.length} asks`);
   check('and the ones waiting say so', /Waiting for your server/.test(waiting), waiting.replace(/\s+/g, ' ').slice(0, 90));
+  check('leaving while they wait asks first, and a reload keeps them in line, not interrupted', asks && !/Interrupted/.test(text), `asks ${asks}; ${text.replace(/\s+/g, ' ').slice(0, 90)}`);
   full.busyOver = Infinity;
+
+  // The Advanced options on your server, which applies them: checked on Save
+  // the way it reads them, and the reason is beside the field.
+  await fresh();
+  await tab.click('#openSettings');
+  await tab.click('#advanced summary');
+  await tab.fill('#optClipStart', 'abc');
+  await tab.click('#saveSettings');
+  await tab.waitForFunction(() => document.getElementById('ytdlpError').textContent, null, { timeout: 10_000 }).catch(() => {});
+  const beside = {
+    open: await tab.evaluate(() => document.getElementById('settings').open),
+    said: (await tab.textContent('#ytdlpError')) || '',
+    shown: await tab.isVisible('#ytdlpError'),
+    focused: await tab.evaluate(() => document.activeElement?.id),
+    invalid: await tab.getAttribute('#optClipStart', 'aria-invalid'),
+  };
+  check('a clip time that is not one keeps the sheet open, and says so beside it', beside.open && beside.shown && /Clip times look like/.test(beside.said) && beside.focused === 'optClipStart' && beside.invalid === 'true',
+    JSON.stringify(beside));
+  await tab.fill('#optClipStart', '0:05');
+  check('and the reason goes as the field is changed', !(await tab.isVisible('#ytdlpError')) && (await tab.getAttribute('#optClipStart', 'aria-invalid')) === null);
+  await tab.fill('#optClipEnd', '0:02');
+  await tab.click('#saveSettings');
+  await tab.waitForFunction(() => document.getElementById('ytdlpError').textContent, null, { timeout: 10_000 }).catch(() => {});
+  check('and so does a clip that ends before it starts', /end after it starts/.test((await tab.textContent('#ytdlpError')) || '') && await tab.evaluate(() => document.getElementById('settings').open));
+  await tab.fill('#optClipStart', '');
+  await tab.fill('#optClipEnd', '');
+  await tab.click('#closeSettings');
+
+  // The bridge, beside a server that does everything, is where this device
+  // turns when the server cannot be reached — not something used ahead of it.
+  await tab.evaluate(() => window.postMessage({ siphon: 'ready', version: '1.2.0' }, '*'));
+  await tab.waitForFunction(() => !/checking/i.test(document.getElementById('backendLabel').textContent || ''), null, { timeout: 10_000 }).catch(() => {});
+  await tab.click('#openSettings');
+  const bridged = (await tab.textContent('#statusText')) || '';
+  check('with your server doing everything, the bridge is said to be for when it cannot be reached, not used first', /bridge \(1\.2\.0\)/.test(bridged) && !/used first/.test(bridged) && /cannot be reached/.test(bridged), bridged.slice(0, 160));
+  await tab.click('#closeSettings');
 
   // Cookies uploaded, the sheet closed and opened again: they are still there.
   await fresh();
