@@ -223,6 +223,16 @@ async function runJob(backend, job) {
   if (info.isLive) {
     throw new BackendError('That is a live stream, which has no end to download to.', { retryable: false });
   }
+  // A playlist or a channel, as your server's yt-dlp reads it: the list, and
+  // no formats of its own. The queue takes it a row per video when it has a
+  // probe of it; queued without one — two lists pasted at once, a share —
+  // it arrives here, and "no downloadable formats" was the wrong reason.
+  if (info.playlist && !(info.formats || []).length) {
+    throw new BackendError('That link is a list, not one video.', {
+      hint: 'Paste it on its own to choose its first video or all of them.',
+      retryable: false,
+    });
+  }
 
   const plan = planDownload(info, job.preset);
   const resolve = info.resolve || ((format) => format.url);

@@ -427,10 +427,11 @@ function saveQueue() {
   try {
     // Only what is needed to redraw a row and re-find the file on the server.
     // The cap is on finished rows; one still running is kept whatever its place.
+    // A row waiting for room on your server says so, to be put back in line.
     localStorage.setItem(
       QUEUE_KEY,
-      JSON.stringify(queue.filter((entry, index) => index < QUEUE_MAX || isActive(entry)).map(({ key, id, url, title, preset, playlist, state, error, filename }) => ({
-        key, id, url, title, preset, playlist, state, error, filename,
+      JSON.stringify(queue.filter((entry, index) => index < QUEUE_MAX || isActive(entry)).map(({ key, id, url, title, preset, playlist, state, stage, error, filename }) => ({
+        key, id, url, title, preset, playlist, state, error, filename, stage: stage === 'waiting' ? stage : undefined,
       }))),
     );
   } catch {
@@ -583,12 +584,12 @@ function renderQueue() {
 }
 
 /**
- * Whether a download lives in this tab: one on this device, or one about to
- * be. A reload or a closed tab ends it, and the row comes back
- * "Interrupted"; a server's goes on without the page.
+ * Whether a download lives in this tab: one on this device, or one not yet
+ * handed to anyone — being identified, or waiting for room on your server.
+ * A reload or a closed tab ends it; a server's goes on without the page.
  */
 const inThisTab = () =>
-  queue.some((entry) => isActive(entry) && (String(entry.id || '').startsWith('b-') || (!entry.id && !backend?.full)));
+  queue.some((entry) => isActive(entry) && (!entry.id || String(entry.id).startsWith('b-')));
 
 /** Ask before a reload or a closed tab throws a download on this device away. */
 function guardUnload(event) {
@@ -730,6 +731,7 @@ async function startEntry(entry) {
       // were all queued. They wait, and start as the others finish.
       entry.stage = 'waiting';
       setTimeout(() => startEntry(entry), BUSY_RETRY_MS);
+      saveQueue();
       renderQueue();
       return;
     }
@@ -765,33 +767,26 @@ function startPolling() {
 }
 
 /**
- * One round of polls at a time. The timer does not wait for the last round,
- * and on mobile data a round takes longer than the interval: the rounds
- * piled up, every one waiting when the job finished saw it done, and each
- * handed the file over again — the same download saved two, or sixteen, times.
+ * One poll of a row at a time. The timer does not wait for the last answer,
+ * and on mobile data one takes longer than the interval: the polls piled
+ * up, every one waiting when the job finished saw it done, and each handed
+ * the file over again — the same download saved two, or sixteen, times.
+ * The wait is each row's own: a poll that never answers holds up its row,
+ * not every other one, a download on this device included.
  */
-let polling = false;
-
 async function pollAll() {
-  if (polling) return;
-  polling = true;
-  try {
-    await pollOnce();
-  } finally {
-    polling = false;
-  }
-}
-
-async function pollOnce() {
   const active = queue.filter((entry) => entry.id && (entry.state === 'running' || entry.state === 'starting'));
   if (active.length === 0) {
     clearInterval(pollTimer);
     pollTimer = null;
     return;
   }
+  const due = active.filter((entry) => !entry.polling);
+  if (due.length === 0) return;
 
   await Promise.all(
-    active.map(async (entry) => {
+    due.map(async (entry) => {
+      entry.polling = true;
       try {
         const job = await backend.poll(entry.id);
         // Cancelled, or settled, while the answer was on its way.
@@ -833,6 +828,8 @@ async function pollOnce() {
         if (!final && entry.misses < POLL_MISSES) return;
         entry.state = 'error';
         entry.error = error instanceof BackendError ? error.message : 'Lost contact with the server.';
+      } finally {
+        entry.polling = false;
       }
     }),
   );
@@ -876,9 +873,16 @@ async function restoreQueue() {
   if (queue.length === 0) return;
   renderQueue();
 
+  // Rows that were waiting for room on your server, which never saw them:
+  // they go back in line.
+  const waiting = [];
   await Promise.all(
     queue.map(async (entry) => {
       if (!entry.id) {
+        if (entry.state === 'starting' && entry.stage === 'waiting' && backend?.full) {
+          waiting.push(entry);
+          return;
+        }
         // Saved while it was still being identified: no job was started, and
         // nothing would ever report on it. Try again is the way on.
         if (entry.state === 'starting') {
@@ -909,6 +913,7 @@ async function restoreQueue() {
   saveQueue();
   renderQueue();
   if (queue.some((entry) => entry.state === 'running')) startPolling();
+  for (const entry of waiting) startEntry(entry);
 }
 
 /* ------------------------------------------------------------------ backend */
@@ -1003,6 +1008,7 @@ function openSettings() {
   // What the last upload said is not what is stored now; the state beside
   // the heading is.
   $('cookiesResult').textContent = '';
+  showYtdlpProblem(null);
   reflectHelper(settings.helper, settings.endpoint);
   renderSuggested();
   $('settings').showModal();
@@ -1019,6 +1025,34 @@ function readYtdlp() {
   };
 }
 
+/** Whether the yt-dlp options are used: only your own server with ffmpeg makes the download. */
+const appliesYtdlp = (helper) => helper?.kind === 'siphon' && helper.ffmpeg !== false;
+
+/**
+ * Say why Save refused an option, under the field it is about, where the eye
+ * already is — the status line sits at the sheet's foot, off-screen on a
+ * phone. null takes the reason away.
+ */
+function showYtdlpProblem(problem) {
+  const said = $('ytdlpError');
+  for (const field of document.querySelectorAll('#ytdlpBlock [aria-invalid]')) {
+    field.removeAttribute('aria-invalid');
+    field.removeAttribute('aria-describedby');
+  }
+  said.hidden = !problem;
+  said.textContent = problem ? problem.message : '';
+  if (!problem) return;
+  const field = $(problem.field);
+  // Below the field's own row: the clip's two boxes share one, the checkbox
+  // sits in its label.
+  (field.parentElement.id === 'ytdlpBlock' ? field : field.parentElement).after(said);
+  field.setAttribute('aria-invalid', 'true');
+  field.setAttribute('aria-describedby', 'ytdlpError');
+  $('advanced').open = true;
+  field.focus();
+  said.scrollIntoView?.({ block: 'nearest' });
+}
+
 /**
  * Say what the yt-dlp options apply to. They are your own server's — yt-dlp
  * runs there — so with any other helper they wait, greyed but kept.
@@ -1027,7 +1061,7 @@ function scopeYtdlp(helper) {
   // A server without ffmpeg only resolves: this device downloads, and has no
   // yt-dlp to hand a clip or a speed limit to.
   const thin = helper?.kind === 'siphon' && helper.ffmpeg === false;
-  const yours = helper?.kind === 'siphon' && !thin;
+  const yours = appliesYtdlp(helper);
   $('ytdlpBlock').classList.toggle('off', !yours);
   $('ytdlpScope').textContent = yours
     ? 'Applied by your server, which runs yt-dlp, to every download it makes.'
@@ -1106,7 +1140,7 @@ function reflectHelper(helper, address = '') {
     scopeYtdlp(null);
     return;
   }
-  // The bridge goes first whatever the helper, and is named with it.
+  // The bridge is named with the helper, for what it does beside it.
   const bridge = backend?.hasBridge ? bridgeSentence(helper) : '';
   const text = helper.kind === 'none' && bridge ? bridge : [describeEndpoint(helper), bridge].filter(Boolean).join(' ');
   setStatus(helper.kind === 'none' && !bridge ? '' : 'ok', named(host, text));
@@ -1119,12 +1153,18 @@ function reflectHelper(helper, address = '') {
 
 const named = (host, text) => (host ? `${host} — ${text}` : text);
 
-/** What the settings say about the bridge, which is used ahead of any helper. */
+/**
+ * What the settings say about the bridge. It carries the hosts that refuse
+ * this page, ahead of any relay or tunnel; YouTube asks the helper first and
+ * the bridge last; and your server with ffmpeg does all of it, so there the
+ * bridge is for when that server cannot be reached.
+ */
 function bridgeSentence(helper) {
   const bridge = `the bridge${backend?.bridgeVersion ? ` (${backend.bridgeVersion})` : ''}`;
-  return helper.kind === 'none'
-    ? `Nothing set, and ${bridge} is installed: YouTube and hosts that refuse a page go through it, from this device.`
-    : `${bridge[0].toUpperCase()}${bridge.slice(1)} is installed too, and is used first.`;
+  const Bridge = `${bridge[0].toUpperCase()}${bridge.slice(1)}`;
+  if (helper.kind === 'none') return `Nothing set, and ${bridge} is installed: YouTube and hosts that refuse a page go through it, from this device.`;
+  if (appliesYtdlp(helper)) return `${Bridge} is installed too, for when your server cannot be reached.`;
+  return `${Bridge} is installed too: hosts that refuse a page go through it, and YouTube when nothing else answers for it.`;
 }
 
 function setStatus(kind, text) {
@@ -1436,6 +1476,29 @@ async function enqueueMany(links) {
   for (const link of links) await enqueue(link);
 }
 
+/** The most links one share offers to queue. */
+const SHARED_MAX = 20;
+
+/**
+ * Offer the links of a shared message, to be queued with one tap.
+ *
+ * A share arrives as a plain link to this page — ?text=… — and any site can
+ * open one. Queued on arrival, a page you happened to visit started
+ * downloads of its choosing on your server, with its key, and saved every
+ * file to this device. A single shared link only fills the field; several
+ * wait for the tap that says they are yours.
+ */
+function offerShared(links) {
+  const kept = links.slice(0, SHARED_MAX);
+  renderFeedback(
+    '<div class="notice">' +
+      `<p>${kept.length} shared links.</p>` +
+      `<p><button type="button" class="chip-btn" id="queueShared">Queue these ${kept.length} links</button></p>` +
+      '</div>',
+  );
+  $('queueShared').addEventListener('click', () => enqueueMany(kept), { once: true });
+}
+
 /** Put one link in the field, as if typed. */
 function fillUrl(value) {
   const input = $('url');
@@ -1637,21 +1700,26 @@ function init() {
     }
   });
 
+  // The reason goes as the field it is about is changed.
+  for (const id of ['optSponsor', 'optClipStart', 'optClipEnd', 'optRate']) {
+    $(id).addEventListener(id === 'optSponsor' ? 'change' : 'input', () => showYtdlpProblem(null));
+  }
   $('testConnection').addEventListener('click', testConnection);
   $('saveSettings').addEventListener('click', async () => {
-    // The Advanced options are read the way your server reads them. Saved
-    // as typed, a slip failed every later download, far from where it was made.
-    const problem = validateYtdlp(readYtdlp());
-    if (problem) {
-      $('advanced').open = true;
-      setStatus('bad', `Advanced: ${problem.message}`);
-      $(problem.field).focus();
-      return;
-    }
+    showYtdlpProblem(null);
     // Saving is what settles what the address is; an address that cannot be
     // reached is not saved, and the reason stays on screen.
     const helper = await probeDraft();
     if (!helper) return;
+    // The Advanced options are read the way your server reads them. Saved
+    // as typed, a slip failed every later download, far from where it was
+    // made. With any other helper they do nothing, greyed where no finger
+    // can change them, and are kept as they are.
+    const problem = appliesYtdlp(helper) ? validateYtdlp(readYtdlp()) : null;
+    if (problem) {
+      showYtdlpProblem(problem);
+      return;
+    }
     settings = { ...draftSettings(), helper };
     saveSettings();
     applyBackend();
@@ -1664,8 +1732,8 @@ function init() {
     scheduleProbe();
   });
 
-  // One shared link fills the field; a message with several queues them all,
-  // as a paste does, once the queue is back and the helper settled.
+  // One shared link fills the field; a message with several offers to queue
+  // them all, once the queue is back and the helper settled.
   const shared = readSharedLinks();
   if (shared.length === 1) {
     urlInput.value = shared[0];
@@ -1710,7 +1778,7 @@ async function boot(firstVisit, shared = []) {
   }
   await restoreQueue();
   // After the restore, which puts back the saved rows in place of these.
-  if (shared.length) enqueueMany(shared);
+  if (shared.length) offerShared(shared);
   refreshBackendLabel();
   setupTour();
   // The site's own relay, if the owner set one up — and nothing else: no
