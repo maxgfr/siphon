@@ -561,6 +561,9 @@ class Job:
     clip_end: float | None = None
     rate_limit: int | None = None
     yt_client: str = ""
+    # Said beside a finished download: here, the videos of a playlist that
+    # did not make it into what is handed over.
+    note: str | None = None
     # Set by DELETE. The download thread checks it at every progress report
     # and stops there; without it, a cancelled job kept downloading into a
     # directory nothing would ever sweep.
@@ -588,6 +591,7 @@ class Job:
             "isPlaylist": self.is_playlist,
             "itemsDone": self.items_done,
             "itemsTotal": self.items_total,
+            "note": self.note,
         }
 
 
@@ -1459,6 +1463,8 @@ def _run_job(job: Job) -> None:
                         ydl.add_post_processor(step, when=when)
                     errors = _keep_errors(ydl)
                     refused = _keep_refusals(ydl)
+                    # How many videos the list had, for a playlist job.
+                    listed = 0
                     try:
                         info = ydl.extract_info(job.url, download=True)
                     except yt_dlp.utils.DownloadError:
@@ -1480,6 +1486,7 @@ def _run_job(job: Job) -> None:
                             # Name the job — and so the archive — after the
                             # playlist, not after whichever track happened to
                             # be first.
+                            listed = len(info.get("entries") or [])
                             job.title = info.get("title") or entries[0].get("title")
                             job.thumbnail = entries[0].get("thumbnail")
                             info = None
@@ -1514,6 +1521,17 @@ def _run_job(job: Job) -> None:
                 else:
                     chosen = files[0]
                 job.filename = chosen.name
+                if listed and errors:
+                    # ignoreerrors carried on past them, and the job was done
+                    # without a word: a playlist of seven came back as a zip of
+                    # five. A video whose download was refused is still in the
+                    # list yt-dlp returns, as if it had arrived, so the count
+                    # is of the errors it reported, one for each video it gave
+                    # up on.
+                    job.note = (
+                        f"{len(errors)} of the {max(listed, len(errors))} videos could not be downloaded: "
+                        f"{humanize_error(Exception(errors[-1]), job.url)}"
+                    )
                 # The progress hook counted the stream it fetched: the video an
                 # MP3 was made from, the last track of a zip. The row shows the
                 # file it hands over.

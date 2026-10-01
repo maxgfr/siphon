@@ -2337,6 +2337,13 @@ class TestWhatAJobHandsOver:
             '<meta property="og:video" content="/clip1.mp4" /><meta property="og:image" content="/thumb.jpg" />'
             "</head><body>video</body></html>"
         )
+        # A list with a video the host refuses, as YouTube refused two of a
+        # real playlist's seven with a 403.
+        (media / "gap.html").write_text(
+            "<!doctype html><html><head><title>One refused</title></head><body>"
+            '<video src="clip1.mp4"></video><video src="gone.mp4"></video>'
+            "</body></html>"
+        )
         monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", True)
         monkeypatch.setattr(server_app, "DOWNLOAD_ROOT", tmp_path / "jobs")
         (tmp_path / "jobs").mkdir()
@@ -2356,6 +2363,20 @@ class TestWhatAJobHandsOver:
         every = _run(f"{site}/three.html", is_playlist=True)
         with zipfile.ZipFile(every.directory / every.filename) as bundle:
             assert len(bundle.namelist()) == server_app.PLAYLIST_LIMIT
+        assert every.public()["note"] is None
+
+    def test_a_playlist_missing_a_video_says_so(self, site: str) -> None:
+        """
+        A playlist goes on past a video it cannot fetch, and then said nothing
+        about it: a real seven-track playlist came back as a zip of five,
+        marked done, and one with a single survivor as that file alone.
+        """
+        job = _run(f"{site}/gap.html", is_playlist=True)
+        assert job.state == "done", job.error
+        assert job.filename.endswith(".mp4"), job.filename
+        note = job.public()["note"]
+        assert note and note.startswith("1 of the 2 videos could not be downloaded"), note
+        assert "404" in note, note
 
     @pytest.mark.parametrize(("path", "preset", "playlist"), [
         ("/clip1.mp4", "audio_mp3", False),
