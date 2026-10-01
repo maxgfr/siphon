@@ -1200,6 +1200,44 @@ class TestJobOptions:
         with pytest.raises(ValueError, match="Unknown YouTube client"):
             server_app.check_yt_client("netscape")
 
+    @pytest.mark.parametrize(("preset", "video", "audio"), [
+        ("video_720", "136", "140-1"),
+        ("video_480", "135", "140-1"),
+        ("video_best", "401", "140-1"),
+    ])
+    def test_a_video_preset_picks_what_an_mp4_plays_everywhere(self, preset: str, video: str, audio: str) -> None:
+        """
+        yt-dlp's own order took AV1 and Opus at every height, which an older
+        iPhone or Mac does not play, and VP9 where no AV1 was offered, which
+        no QuickTime plays inside the .mp4 the job writes. At one height H.264
+        and AAC come first now; above 1080p, where YouTube has no H.264, AV1
+        before VP9, a direct file before HLS; the original soundtrack always.
+        """
+        def fmt(format_id: str, ext: str, vcodec: str, acodec: str, height: int | None = None, tbr: float = 1000, **extra: Any) -> dict:
+            return {"format_id": format_id, "url": f"https://rr1.googlevideo.com/{format_id}", "ext": ext, "vcodec": vcodec,
+                    "acodec": acodec, "height": height, "width": height and height * 16 // 9, "tbr": tbr, "protocol": "https", **extra}
+
+        formats = [
+            fmt("135", "mp4", "avc1.4d401f", "none", 480, 600),
+            fmt("397", "mp4", "av01.0.04M.08", "none", 480, 400),
+            fmt("244", "webm", "vp9", "none", 480, 700),
+            fmt("136", "mp4", "avc1.64001f", "none", 720, 1600),
+            fmt("398", "mp4", "av01.0.05M.08", "none", 720, 900),
+            fmt("609", "mp4", "vp09.00.31.08", "none", 720, 3000, protocol="m3u8_native"),
+            fmt("247", "webm", "vp9", "none", 720, 1100),
+            fmt("313", "webm", "vp9", "none", 2160, 9000),
+            fmt("625", "mp4", "vp09.00.51.08", "none", 2160, 12000, protocol="m3u8_native"),
+            fmt("401", "mp4", "av01.0.12M.08", "none", 2160, 7000),
+            fmt("140-0", "m4a", "none", "mp4a.40.2", tbr=132, language="en-US", language_preference=-1),
+            fmt("140-1", "m4a", "none", "mp4a.40.2", tbr=131, language="fr-FR", language_preference=10),
+            fmt("251-0", "webm", "none", "opus", tbr=140, language="en-US", language_preference=-1),
+            fmt("251-1", "webm", "none", "opus", tbr=139, language="fr-FR", language_preference=10),
+        ]
+        options = server_app.PRESETS[preset]["opts"]
+        with server_app.yt_dlp.YoutubeDL({"quiet": True, "simulate": True, "format": options["format"], "format_sort": options["format_sort"]}) as ydl:
+            picked = ydl.process_ie_result({"id": "x", "title": "x", "extractor": "youtube", "webpage_url": "https://www.youtube.com/watch?v=x", "formats": formats}, download=False)
+        assert [f["format_id"] for f in picked["requested_formats"]] == [video, audio]
+
     def test_sponsorblock_cuts_before_anything_else_touches_the_file(self) -> None:
         pps = server_app.build_options(self._job(sponsorblock=True), None)["postprocessors"]
         assert [pp["key"] for pp in pps[:2]] == ["SponsorBlock", "ModifyChapters"]
@@ -2338,6 +2376,22 @@ class TestEveryMediaExtension:
 
 
 @needs_ffmpeg
+@pytest.mark.parametrize(("title", "label"), [
+    ("Pourquoi la France DÉPEND secrètement de l’Auvergne", "Pourquoi la France DÉPEND secrètement de l’Auvergne"),
+    ("It's FAKE 😢 — Sound Test: FAIL", "It's FAKE 😢 — Sound Test FAIL"),
+    ('a/b\\c<d>e"f|g?h*i', "abcdefghi"),
+    ("  ..  ", "playlist"),
+    (None, "playlist"),
+])
+def test_an_archive_is_named_after_its_title_as_it_was_written(title: str | None, label: str) -> None:
+    """
+    Everything that was not a letter, a digit, a space, a dot or a dash was
+    dropped: "l’Auvergne" came back as "lAuvergne". Only what a file name
+    cannot hold, on any system the file may land on, goes now.
+    """
+    assert server_app.archive_label(title) == label
+
+
 class TestWhatAJobHandsOver:
     """
     What a job ends with, from real yt-dlp against a site on this machine:
@@ -2898,6 +2952,132 @@ class TestATunnelToAHostThatWantsWindows:
         client.post("/api/resolve", json={"url": "https://windowed.example/v/plain"})
         client.get("/api/tunnel", params={"url": host["url"]})
         assert host["asked"] == [None]
+
+
+# ---------------------------------------------- captions that roll up a line
+
+
+ROLLING = """1
+00:00:00,000 --> 00:00:02,230
+
+L'Auvergne n'a pas tiré le gros lot. Pas
+
+2
+00:00:02,230 --> 00:00:02,240
+L'Auvergne n'a pas tiré le gros lot. Pas
+
+
+3
+00:00:02,240 --> 00:00:04,150
+L'Auvergne n'a pas tiré le gros lot. Pas
+de littoral, pas de grande ville, pas de
+
+4
+00:00:04,150 --> 00:00:04,160
+de littoral, pas de grande ville, pas de
+
+
+5
+00:00:04,160 --> 00:00:06,030
+de littoral, pas de grande ville, pas de
+frontière avec un autre pays. Pendant
+"""
+
+
+def test_captions_that_roll_up_are_said_a_line_at_a_time(tmp_path: Path) -> None:
+    """
+    YouTube's machine captions roll up: each line is shown under the one
+    before, and again alone for ten milliseconds as it scrolls. Converted to
+    SubRip as they are, every line was in the file three times, the player
+    flashing a cue between each pair. A real 24-minute video's .srt had 1491.
+    """
+    path = tmp_path / "rolling.fr.srt"
+    path.write_text(ROLLING, encoding="utf-8")
+    server_app.tidy_roll_up(path)
+    assert path.read_text(encoding="utf-8") == (
+        "1\n00:00:00,000 --> 00:00:02,230\nL'Auvergne n'a pas tiré le gros lot. Pas\n\n"
+        "2\n00:00:02,240 --> 00:00:04,150\nde littoral, pas de grande ville, pas de\n\n"
+        "3\n00:00:04,160 --> 00:00:06,030\nfrontière avec un autre pays. Pendant\n"
+    )
+
+
+def test_written_subtitles_are_left_as_they_are(tmp_path: Path) -> None:
+    """Two-line cues that do not repeat each other are someone's writing, not a roll."""
+    written = (
+        "1\n00:00:01,000 --> 00:00:03,000\n- Where are you going?\n- Home.\n\n"
+        "2\n00:00:03,500 --> 00:00:05,000\nHome is far.\n\n"
+        "3\n00:00:05,200 --> 00:00:07,000\n- Home.\n- Yes, home.\n"
+    )
+    path = tmp_path / "written.en.srt"
+    path.write_text(written, encoding="utf-8")
+    server_app.tidy_roll_up(path)
+    assert path.read_text(encoding="utf-8") == written
+
+
+def test_a_clip_keeps_the_words_of_a_cue_that_opens_on_an_empty_line(tmp_path: Path) -> None:
+    """Split on blank lines, the first cue's words were cut from its timing and dropped."""
+    path = tmp_path / "rolling.fr.srt"
+    path.write_text(ROLLING, encoding="utf-8")
+    server_app.clip_srt(path, 0.0, 2.0)
+    assert path.read_text(encoding="utf-8") == "1\n00:00:00,000 --> 00:00:02,000\nL'Auvergne n'a pas tiré le gros lot. Pas\n"
+
+@pytest.mark.parametrize("subs", ["embed", "files"])
+def test_subtitles_are_subrip_and_tidied_before_the_download(subs: str) -> None:
+    """Embedded ones too: they went in as YouTube's rolling WebVTT."""
+    job = server_app.Job(id="r1", url="https://www.youtube.com/watch?v=abc", preset="video_720", subs=subs, sub_langs="fr")
+    keys = [pp["key"] for pp in server_app.build_options(job, None)["postprocessors"]]
+    assert "FFmpegSubtitlesConvertor" in keys
+    steps = [(type(step).__name__, when) for step, when in server_app.job_postprocessors(job)]
+    assert ("TidyRollUp", "before_dl") in steps
+
+
+# --------------------------------------------- subtitles the site will not give
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("subs", ["files", "embed"])
+def test_subtitles_that_cannot_be_fetched_leave_the_video_alone(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sample_mp4: bytes, subs: str) -> None:
+    """
+    YouTube answers a run of subtitle requests with 429 Too Many Requests,
+    and yt-dlp then fails the whole job: the video was lost for want of its
+    captions. The page already kept the video and said so; the server now
+    does the same.
+    """
+    from yt_dlp.extractor.common import InfoExtractor
+
+    class Site(_Quiet):
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path.endswith(".vtt"):
+                self.send_response(429)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(len(sample_mp4)))
+            self.end_headers()
+            self.wfile.write(sample_mp4)
+
+    monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", True)
+    monkeypatch.setattr(server_app, "DOWNLOAD_ROOT", tmp_path / "jobs")
+    with _serving(Site) as site:
+
+        class Captioned(InfoExtractor):
+            _VALID_URL = r"https://captioned\.example/v/(?P<id>\w+)"
+
+            def _real_extract(self, url: str) -> dict:
+                return {
+                    "id": self._match_id(url),
+                    "title": "A video whose captions are refused",
+                    "formats": [{"format_id": "18", "url": f"{site}/v.mp4", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}],
+                    "subtitles": {"fr": [{"url": f"{site}/fr.vtt", "ext": "vtt"}]},
+                }
+
+        _with_extractors(monkeypatch, Captioned)
+        job = _run("https://captioned.example/v/c1", preset="video_480", subs=subs, sub_langs="fr")
+    assert job.state == "done", job.error
+    assert job.filename.endswith(".mp4"), job.filename
+    assert "subtitles" in (job.note or "").lower() and "429" in job.note, job.note
 
 
 # ------------------------------------------------------ a clip's subtitles
