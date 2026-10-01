@@ -15,9 +15,9 @@
  */
 import { BackendError } from './errors.js';
 import { Fetcher } from './net.js';
-import { extract, planDownload, safeFilename, MIME_FOR } from './extract.js';
+import { extract, planDownload, safeFilename, youtubeId, MIME_FOR } from './extract.js';
 import { parseMedia, segmentIv } from './m3u8.js';
-import { ensureFfmpeg, isLoaded, mux, toAudio, setCoreUrl } from './media.js';
+import { cutOut, ensureFfmpeg, isLoaded, mux, toAudio, setCoreUrl } from './media.js';
 import * as store from './store.js';
 
 /** Matches the server's default, and for the same reason: bounded disk use. */
@@ -118,7 +118,7 @@ export class BrowserBackend {
     };
   }
 
-  async start(url, preset, { subs = 'off', subLangs = 'en' } = {}) {
+  async start(url, preset, { subs = 'off', subLangs = 'en', ytdlp = {} } = {}) {
     const id = `b-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const controller = new AbortController();
     const job = {
@@ -136,6 +136,8 @@ export class BrowserBackend {
       error: null,
       subs,
       subLangs,
+      // The one Advanced option this device can honour itself: see sponsorDrop.
+      sponsorblock: ytdlp.sponsorblock === true,
       note: subs === 'files' ? 'Subtitles as a separate file need your own server; this embeds them instead.' : null,
       controller,
       objectUrl: null,
@@ -237,6 +239,11 @@ async function runJob(backend, job) {
   const plan = planDownload(info, job.preset);
   const resolve = info.resolve || ((format) => format.url);
 
+  // A sponsor to cut needs the converter, as a subtitle does: a file that
+  // would have gone straight to disk is copied through it instead.
+  const drop = job.sponsorblock ? await sponsorDrop(job, info, signal) : [];
+  if (drop.length && plan.op === 'raw' && plan.video) plan.op = 'copy';
+
   // Subtitles are a video concern, and embedding one means a remux — so a
   // download that would otherwise have needed no conversion now does. That is
   // the cost of asking for them, and it is only paid when a track was actually
@@ -275,7 +282,10 @@ async function runJob(backend, job) {
     if (expected.every(Boolean)) job.totalBytes = expected.reduce((a, b) => a + b, 0);
     if (!warned && expected.reduce((a, b) => a + b, 0) > HEAVY_CONVERSION_BYTES) {
       warned = true;
-      job.note = 'Large file: converting it here needs it in memory, which a phone may not have. Your own server does this on disk.';
+      // Beside what the row already says, not over it: the sponsors cut, or
+      // why the subtitles go inside the video.
+      const large = 'Large file: converting it here needs it in memory, which a phone may not have. Your own server does this on disk.';
+      job.note = [job.note, large].filter(Boolean).join(' ');
     }
   };
   reckon();
@@ -369,8 +379,18 @@ async function runJob(backend, job) {
       onProgress,
       signal,
     });
+    // After the tracks are one file, so picture, sound and subtitles are cut
+    // at the same places: the keyframe before each, as yt-dlp cuts on a server.
+    if (drop.length && !signal.aborted) {
+      output = await cutOut({ source: { ext: plan.ext, data: output }, ext: plan.ext, keep: keptSpans(drop, info.duration), tags, onProgress, signal });
+    }
   } else {
-    const source = fetched[0];
+    let source = fetched[0];
+    // A copy of AAC is cut before its container changes, where every packet
+    // is a place to cut; an encode drops the spans itself, to the sample.
+    if (drop.length && plan.op === 'audio-copy') {
+      source = { ...source, data: await cutOut({ source, ext: source.ext, keep: keptSpans(drop, info.duration), onProgress, signal }) };
+    }
     const cover = await coverArt(net, info, signal);
     output = await toAudio({
       source,
@@ -378,6 +398,7 @@ async function runJob(backend, job) {
       copy: plan.op === 'audio-copy',
       tags,
       cover,
+      drop: plan.op === 'audio-copy' ? [] : drop,
       onProgress,
       signal,
     });
@@ -397,6 +418,83 @@ async function runJob(backend, job) {
   job.progress = 1;
   job.stage = 'ready';
   job.state = 'done';
+}
+
+/* ---------------------------------------------------------------- sponsors */
+
+/** What is cut, as on the server (SPONSOR_CATEGORIES in server/app.py). */
+const SPONSOR_CATEGORIES = ['sponsor', 'selfpromo', 'interaction'];
+const SPONSORBLOCK = 'https://sponsor.ajay.app/api/skipSegments';
+
+/**
+ * The spans of a video to drop, from SponsorBlock's answer: skips in the
+ * categories cut, inside the video, joined where they meet, and none so
+ * short a cut would cost more than it saves.
+ */
+export function sponsorSpans(answer, duration = null) {
+  const end = Number(duration) || Infinity;
+  const spans = (Array.isArray(answer) ? answer : [])
+    .filter((item) => SPONSOR_CATEGORIES.includes(item?.category) && (item.actionType || 'skip') === 'skip')
+    .map((item) => [Math.max(0, Number(item.segment?.[0])), Math.min(end, Number(item.segment?.[1]))])
+    .filter(([from, to]) => Number.isFinite(from) && Number.isFinite(to) && to - from >= 1)
+    .sort((a, b) => a[0] - b[0]);
+  const joined = [];
+  for (const span of spans) {
+    const last = joined.at(-1);
+    if (last && span[0] <= last[1]) last[1] = Math.max(last[1], span[1]);
+    else joined.push([...span]);
+  }
+  return joined;
+}
+
+/** What is kept around the spans dropped, for cutOut; null runs to the end. */
+export function keptSpans(drop, duration = null) {
+  const kept = [];
+  let from = 0;
+  for (const [start, end] of drop) {
+    if (start > from) kept.push([from, start]);
+    from = Math.max(from, end);
+  }
+  if (!duration || from < Number(duration) - 0.05) kept.push([from, null]);
+  return kept;
+}
+
+/**
+ * The spans of this YouTube video to drop, or none, with a note either way.
+ *
+ * SponsorBlock answers a page (it sends CORS headers), so this needs no
+ * helper. Asked as yt-dlp asks: by the first four characters of the ID's
+ * SHA-256, so the service learns a bucket of videos rather than this one —
+ * except on a page with no crypto.subtle (plain http to a LAN address),
+ * where the ID itself goes.
+ */
+async function sponsorDrop(job, info, signal) {
+  const id = youtubeId(job.url) || youtubeId(info.url || '');
+  if (!id) {
+    job.note = [job.note, 'Sponsor removal is for YouTube videos; this one was left whole.'].filter(Boolean).join(' ');
+    return [];
+  }
+  const categories = encodeURIComponent(JSON.stringify(SPONSOR_CATEGORIES));
+  try {
+    let answer;
+    if (globalThis.crypto?.subtle) {
+      const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(id)));
+      const prefix = [...digest.slice(0, 2)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+      const response = await fetch(`${SPONSORBLOCK}/${prefix}?categories=${categories}`, { signal });
+      answer = response.status === 404 ? [] : (await response.json()).find((video) => video.videoID === id)?.segments || [];
+    } else {
+      const response = await fetch(`${SPONSORBLOCK}?videoID=${id}&categories=${categories}`, { signal });
+      answer = response.status === 404 ? [] : await response.json();
+    }
+    const drop = sponsorSpans(answer, info.duration);
+    const seconds = Math.round(drop.reduce((sum, [from, to]) => sum + to - from, 0));
+    job.note = [job.note, drop.length ? `Sponsor segments cut: ${drop.length}, ${seconds} s.` : 'SponsorBlock lists no segments to cut in this video.'].filter(Boolean).join(' ');
+    return drop;
+  } catch (error) {
+    if (signal.aborted) throw error;
+    job.note = [job.note, 'SponsorBlock could not be reached, so nothing was cut.'].filter(Boolean).join(' ');
+    return [];
+  }
 }
 
 /**

@@ -158,6 +158,16 @@ WEB_DIR = Path(os.environ.get("WEB_DIR", Path(__file__).resolve().parent.parent 
 
 # ------------------------------------------------------------------- presets
 
+# How a video preset picks among the formats of one height, after yt-dlp's
+# filters. yt-dlp's own order takes AV1 and Opus wherever they are offered,
+# which an older iPhone or Mac does not play, and VP9 where AV1 is not, which
+# no QuickTime plays inside the .mp4 a job writes. So: the original soundtrack
+# before a dub (yt-dlp's "lang"), the height and frame rate asked for, a direct
+# file before HLS, then what an MP4 holds natively (mp4 and m4a before webm,
+# which leaves VP9 last), and H.264 before the rest — AV1 where YouTube offers
+# nothing else, above 1080p. Audio follows the same order: AAC in m4a.
+VIDEO_SORT = ["lang", "res", "fps", "proto", "ext:mp4:m4a", "vcodec:h264"]
+
 # Kept deliberately small. The frontend shows exactly these, and anything not on
 # this list cannot be requested — an arbitrary format string from the client
 # would be a way to smuggle yt-dlp options through.
@@ -167,6 +177,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "kind": "video",
         "opts": {
             "format": "bv*+ba/b",
+            "format_sort": VIDEO_SORT,
             "merge_output_format": "mp4",
             "postprocessors": [{"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True}],
         },
@@ -176,6 +187,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "kind": "video",
         "opts": {
             "format": "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b",
+            "format_sort": VIDEO_SORT,
             "merge_output_format": "mp4",
             "postprocessors": [{"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True}],
         },
@@ -185,6 +197,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "kind": "video",
         "opts": {
             "format": "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
+            "format_sort": VIDEO_SORT,
             "merge_output_format": "mp4",
             "postprocessors": [{"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True}],
         },
@@ -194,6 +207,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "kind": "video",
         "opts": {
             "format": "bv*[height<=480]+ba/b[height<=480]/bv*+ba/b",
+            "format_sort": VIDEO_SORT,
             "merge_output_format": "mp4",
             "postprocessors": [{"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True}],
         },
@@ -1165,23 +1179,78 @@ def clip_srt(path: Path, start: float, end: float | None) -> None:
     the time asked for, and seeking the output does not shift it at all.
     """
     kept: list[str] = []
-    text = path.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n").strip()
-    for block in re.split(r"\n\s*\n", text):
-        lines = block.split("\n")
-        timing = next((index for index, line in enumerate(lines) if "-->" in line), None)
-        if timing is None:
+    for cue_start, cue_end, said in _srt_cues(path.read_text(encoding="utf-8", errors="replace")):
+        span = _on_the_clips_clock(cue_start, cue_end, start, end)
+        if span is None or not said:
             continue
-        first, _, last = lines[timing].partition("-->")
-        cue_start, cue_end = _srt_seconds(first), _srt_seconds(last)
-        span = None if cue_start is None or cue_end is None else _on_the_clips_clock(cue_start, cue_end, start, end)
-        if span is None:
-            continue
-        kept.append("\n".join([str(len(kept) + 1), f"{_srt_time(span[0])} --> {_srt_time(span[1])}", *lines[timing + 1:]]))
+        kept.append("\n".join([str(len(kept) + 1), f"{_srt_time(span[0])} --> {_srt_time(span[1])}", *said]))
     if kept:
         path.write_text("\n\n".join(kept) + "\n", encoding="utf-8")
     else:
         # Nothing is said during the clip: no file, rather than an empty one.
         path.unlink()
+
+
+def _srt_cues(text: str) -> list[tuple[float, float, list[str]]]:
+    """
+    A SubRip file's cues, as (start, end, the lines that say something).
+
+    Read from timing line to timing line, not split on blank lines: YouTube's
+    captions converted to SubRip open a cue with an empty line, and splitting
+    there left the cue's words with no timing, so they were dropped.
+    """
+    lines = text.replace("\r\n", "\n").split("\n")
+    cues: list[tuple[float, float, list[str]]] = []
+    for index, line in enumerate(lines):
+        if "-->" in line:
+            first, _, last = line.partition("-->")
+            start, end = _srt_seconds(first), _srt_seconds(last)
+            if start is not None and end is not None:
+                cues.append((start, end, []))
+            continue
+        # The number of the cue that follows is not this cue's text.
+        numbering = line.strip().isdigit() and index + 1 < len(lines) and "-->" in lines[index + 1]
+        if cues and line.strip() and not numbering:
+            cues[-1][2].append(line.strip())
+    return cues
+
+
+def tidy_roll_up(path: Path) -> None:
+    """
+    Say YouTube's rolling machine captions a line at a time.
+
+    They roll up: each line is shown under the one before it, and again alone
+    for ten milliseconds as it scrolls away. Converted as they are, every line
+    was in the .srt three times and the player flashed a cue between each
+    pair. Only a file that rolls is touched — most of its cues starting with
+    the line the cue before ended on — so written subtitles stay as written.
+    """
+    cues = _srt_cues(path.read_text(encoding="utf-8", errors="replace"))
+    spoken = [lines for _, _, lines in cues if lines]
+    rolls = sum(1 for before, after in zip(spoken, spoken[1:]) if after[0] == before[-1])
+    if len(spoken) < 3 or rolls * 2 < len(spoken) - 1:
+        return
+    kept: list[str] = []
+    before: list[str] = []
+    for start, end, lines in cues:
+        if not lines or (end - start < 0.05 and all(line in before for line in lines)):
+            continue
+        said = lines[1:] if before and lines[0] == before[-1] else lines
+        before = lines
+        if said:
+            kept.append("\n".join([str(len(kept) + 1), f"{_srt_time(start)} --> {_srt_time(end)}", *said]))
+    path.write_text("\n\n".join(kept) + "\n", encoding="utf-8")
+
+
+class TidyRollUp(yt_dlp.postprocessor.PostProcessor):
+    """tidy_roll_up on each subtitle file, once it is SubRip (see build_options)."""
+
+    def run(self, info: dict[str, Any]):
+        for track in (info.get("requested_subtitles") or {}).values():
+            subtitle = track.get("filepath") or ""
+            if subtitle.endswith(".srt") and os.path.exists(subtitle):
+                tidy_roll_up(Path(subtitle))
+        return [], info
 
 
 # What a track nobody asked for has to be before it is the fallback: text a
@@ -1269,6 +1338,8 @@ def job_postprocessors(job: Job) -> list[tuple[yt_dlp.postprocessor.PostProcesso
     if job.subs != "off" and PRESETS[job.preset]["kind"] == "video":
         # Before anything is fetched, after yt-dlp's own choice is made.
         steps.append((PickSubtitle([lang.strip() for lang in job.sub_langs.split(",") if lang.strip()]), "pre_process"))
+        # Once they are SubRip, and before a clip moves them.
+        steps.append((TidyRollUp(), "before_dl"))
     if job.clip_start is not None or job.clip_end is not None:
         steps.append((FitToClip(job.clip_start, job.clip_end), "before_dl"))
     return steps
@@ -1285,6 +1356,19 @@ def outtmpl_for(job: Job) -> str:
     if job.is_playlist:
         return "%(playlist_index)03d - %(title).120B [%(id)s].%(ext)s"
     return "%(title).150B [%(id)s].%(ext)s"
+
+
+def archive_label(title: str | None) -> str:
+    """
+    The name of a job's zip, from its title as it was written: only what a
+    file name cannot hold on any system it may land on goes. Everything that
+    was not a letter, digit, space, dot or dash used to, and "l’Auvergne"
+    came back as "lAuvergne".
+    """
+    label = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", title or "")
+    # Windows drops a trailing dot or space from a name; a leading one hides it.
+    label = re.sub(r"\s+", " ", label).strip(" .")[:80].strip(" .")
+    return label or "playlist"
 
 
 def build_options(job: Job, client: str | None) -> dict[str, Any]:
@@ -1323,15 +1407,15 @@ def build_options(job: Job, client: str | None) -> dict[str, Any]:
         # yt-dlp's own choice, which PickSubtitle then replaces before
         # anything is fetched: see job_postprocessors.
         options["subtitleslangs"] = [lang.strip() for lang in job.sub_langs.split(",") if lang.strip()]
-        if job.subs == "files" or clipped:
-            # SubRip, as the settings promise: YouTube's own formats are VTT
-            # and its JSON variants, which fewer phone players open. And for
-            # a clip, embedded or not, the one format FitToClip can move onto
-            # the clip's clock.
-            options["postprocessors"] = [
-                *options.get("postprocessors", []),
-                {"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"},
-            ]
+        # SubRip, embedded or not: as the settings promise for files, since
+        # YouTube's own formats are VTT and its JSON variants, which fewer
+        # phone players open; the one format FitToClip can move onto a clip's
+        # clock; and the one TidyRollUp reads, embedded captions having gone
+        # in as YouTube's rolling WebVTT, each line three times.
+        options["postprocessors"] = [
+            *options.get("postprocessors", []),
+            {"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"},
+        ]
         if job.subs == "embed":
             options.setdefault("postprocessors", [])
             options["postprocessors"] = [
@@ -1530,8 +1614,7 @@ def _run_job(job: Job) -> None:
                     # these is already compressed, so deflating would burn CPU
                     # over a playlist's worth of data to save nothing.
                     job.stage = "packing"
-                    label = re.sub(r'[^\w\s.-]', "", job.title or "playlist").strip() or "playlist"
-                    archive = job.directory / f"{label[:80]}.zip"
+                    archive = job.directory / f"{archive_label(job.title)}.zip"
                     with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as bundle:
                         for item in files:
                             bundle.write(item, arcname=item.name)
@@ -1549,10 +1632,11 @@ def _run_job(job: Job) -> None:
                     # list yt-dlp returns, as if it had arrived, so the count
                     # is of the errors it reported, one for each video it gave
                     # up on.
-                    job.note = (
+                    lost = (
                         f"{len(errors)} of the {max(listed, len(errors))} videos could not be downloaded: "
                         f"{humanize_error(Exception(errors[-1]), job.url)}"
                     )
+                    job.note = f"{job.note} {lost}" if job.note else lost
                 # The progress hook counted the stream it fetched: the video an
                 # MP3 was made from, the last track of a zip. The row shows the
                 # file it hands over.
@@ -1566,6 +1650,16 @@ def _run_job(job: Job) -> None:
                 if job.cancelled:
                     return
                 last_error = exc
+                refused_captions = re.search(r"unable to download video subtitles for [^:]*: (.*)", str(exc), re.I)
+                if refused_captions and job.subs != "off":
+                    # The captions, not the video: YouTube answers a run of
+                    # them with 429 Too Many Requests, and yt-dlp failed the
+                    # whole job for it. The video is fetched again without
+                    # them, as the page does, and the row says why.
+                    job.subs = "off"
+                    job.note = f"The subtitles could not be fetched ({refused_captions[1].strip().rstrip('.')}), so the video has none."
+                    attempts.insert(index + 1, client)
+                    continue
                 if index + 1 < len(attempts) and is_bot_wall(str(exc)):
                     job.attempts = index + 1
                     continue

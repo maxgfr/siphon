@@ -99,6 +99,7 @@ globalThis.Worker = class {
     const title = payload.args.find((arg) => String(arg).startsWith('title=')) || '';
     this.runs.push(title);
     this.args = payload.args;
+    this.inputs = payload.inputs;
     this.busy = true;
     if (title === 'title=long') return undefined;
     setTimeout(() => {
@@ -187,4 +188,33 @@ test('a cover that is already a JPEG goes in as it is, and only another kind is 
   assert.equal(await codec(jpeg, 'm4a'), 'copy');
   assert.equal(await codec(jpeg, 'mp3'), 'copy');
   assert.equal(await codec(png, 'm4a'), 'mjpeg');
+});
+
+/* -------------------------------------------------------------- sponsors */
+
+test('sponsor segments are cut by copying what is kept, one span after another', async () => {
+  // The device makes the file when your server only resolves, and SponsorBlock
+  // was greyed there: the 92-second sponsor of a 24-minute video stayed in.
+  const { cutOut } = await import('../web/media.js');
+  const data = new Uint8Array([1, 2, 3, 4]);
+  await cutOut({ source: { ext: 'mp4', data }, ext: 'mp4', keep: [[0, 623.539], [716.021, null]], tags: { title: 'cut-mp4' } });
+  const worker = workers.at(-1);
+  const list = new TextDecoder().decode(worker.inputs.find((input) => input.name === 'keep.txt').data);
+  assert.equal(list, "file 'source.mp4'\ninpoint 0\noutpoint 623.539\nfile 'source.mp4'\ninpoint 716.021\n");
+  assert.deepEqual(worker.args.slice(0, 6), ['-f', 'concat', '-safe', '0', '-i', 'keep.txt']);
+  assert.ok(worker.args.includes('copy'));
+  assert.equal(worker.args.at(-1), 'out.mp4');
+});
+
+test('an audio file being encoded anyway is cut exactly, sample by sample', async () => {
+  // A copy cuts where the container lets it: on YouTube's WebM, six seconds
+  // of a sponsor stayed. An encode can drop exactly the span asked for.
+  const { toAudio } = await import('../web/media.js');
+  await toAudio({ source: { ext: 'webm', data: new Uint8Array(4) }, ext: 'mp3', cover: new Uint8Array([0xff, 0xd8, 0xff, 0]), drop: [[623.539, 716.021]], tags: { title: 'cut-mp3' } });
+  const args = workers.at(-1).args;
+  const filter = args[args.indexOf('-af') + 1];
+  assert.equal(filter, "aselect='not(between(t,623.539,716.021))',asetpts=N/SR/TB");
+  // After every input: before one, it is read as that input's option, and
+  // ffmpeg.wasm refused the whole MP3 of a YouTube video, which has a cover.
+  assert.ok(args.indexOf('-af') > args.lastIndexOf('-i'), args.join(' '));
 });

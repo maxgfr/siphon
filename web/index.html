@@ -214,15 +214,17 @@
 
     <details style="margin-top:14px" id="advanced">
       <summary class="lbl" style="cursor:pointer">Advanced — yt-dlp options</summary>
+      <!-- Outside the block below: this device can cut a sponsor itself. -->
+      <label class="lbl" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="optSponsor" /> Remove sponsor segments
+      </label>
+      <p class="hint">
+        Sponsors, self-promotion and "like and subscribe" are cut out of YouTube videos, from
+        the community's <a href="https://sponsor.ajay.app" target="_blank" rel="noopener">SponsorBlock</a> data —
+        by your server, or by this device when it makes the file.
+      </p>
       <p class="hint" id="ytdlpScope"></p>
       <div id="ytdlpBlock">
-        <label class="lbl" style="display:flex;align-items:center;gap:8px;cursor:pointer">
-          <input type="checkbox" id="optSponsor" /> Remove sponsor segments
-        </label>
-        <p class="hint">
-          Sponsors, self-promotion and "like and subscribe" are cut out of YouTube videos, from
-          the community's <a href="https://sponsor.ajay.app" target="_blank" rel="noopener">SponsorBlock</a> data.
-        </p>
 
         <label class="lbl" for="optClipStart">Clip <span style="font-weight:400;color:var(--muted)">— only this part</span></label>
         <div style="display:flex;gap:8px">

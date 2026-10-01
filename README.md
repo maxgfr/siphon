@@ -299,13 +299,14 @@ it answers this page for a video, before you save. Under **Advanced** are
 yt-dlp's options, applied by your own server to every download it makes, and
 checked on Save the way the server reads them, so a slip is shown beside the
 field rather than failing every download after it.
-With any other helper they are kept, greyed, until one is set, and so they
-are on a server without ffmpeg, which only resolves and leaves the download
-to this device:
+With any other helper the rest are kept, greyed, until one is set, and so
+they are on a server without ffmpeg, which only resolves and leaves the
+download to this device. Sponsor removal is the exception: where this device
+makes the file, it cuts the sponsors itself.
 
 | option | what it does |
 |---|---|
-| **Remove sponsor segments** | cuts sponsors, self-promotion and "like and subscribe" out of YouTube videos, from the community's [SponsorBlock](https://sponsor.ajay.app) data |
+| **Remove sponsor segments** | cuts sponsors, self-promotion and "like and subscribe" out of YouTube videos, from the community's [SponsorBlock](https://sponsor.ajay.app) data — by your server, or by this device when it makes the file. The device asks SponsorBlock by the first characters of the video's hash, as yt-dlp does, not by the video itself; the row says how many segments were cut |
 | **Clip** | only the part between two times, as `1:23`, `01:02:03` or seconds, `150`; only that span is fetched, re-encoded so it starts and ends exactly there, with the subtitles and chapters moved to match |
 | **Speed limit** | bytes per second, as `500K` or `2M`; not applied to a clip, a live stream or HLS only ffmpeg reads, which ffmpeg fetches and yt-dlp does not slow down |
 | **YouTube client** | which of YouTube's clients to try first; the ladder still follows. A client the server's yt-dlp no longer has counts as no choice |
@@ -481,9 +482,16 @@ that are yours: the bridge, the relay, the server.
   make the same answer arrive later. A row's **Try again**, once a download
   has failed, starts it over.
 - **Subtitles.** Off, embedded, or as separate `.srt` files beside the video
-  (the last needs your server). Auto-generated captions are included; the
-  languages are a preference list, so `fr,en` offered only Japanese gets
-  Japanese rather than nothing.
+  (the last needs your server). Auto-generated captions are included, a line
+  at a time rather than YouTube's rolling display, which put every line in
+  the file three times; the languages are a preference list, so `fr,en`
+  offered only Japanese gets Japanese rather than nothing. Subtitles the site
+  refuses (YouTube answers a run of them with 429) leave the video alone: it
+  downloads without them, and the row says why.
+- **Files that play where they land.** Up to 1080p a video is H.264 with AAC
+  in its `.mp4`, which every phone, Mac and TV plays; above, where YouTube
+  offers nothing else, AV1, never VP9, which no QuickTime plays inside an
+  `.mp4`. The video's own soundtrack is taken over a dub YouTube made of it.
 - **Playlists.** Offered, never assumed: a video inside a playlist stays one
   video unless you tap **All**, and **This one** of a link that is only a list
   is its first video. A full server delivers one `.zip`, numbered in

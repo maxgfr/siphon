@@ -326,6 +326,30 @@ the proof-of-origin provider. Eight defects only the real thing could show:
   Safari and an iPhone do not play; H.264 of the same height was there. At
   one height the planner now takes H.264, then HEVC, then AV1, then VP9.
 
+The round after it, with the same 24-minute video through the image, its
+page, the Pages deploy pointed at it and the split, found five more:
+
+- **The server's videos did not play everywhere.** yt-dlp's order took AV1
+  and Opus at every height, which an older iPhone or Mac does not play, and
+  VP9 where no AV1 was offered, which no QuickTime plays in an `.mp4`. The
+  video presets now sort for H.264 and AAC at one height, AV1 above 1080p,
+  a direct file before HLS, the original soundtrack first.
+- **Subtitles the site refused took the video with them.** YouTube answered
+  a run of subtitle requests with 429, and yt-dlp failed the whole job. The
+  video is now fetched again without them, and the row says why.
+- **Machine captions said every line three times**, as YouTube's rolling
+  display does; a 24-minute `.srt` had 1491 cues. They are said a line at a
+  time now (746), embedded ones too. Reading them, the clip's cutter was
+  found to drop the words of a cue that opened on an empty line, as these
+  do; both read a cue from its timing now.
+- **A zip's name lost its apostrophes**: "l’Auvergne" came back as
+  "lAuvergne". Only what a file name cannot hold is dropped now.
+- **SponsorBlock did nothing where the device made the file**, a split or a
+  short video through a relay or the bridge. The device cuts the sponsors
+  itself now: a video and an M4A by copying what is kept, an MP3 exactly
+  while it is encoded. The split's 720p, MP3 and M4A of that video all came
+  out at 1378.6 seconds, the 92.5-second sponsor gone.
+
 And one limit that is YouTube's: from a page, every client youtubei.js offers
 is served about a minute of a stream and then refused, so a YouTube video
 longer than that downloads through your own server, not through the browser
