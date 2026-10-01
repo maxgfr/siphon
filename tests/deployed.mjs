@@ -597,6 +597,15 @@ for (const [old, expected] of [
   }));
   check('a row titled with a long link does not push the page sideways at phone width', laid.page <= WIDTH && laid.rows <= WIDTH, `page ${laid.page}px, rows to ${Math.round(laid.rows)}px, on a ${WIDTH}px screen`);
   check('and Try again and Save stay on screen', laid.buttons.length === 3 && laid.buttons.every((right) => right <= WIDTH), laid.buttons.join(', '));
+
+  // The languages field sat in one row with the sentence under it, which
+  // took the row: at phone width the box a language is typed in was 0px
+  // wide, and "Separate files" showed a hint and nowhere to type.
+  await page.click('input[name="subs"][value="files"]');
+  const langs = await page.evaluate(() => Math.round(document.getElementById('subLangs').getBoundingClientRect().width));
+  check('choosing subtitles shows a languages box a person can type in, at phone width', langs >= 200, `${langs}px wide on a ${WIDTH}px screen`);
+  await page.fill('#subLangs', 'fr', { timeout: 3000 }).catch(() => {});
+  check('and what is typed there is kept', (await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:settings') || '{}').subLangs)) === 'fr');
   await context.close();
 }
 
