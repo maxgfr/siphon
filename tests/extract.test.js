@@ -23,6 +23,7 @@ import {
   extract,
   playableFormats,
   answeringClient,
+  toFormat,
 } from '../web/extract.js';
 import { BackendError } from '../web/errors.js';
 import { Fetcher } from '../web/net.js';
@@ -1269,4 +1270,55 @@ test('a video YouTube says is gone is final, not a reason to try another client'
   const youtube = session({ default: { playability_status: { status: 'ERROR', reason: 'Video unavailable' } } });
   await assert.rejects(answeringClient(youtube, 'gone0000000'), (error) => error instanceof BackendError && /Video unavailable/.test(error.message));
   assert.deepEqual(youtube.asked, ['default']);
+});
+
+test('the original soundtrack is taken over a dub YouTube made of it, whatever their bitrates', () => {
+  // A French video carried an English auto-dub beside its original, and the
+  // dub came first: every preset the page planned from a server's resolve
+  // took the English track, where yt-dlp on the server took the French one.
+  const formats = [
+    { id: '609', protocol: 'hls', kind: 'video', container: 'mp4', height: 720, width: 1280, bitrate: 1500000 },
+    { id: '140-0', protocol: 'progressive', kind: 'audio', container: 'm4a', codecs: 'mp4a.40.2', bitrate: 130000, languagePreference: -1, label: 'English (US), medium' },
+    { id: '140-1', protocol: 'progressive', kind: 'audio', container: 'm4a', codecs: 'mp4a.40.2', bitrate: 129000, languagePreference: 10, label: 'French (FR) original (default), medium' },
+    { id: '251-0', protocol: 'progressive', kind: 'audio', container: 'webm', codecs: 'opus', bitrate: 140000, languagePreference: -1, label: 'English (US), medium' },
+  ];
+  for (const preset of ['video_720', 'video_best', 'audio_m4a', 'audio_mp3']) {
+    assert.equal(planDownload({ formats, title: 't', url: 'u' }, preset).audio.id, '140-1', preset);
+  }
+  // Without the field, as from every other site, the best bitrate still wins.
+  const plain = formats.map(({ languagePreference, ...rest }) => rest);
+  assert.equal(planDownload({ formats: plain, title: 't', url: 'u' }, 'audio_mp3').audio.id, '251-0');
+});
+
+test("YouTube's own formats rank the original soundtrack over a dub, not by which is marked default", () => {
+  // youtubei.js marked the English auto-dub of a French video as the default
+  // track (the default follows who asks), and the original as not.
+  const base = { mime_type: 'audio/mp4; codecs="mp4a.40.2"', has_audio: true, has_video: false, itag: 140 };
+  const dub = toFormat({ ...base, bitrate: 131819, is_auto_dubbed: true, audio_track: { audio_is_default: true } }, 0);
+  const original = toFormat({ ...base, bitrate: 131726, is_original: true, audio_track: { audio_is_default: false } }, 1);
+  const described = toFormat({ ...base, bitrate: 131000, is_descriptive: true }, 2);
+  const plain = toFormat({ ...base, bitrate: 131000 }, 3);
+  assert.ok(original.languagePreference > dub.languagePreference);
+  assert.ok(dub.languagePreference > described.languagePreference);
+  assert.equal(plain.languagePreference, undefined);
+  assert.equal(planDownload({ formats: [dub, original], title: 't', url: 'u' }, 'audio_m4a').audio.index, 1);
+});
+
+test('at the same height, the picture is the one an MP4 plays everywhere, not the heaviest', () => {
+  // A 720p request took YouTube's VP9 for its bitrate and wrote it into the
+  // .mp4 the page makes, which QuickTime, Safari and an iPhone do not play;
+  // H.264 of the same height was right there. Height still comes first.
+  const audio = { id: 'a', protocol: 'progressive', kind: 'audio', container: 'm4a', codecs: 'mp4a.40.2', bitrate: 130000 };
+  const at720 = [
+    { id: '609', protocol: 'hls', kind: 'video', container: 'mp4', height: 720, width: 1280, codecs: 'vp09.00.31.08', bitrate: 3038598 },
+    { id: '398', protocol: 'progressive', kind: 'video', container: 'mp4', height: 720, width: 1280, codecs: 'av01.0.05M.08', bitrate: 883922 },
+    { id: '136', protocol: 'progressive', kind: 'video', container: 'mp4', height: 720, width: 1280, codecs: 'avc1.64001f', bitrate: 1626071 },
+  ];
+  assert.equal(planDownload({ formats: [audio, ...at720], title: 't', url: 'u' }, 'video_720').video.id, '136');
+  // Above 1080p YouTube has no H.264: AV1 before VP9, and the height is not traded away.
+  const at2160 = [
+    { id: '313', protocol: 'progressive', kind: 'video', container: 'webm', height: 2160, width: 3840, codecs: 'vp9', bitrate: 9000000 },
+    { id: '401', protocol: 'progressive', kind: 'video', container: 'mp4', height: 2160, width: 3840, codecs: 'av01.0.12M.08', bitrate: 7000000 },
+  ];
+  assert.equal(planDownload({ formats: [audio, ...at720, ...at2160], title: 't', url: 'u' }, 'video_best').video.id, '401');
 });

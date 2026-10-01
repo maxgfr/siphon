@@ -900,10 +900,21 @@ async function extractYouTube(url, context) {
   });
 }
 
-function toFormat(format, index) {
+/**
+ * yt-dlp's rank for a soundtrack, from what youtubei.js says of it: the
+ * video's own first, a dub of it after, a described one last. Not from which
+ * one is marked default: that follows who asks, and was the English auto-dub
+ * of a French video.
+ */
+const trackRank = (format) =>
+  format.is_original ? 10 : format.is_dubbed || format.is_auto_dubbed ? -1 : format.is_descriptive ? -10 : undefined;
+
+export function toFormat(format, index) {
   const mime = String(format.mime_type || '');
   const container = /mp4|m4a/.test(mime) ? (format.has_video ? 'mp4' : 'm4a') : /webm/.test(mime) ? 'webm' : 'mp4';
+  const languagePreference = format.has_video ? undefined : trackRank(format);
   return {
+    ...(languagePreference === undefined ? {} : { languagePreference }),
     id: `itag-${format.itag}`,
     index,
     url: format.url || '',
@@ -1330,10 +1341,36 @@ async function extractInvidious(id, url, context) {
 /** The ceiling each video preset asks for; null means "whatever is best". */
 const PRESET_HEIGHT = { video_best: null, video_1080: 1080, video_720: 720, video_480: 480 };
 
-const better = (a, b) =>
-  (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0) || (b.filesize || 0) - (a.filesize || 0);
+/**
+ * How widely a picture plays in the .mp4 this page writes: H.264 everywhere,
+ * HEVC and AV1 on recent devices, VP9 in an MP4 nowhere Apple makes. Only
+ * between formats of one height: a 720p VP9 was taken over the H.264 beside
+ * it for its bitrate, and QuickTime, Safari and an iPhone could not play it.
+ * A codec nobody named sits in the middle.
+ */
+const PICTURE = [
+  [/^(avc1|avc3|h264)/i, 4],
+  [/^(hvc1|hev1|h265)/i, 3],
+  [/^av01/i, 2],
+  [/^(vp09|vp9|vp08|vp8)/i, 1],
+];
+const plays = (format) => {
+  for (const codec of String(format.codecs || '').split(',')) {
+    const known = PICTURE.find(([pattern]) => pattern.test(codec.trim()));
+    if (known) return known[1];
+  }
+  return 2;
+};
 
-const betterAudio = (a, b) => (b.bitrate || 0) - (a.bitrate || 0) || (b.filesize || 0) - (a.filesize || 0);
+const better = (a, b) =>
+  (b.height || 0) - (a.height || 0) || plays(b) - plays(a) || (b.bitrate || 0) - (a.bitrate || 0) || (b.filesize || 0) - (a.filesize || 0);
+
+// A video's own soundtrack before a dub of it, then the best bitrate. YouTube
+// adds auto-dubs beside the original, and the English one of a French video
+// came first; `languagePreference` is yt-dlp's rank, which a server's resolve
+// passes on and the YouTube path here works out the same way.
+const betterAudio = (a, b) =>
+  (b.languagePreference ?? 0) - (a.languagePreference ?? 0) || (b.bitrate || 0) - (a.bitrate || 0) || (b.filesize || 0) - (a.filesize || 0);
 
 /**
  * The rung of an HLS ladder to take the sound from when it has no audio-only
