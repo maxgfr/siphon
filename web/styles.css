@@ -204,6 +204,10 @@ button, input, select, textarea { font: inherit; color: inherit; }
   font-size: 16px;
   font-family: var(--mono);
 }
+/* The languages field has a sentence under its box. In the row, the sentence
+   took all of it and the box was 0px wide at phone width. */
+#subLangsField { flex-wrap: wrap; }
+#subLangsField .playlist-note { flex-basis: 100%; }
 .field input::placeholder { color: var(--muted); font-family: var(--sans); }
 .field input:focus { outline: none; }
 
