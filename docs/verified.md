@@ -286,7 +286,7 @@ On 2026-10-01 every suite above ran on one machine on a residential IP, and
 the image was built and driven through its API and its page: a direct file,
 a YouTube video, its MP3, a clip, its subtitles, a playlist, the resolve and
 the tunnel, the access key, CORS, the address guard, the cookie upload, and
-the proof-of-origin provider. Three defects only the real thing could show:
+the proof-of-origin provider. Four defects only the real thing could show:
 
 - **The browser mode stopped at the first YouTube client with any formats.**
   YouTube now gives the default client formats with no URL, or with URLs only
@@ -301,6 +301,16 @@ the proof-of-origin provider. Three defects only the real thing could show:
   of a real seven with a 403 and the job was done, a zip of five; with one
   left it would have been that file alone. The row now says how many did not
   arrive, and the last reason given.
+- **SponsorBlock left part of a sponsor in an MP3 or M4A.** The cut came
+  before the audio was extracted, on YouTube's WebM, which a copy cannot cut
+  where it is told: a 92.5-second sponsor lost in full from the video kept six
+  seconds in the MP3. The cut now comes after the extraction, in yt-dlp's own
+  order.
+
+And one limit that is YouTube's: from a page, every client youtubei.js offers
+is served about a minute of a stream and then refused, so a YouTube video
+longer than that downloads through your own server, not through the browser
+mode. The measurement is in [youtube.md](youtube.md).
 
 The rest of what that run measured, YouTube's and the public instances'
 answers included, is quoted in [youtube.md](youtube.md).

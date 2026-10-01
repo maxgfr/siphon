@@ -336,13 +336,34 @@ The M4A first sat at "Converting…" for good: ffmpeg.wasm never comes back
 from re-encoding YouTube's thumbnail as cover art, where native ffmpeg takes
 no time. A JPEG cover is now copied in as it is.
 
+That video is nineteen seconds long, and its whole stream fits in what
+googlevideo gives away. A 24-minute one (`GPoguKJpbsw`) does not: every
+client youtubei.js offers — IOS and ANDROID_VR, with a local or a fetched
+session — gets about a minute of it, then `403` whatever the window size:
+
+```
+itag 140, 22.7 MiB    1 MiB windows: HTTP 403 at window 2 (bytes 1048576-2097151)
+itag 136, 285.2 MiB   1 MiB windows: HTTP 403 at window 12 (bytes 11534336-12582911)
+itag 140, no Range    HTTP 403   (the page's own request: the whole file at once)
+```
+
+yt-dlp's `visionos` client, which the server uses for video, is served whole
+with neither a token nor a challenge solved; its audio comes from a client
+whose challenge yt-dlp solves with Deno. So from a page today, a YouTube video
+longer than about a minute does not download: the page reads
+*rr5---….googlevideo.com answered 403*. Through your own server it does.
+
 `pipedapi.kavin.rocks` answered `HTTP 502 Bad gateway`, and every bundled
 Invidious instance shut its video endpoint as above (403 *Endpoint disabled*,
 403, 401, 303), so neither of those paths is a home connection's either.
 
 The server (`npm run test:server`, and the image through `docker compose`)
 downloaded the video, its MP3, a 720p clip, its subtitles as `.srt` and a
-seven-video playlist as a zip with no cookies. With the provider beside it, a
+seven-video playlist as a zip with no cookies, and the 24-minute one whole up
+to 2160p, from its own page and from the Pages deploy pointed at it. With
+SponsorBlock on, its 92.5-second sponsor went from the video (1471.1 s to
+1378.6 s); the MP3 kept six seconds of it until the cut was moved after the
+extraction, as yt-dlp orders it. With the provider beside it, a
 job pinned to `mweb` used a proof-of-origin token the provider minted. One
 playlist run lost two of its seven to `HTTP Error 403: Forbidden` on the
 video data and said nothing about it; the row now says how many did not
