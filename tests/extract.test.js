@@ -21,6 +21,9 @@ import {
   extensionOf,
   innertubeFetch,
   extract,
+  playableFormats,
+  answeringClient,
+  toFormat,
 } from '../web/extract.js';
 import { BackendError } from '../web/errors.js';
 import { Fetcher } from '../web/net.js';
@@ -1187,4 +1190,135 @@ test('a file on a host that refuses the page goes to a resolver that can take it
   } finally {
     globalThis.fetch = real;
   }
+});
+
+/* ----------------------------------------------------- YouTube's own clients */
+
+test('a client whose formats carry no URL is no answer, so the next client is asked', () => {
+  // YouTube's web client now lists every format with neither a URL nor a
+  // cipher, for its own streaming protocol only. The ladder took fourteen
+  // such formats as an answer, never asked IOS, and every download failed
+  // with youtubei.js's "No valid URL to decipher".
+  const web = {
+    formats: [],
+    adaptive_formats: [{ itag: 137 }, { itag: 140 }],
+    server_abr_streaming_url: 'https://rr1.googlevideo.com/videoplayback?sabr=1',
+  };
+  assert.deepEqual(playableFormats(web), []);
+  const ios = {
+    formats: [{ itag: 18, url: 'https://rr1.googlevideo.com/videoplayback?itag=18' }],
+    adaptive_formats: [{ itag: 140, signature_cipher: 's=abc&url=https%3A%2F%2Frr1.googlevideo.com' }, { itag: 251 }],
+  };
+  assert.deepEqual(playableFormats(ios).map((format) => format.itag), [18, 140]);
+  assert.deepEqual(playableFormats(undefined), []);
+});
+
+/** A youtubei.js session whose clients answer as `answers` says, by name. */
+function session(answers) {
+  const asked = [];
+  return {
+    asked,
+    session: { player: {} },
+    async getBasicInfo(id, options) {
+      const client = options?.client || 'default';
+      asked.push(client);
+      const answer = answers[client];
+      if (answer instanceof Error) throw answer;
+      return answer;
+    },
+  };
+}
+
+const playable = (formats) => ({ playability_status: { status: 'OK' }, streaming_data: { formats: [], adaptive_formats: formats } });
+const format = (itag, decipher) => ({ itag, url: `https://rr1.googlevideo.com/videoplayback?itag=${itag}`, decipher });
+const needsEvaluator = async () => {
+  throw new Error('To decipher URLs, you must provide your own JavaScript evaluator.');
+};
+
+test('a client whose formats this page cannot decipher is passed over for one it can', async () => {
+  // youtubei.js deciphers nothing without a JavaScript evaluator, which this
+  // page does not give it. On the days YouTube hands the web client formats
+  // that need one, the ladder stopped there and every download failed with
+  // "To decipher URLs, you must provide your own JavaScript evaluator";
+  // IOS, next but one, hands out URLs that need nothing.
+  const youtube = session({
+    default: playable([format(140, needsEvaluator)]),
+    TV_EMBEDDED: new Error('This video is unavailable'),
+    IOS: playable([format(140, async () => 'https://rr1.googlevideo.com/videoplayback?itag=140&n=ok')]),
+  });
+  const answer = await answeringClient(youtube, 'jNQXAC9IVRw');
+  assert.equal(answer.client, 'IOS');
+  assert.deepEqual(youtube.asked, ['default', 'TV_EMBEDDED', 'IOS']);
+  assert.equal(answer.raw.length, 1);
+});
+
+test('and when no client is usable, the last reason is kept for the person to read', async () => {
+  const wall = { playability_status: { status: 'LOGIN_REQUIRED', reason: 'Sign in to confirm you are not a bot' } };
+  const youtube = session({
+    default: playable([{ itag: 140 }]),
+    TV_EMBEDDED: new Error('This video is unavailable'),
+    IOS: wall,
+    ANDROID_VR: wall,
+    MWEB: playable([format(140, needsEvaluator)]),
+  });
+  const answer = await answeringClient(youtube, 'jNQXAC9IVRw');
+  assert.equal(answer.client, undefined);
+  assert.match(answer.lastReason, /JavaScript evaluator/);
+});
+
+test('a video YouTube says is gone is final, not a reason to try another client', async () => {
+  const youtube = session({ default: { playability_status: { status: 'ERROR', reason: 'Video unavailable' } } });
+  await assert.rejects(answeringClient(youtube, 'gone0000000'), (error) => error instanceof BackendError && /Video unavailable/.test(error.message));
+  assert.deepEqual(youtube.asked, ['default']);
+});
+
+test('the original soundtrack is taken over a dub YouTube made of it, whatever their bitrates', () => {
+  // A French video carried an English auto-dub beside its original, and the
+  // dub came first: every preset the page planned from a server's resolve
+  // took the English track, where yt-dlp on the server took the French one.
+  const formats = [
+    { id: '609', protocol: 'hls', kind: 'video', container: 'mp4', height: 720, width: 1280, bitrate: 1500000 },
+    { id: '140-0', protocol: 'progressive', kind: 'audio', container: 'm4a', codecs: 'mp4a.40.2', bitrate: 130000, languagePreference: -1, label: 'English (US), medium' },
+    { id: '140-1', protocol: 'progressive', kind: 'audio', container: 'm4a', codecs: 'mp4a.40.2', bitrate: 129000, languagePreference: 10, label: 'French (FR) original (default), medium' },
+    { id: '251-0', protocol: 'progressive', kind: 'audio', container: 'webm', codecs: 'opus', bitrate: 140000, languagePreference: -1, label: 'English (US), medium' },
+  ];
+  for (const preset of ['video_720', 'video_best', 'audio_m4a', 'audio_mp3']) {
+    assert.equal(planDownload({ formats, title: 't', url: 'u' }, preset).audio.id, '140-1', preset);
+  }
+  // Without the field, as from every other site, the best bitrate still wins.
+  const plain = formats.map(({ languagePreference, ...rest }) => rest);
+  assert.equal(planDownload({ formats: plain, title: 't', url: 'u' }, 'audio_mp3').audio.id, '251-0');
+});
+
+test("YouTube's own formats rank the original soundtrack over a dub, not by which is marked default", () => {
+  // youtubei.js marked the English auto-dub of a French video as the default
+  // track (the default follows who asks), and the original as not.
+  const base = { mime_type: 'audio/mp4; codecs="mp4a.40.2"', has_audio: true, has_video: false, itag: 140 };
+  const dub = toFormat({ ...base, bitrate: 131819, is_auto_dubbed: true, audio_track: { audio_is_default: true } }, 0);
+  const original = toFormat({ ...base, bitrate: 131726, is_original: true, audio_track: { audio_is_default: false } }, 1);
+  const described = toFormat({ ...base, bitrate: 131000, is_descriptive: true }, 2);
+  const plain = toFormat({ ...base, bitrate: 131000 }, 3);
+  assert.ok(original.languagePreference > dub.languagePreference);
+  assert.ok(dub.languagePreference > described.languagePreference);
+  assert.equal(plain.languagePreference, undefined);
+  assert.equal(planDownload({ formats: [dub, original], title: 't', url: 'u' }, 'audio_m4a').audio.index, 1);
+});
+
+test('at the same height, the picture is the one an MP4 plays everywhere, not the heaviest', () => {
+  // A 720p request took YouTube's VP9 for its bitrate and wrote it into the
+  // .mp4 the page makes, which QuickTime, Safari and an iPhone do not play;
+  // H.264 of the same height was right there. Height still comes first.
+  const audio = { id: 'a', protocol: 'progressive', kind: 'audio', container: 'm4a', codecs: 'mp4a.40.2', bitrate: 130000 };
+  const at720 = [
+    { id: '609', protocol: 'hls', kind: 'video', container: 'mp4', height: 720, width: 1280, codecs: 'vp09.00.31.08', bitrate: 3038598 },
+    { id: '398', protocol: 'progressive', kind: 'video', container: 'mp4', height: 720, width: 1280, codecs: 'av01.0.05M.08', bitrate: 883922 },
+    { id: '136', protocol: 'progressive', kind: 'video', container: 'mp4', height: 720, width: 1280, codecs: 'avc1.64001f', bitrate: 1626071 },
+  ];
+  assert.equal(planDownload({ formats: [audio, ...at720], title: 't', url: 'u' }, 'video_720').video.id, '136');
+  // Above 1080p YouTube has no H.264: AV1 before VP9, and the height is not traded away.
+  const at2160 = [
+    { id: '313', protocol: 'progressive', kind: 'video', container: 'webm', height: 2160, width: 3840, codecs: 'vp9', bitrate: 9000000 },
+    { id: '401', protocol: 'progressive', kind: 'video', container: 'mp4', height: 2160, width: 3840, codecs: 'av01.0.12M.08', bitrate: 7000000 },
+  ];
+  assert.equal(planDownload({ formats: [audio, ...at720, ...at2160], title: 't', url: 'u' }, 'video_best').video.id, '401');
 });

@@ -741,7 +741,8 @@ for (const [old, expected] of [
   await page.fill('#url', '');
   await page.evaluate((text) => navigator.clipboard.writeText(text), `Me at the zoo ${titled}`);
   await page.focus('#url');
-  await page.keyboard.press('Control+V');
+  // The platform's own paste: Control+V pastes nothing on a Mac.
+  await page.keyboard.press('ControlOrMeta+V');
   await page.waitForTimeout(200);
   check('a title and its link pasted into the field become just the link', (await page.inputValue('#url')) === titled && !(await page.isDisabled('#go')),
     `${JSON.stringify(await page.inputValue('#url'))}, Download ${(await page.isDisabled('#go')) ? 'disabled' : 'enabled'}`);

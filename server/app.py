@@ -270,6 +270,20 @@ def is_bot_wall(message: str) -> bool:
     return any(marker in lowered for marker in BOT_WALL_MARKERS)
 
 
+# googlevideo refuses a stream now and then, on a link it served a moment
+# before: yt-dlp says "HTTP Error 403" on the video data, and ffmpeg, fetching
+# a clip, only gives its exit code. The same job asked again goes through, on
+# fresh links, so a refusal on the stream is answered with a new extraction —
+# on the same client, since the client was not what was refused — this many
+# times at most.
+STREAM_REFRESHES = 2
+
+
+def is_refused_stream(message: str) -> bool:
+    lowered = message.lower()
+    return "http error 403" in lowered or "ffmpeg exited with code" in lowered
+
+
 def player_client_chain(has_cookies: bool, first: str = "") -> list[str | None]:
     """
     Which YouTube clients to try, in order. None means "yt-dlp's own default",
@@ -561,6 +575,9 @@ class Job:
     clip_end: float | None = None
     rate_limit: int | None = None
     yt_client: str = ""
+    # Said beside a finished download: here, the videos of a playlist that
+    # did not make it into what is handed over.
+    note: str | None = None
     # Set by DELETE. The download thread checks it at every progress report
     # and stops there; without it, a cancelled job kept downloading into a
     # directory nothing would ever sweep.
@@ -588,6 +605,7 @@ class Job:
             "isPlaylist": self.is_playlist,
             "itemsDone": self.items_done,
             "itemsTotal": self.items_total,
+            "note": self.note,
         }
 
 
@@ -1336,11 +1354,17 @@ def build_options(job: Job, client: str | None) -> dict[str, Any]:
         options["cookiefile"] = cookies
     if job.sponsorblock:
         # The community's segment list is fetched after the video is chosen,
-        # and the cuts are made before anything else touches the file.
+        # and the cuts are made before anything else touches the file — but
+        # after the audio is extracted, in yt-dlp's own order. Cut first, the
+        # audio was YouTube's WebM, which a copy cannot cut where it is told:
+        # the seek lands on the cluster before the segment's end, and an MP3
+        # kept six seconds of a sponsor the video of it had lost.
+        steps = list(options.get("postprocessors", []))
+        extract = next((i + 1 for i, step in enumerate(steps) if step["key"] == "FFmpegExtractAudio"), 0)
+        steps.insert(extract, {"key": "ModifyChapters", "remove_sponsor_segments": SPONSOR_CATEGORIES, "force_keyframes": False})
         options["postprocessors"] = [
             {"key": "SponsorBlock", "categories": SPONSOR_CATEGORIES, "when": "after_filter"},
-            {"key": "ModifyChapters", "remove_sponsor_segments": SPONSOR_CATEGORIES, "force_keyframes": False},
-            *options.get("postprocessors", []),
+            *steps,
         ]
     if clipped:
         # Only the span asked for is fetched: yt-dlp hands it to ffmpeg,
@@ -1442,6 +1466,7 @@ def _run_job(job: Job) -> None:
         job.state = "running"
         attempts = player_client_chain(have_cookies(), job.yt_client) if is_youtube(job.url) else [None]
         last_error: Exception | None = None
+        refreshes = 0
 
         for index, client in enumerate(attempts):
             # Each attempt starts from an empty directory: a previous try can
@@ -1459,6 +1484,8 @@ def _run_job(job: Job) -> None:
                         ydl.add_post_processor(step, when=when)
                     errors = _keep_errors(ydl)
                     refused = _keep_refusals(ydl)
+                    # How many videos the list had, for a playlist job.
+                    listed = 0
                     try:
                         info = ydl.extract_info(job.url, download=True)
                     except yt_dlp.utils.DownloadError:
@@ -1480,6 +1507,7 @@ def _run_job(job: Job) -> None:
                             # Name the job — and so the archive — after the
                             # playlist, not after whichever track happened to
                             # be first.
+                            listed = len(info.get("entries") or [])
                             job.title = info.get("title") or entries[0].get("title")
                             job.thumbnail = entries[0].get("thumbnail")
                             info = None
@@ -1514,6 +1542,17 @@ def _run_job(job: Job) -> None:
                 else:
                     chosen = files[0]
                 job.filename = chosen.name
+                if listed and errors:
+                    # ignoreerrors carried on past them, and the job was done
+                    # without a word: a playlist of seven came back as a zip of
+                    # five. A video whose download was refused is still in the
+                    # list yt-dlp returns, as if it had arrived, so the count
+                    # is of the errors it reported, one for each video it gave
+                    # up on.
+                    job.note = (
+                        f"{len(errors)} of the {max(listed, len(errors))} videos could not be downloaded: "
+                        f"{humanize_error(Exception(errors[-1]), job.url)}"
+                    )
                 # The progress hook counted the stream it fetched: the video an
                 # MP3 was made from, the last track of a zip. The row shows the
                 # file it hands over.
@@ -1528,6 +1567,13 @@ def _run_job(job: Job) -> None:
                     return
                 last_error = exc
                 if index + 1 < len(attempts) and is_bot_wall(str(exc)):
+                    job.attempts = index + 1
+                    continue
+                if is_youtube(job.url) and refreshes < STREAM_REFRESHES and is_refused_stream(str(exc)):
+                    refreshes += 1
+                    # The same client again, next: the loop reads the list as
+                    # it grows.
+                    attempts.insert(index + 1, client)
                     job.attempts = index + 1
                     continue
                 break
@@ -2101,6 +2147,21 @@ def _grant_host(url: str, headers: dict[str, Any] | None) -> None:
         TUNNEL_HOSTS[host] = ({**previous, **kept}, time.time() + TUNNEL_HOST_TTL)
 
 
+# host -> the window, in bytes, that a format on it asked to be fetched in.
+# yt-dlp's YouTube formats name one (http_chunk_size): googlevideo serves a
+# whole stream, or one with no end, at about 30 KB/s, and a bounded window of
+# 10 MiB in a second. Read only for a host that is granted.
+TUNNEL_WINDOWS: dict[str, int] = {}
+
+
+def _window_for(url: str, raw: dict[str, Any]) -> None:
+    size = (raw.get("downloader_options") or {}).get("http_chunk_size")
+    host = (urlparse(url).hostname or "").lower()
+    if host and isinstance(size, int) and size > 0:
+        with TUNNEL_HOSTS_LOCK:
+            TUNNEL_WINDOWS[host] = size
+
+
 def _granted(host: str) -> dict[str, str] | None:
     now = time.time()
     with TUNNEL_HOSTS_LOCK:
@@ -2199,7 +2260,7 @@ def resolved_format(fmt: dict[str, Any]) -> dict[str, Any] | None:
         return None
     codecs = ",".join(c for c in (fmt.get("vcodec"), fmt.get("acodec")) if c and c != "none")
     tbr = fmt.get("tbr")
-    return {
+    out = {
         "id": str(fmt.get("format_id") or ""),
         "url": url,
         "protocol": shape,
@@ -2212,6 +2273,12 @@ def resolved_format(fmt: dict[str, Any]) -> dict[str, Any] | None:
         "codecs": codecs,
         "label": fmt.get("format_note") or format_label(fmt),
     }
+    # yt-dlp's rank of a soundtrack: 10 for a video's original, -1 for a dub
+    # YouTube made of it. Without it the page took the English auto-dub of a
+    # French video, being the first at the best bitrate.
+    if isinstance(fmt.get("language_preference"), int):
+        out["languagePreference"] = fmt["language_preference"]
+    return out
 
 
 def resolve_url(url: str) -> dict[str, Any]:
@@ -2306,6 +2373,7 @@ def resolve_url(url: str) -> dict[str, Any]:
                 if jar.get(fmt["url"]):
                     headers["Cookie"] = jar[fmt["url"]]
                 _grant_host(fmt["url"], headers)
+                _window_for(fmt["url"], raw)
             formats = [fmt for fmt, _ in pairs]
             thumbnail = whole_address(info.get("webpage_url") or url, info.get("thumbnail"))
             if thumbnail:
@@ -2393,6 +2461,50 @@ def _iter_upstream(response: Any) -> Iterator[bytes]:
         response.close()
 
 
+def _open_span(range_header: str | None, window: int) -> tuple[int, int | None, bool] | None:
+    """
+    The part of a resource a request wants, when it is more than a window:
+    (first byte, last byte or None for the end, whether it asked for a range).
+    A bounded range within a window, or one this cannot read, goes as it is.
+    """
+    if not range_header:
+        return (0, None, False)
+    match = re.fullmatch(r"\s*bytes=(\d+)-(\d*)\s*", range_header)
+    if not match:
+        return None
+    start, stop = int(match[1]), int(match[2]) if match[2] else None
+    return (start, stop, True) if stop is None or stop - start + 1 > window else None
+
+
+def _window_end(start: int, stop: int | None, window: int) -> int:
+    end = start + window - 1
+    return end if stop is None else min(end, stop)
+
+
+def _content_range(value: str | None) -> tuple[int, int, int | None] | None:
+    """`bytes 0-999/2560` as numbers; the total is None when the host says `*`."""
+    match = re.fullmatch(r"\s*bytes (\d+)-(\d+)/(\d+|\*)\s*", value or "")
+    if not match:
+        return None
+    return int(match[1]), int(match[2]), None if match[3] == "*" else int(match[3])
+
+
+def _iter_windows(first: Any, url: str, headers: dict[str, str], start: int, end: int, window: int) -> Iterator[bytes]:
+    """The first window's bytes, then each next one asked for as the last runs out."""
+    yield from _iter_upstream(first)
+    while start <= end:
+        upto = min(end, start + window - 1)
+        response = urlopen(UrlRequest(url, headers={**headers, "Range": f"bytes={start}-{upto}"}), timeout=30)
+        got = _content_range(response.headers.get("content-range"))
+        if response.status != 206 or not got or got[0] != start:
+            response.close()
+            # Mid-answer there is no status left to change: the answer stops
+            # short of its length, which is how the page learns of it.
+            raise OSError(f"{urlparse(url).hostname} answered {response.status} part-way through the file")
+        yield from _iter_upstream(response)
+        start = got[1] + 1
+
+
 @app.get("/api/tunnel")
 async def tunnel(url: str, request: Request, key: str | None = None, authorization: str | None = Header(default=None)):
     """
@@ -2427,10 +2539,15 @@ async def tunnel(url: str, request: Request, key: str | None = None, authorizati
     range_header = request.headers.get("range")
     if range_header:
         headers["Range"] = range_header
+    # A host that wants windows is asked for the first here and for the rest
+    # as the page reads, and the page is answered as one request would be.
+    window = TUNNEL_WINDOWS.get(host.lower()) if _granted(host) is not None else None
+    span = _open_span(range_header, window) if window else None
+    asked = {**headers, "Range": f"bytes={span[0]}-{_window_end(span[0], span[1], window)}"} if span else headers
 
     def open_upstream() -> Any:
         try:
-            return urlopen(UrlRequest(target, headers=headers), timeout=30)
+            return urlopen(UrlRequest(target, headers=asked), timeout=30)
         except HTTPError as exc:
             return exc  # an HTTPError is a response too; pass its status through
         except (URLError, OSError) as exc:
@@ -2465,6 +2582,19 @@ async def tunnel(url: str, request: Request, key: str | None = None, authorizati
         # It was reached on the granted host's say-so, as the redirect was, so
         # it is carried too, with none of that host's credentials.
         _grant_host(final, None)
+    if span and status == 206:
+        start, stop, ranged = span
+        got = _content_range(upstream.headers.get("content-range"))
+        if not got or got[0] != start or got[2] is None:
+            upstream.close()
+            raise HTTPException(status_code=502, detail=f"{host} sent a different part of the file than the one asked for.")
+        end = min(stop if stop is not None else got[2] - 1, got[2] - 1)
+        passed.pop("content-range", None)
+        passed["content-length"] = str(end - start + 1)
+        if ranged:
+            passed["content-range"] = f"bytes {start}-{end}/{got[2]}"
+        windows = _iter_windows(upstream, final, headers, got[1] + 1, end, window)
+        return StreamingResponse(windows, status_code=206 if ranged else 200, headers=passed)
     return StreamingResponse(_iter_upstream(upstream), status_code=status, headers=passed)
 
 

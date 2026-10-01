@@ -309,7 +309,13 @@ export async function toAudio({ source, ext = 'mp3', copy = false, tags = {}, co
     // Note there is deliberately no `-vn` here: it would discard the artwork
     // along with the source's video, which is the opposite of what was asked.
     // The explicit maps already drop everything that is not wanted.
-    args.push('-map', '0:a:0', '-map', '1:v:0', '-c:v', 'mjpeg', '-disposition:v:0', 'attached_pic');
+    //
+    // A cover that is a JPEG already goes in as it is. ffmpeg.wasm never came
+    // back from re-encoding YouTube's own thumbnails as MJPEG, so every MP3
+    // and M4A of a YouTube video made here hung at "Converting…"; and a copy
+    // costs nothing and loses nothing. Anything else is encoded.
+    const jpeg = cover[0] === 0xff && cover[1] === 0xd8 && cover[2] === 0xff;
+    args.push('-map', '0:a:0', '-map', '1:v:0', '-c:v', jpeg ? 'copy' : 'mjpeg', '-disposition:v:0', 'attached_pic');
     if (ext === 'mp3') args.push('-id3v2_version', '3');
   } else {
     args.push('-vn', '-map', '0:a:0');

@@ -301,7 +301,77 @@ So from a datacentre IP, with the runtime and the provider both present,
 YouTube refuses every client until there is a session behind the request.
 yt-dlp's own advice on that machine is cookies, which is the second step of
 the README's three and the one a runner cannot take. On a home connection the
-same code is what the image is for; that measurement is yours to make.
+same code is what the image is for; that measurement is the next section.
+
+### From a home connection, 2026-10-01
+
+The same suites from a residential IP in France, no cookies. The bare probe
+(`npm run test:innertube`):
+
+```
+WEB          HTTP 200  playability=UNPLAYABLE (Video unavailable)  formats=0
+MWEB         HTTP 200  playability=UNPLAYABLE (The page needs to be reloaded.)  formats=0
+TV_EMBEDDED  HTTP 200  playability=ERROR (YouTube is no longer supported in this application or device.)
+IOS          HTTP 200  playability=OK  formats=16
+ANDROID_VR   HTTP 200  playability=LOGIN_REQUIRED (Sign in to confirm you're not a bot)  formats=0
+2/8 hand-built variants got a playable answer
+youtubei.js: default, IOS and MWEB playable; TV_EMBEDDED unavailable
+```
+
+Playable is not the same as downloadable. youtubei.js gave the default client
+fourteen formats with no URL at all, for YouTube's own streaming protocol;
+another run gave it formats with URLs that only a JavaScript evaluator can
+decipher, which the page does not give the library. IOS's URLs need neither.
+The page took the first client with any formats, so every download failed at
+the decipher, and IOS was never asked. It now takes the first client with a
+format it can actually use, and both from the browser through
+`node relay/serve.mjs` then arrived:
+
+```
+ok   video_480 produced real video via youtube (IOS) — 320x240
+ok   audio_m4a produced AAC audio via youtube (IOS) — Me at the zoo.m4a
+```
+
+The M4A first sat at "Converting…" for good: ffmpeg.wasm never comes back
+from re-encoding YouTube's thumbnail as cover art, where native ffmpeg takes
+no time. A JPEG cover is now copied in as it is.
+
+That video is nineteen seconds long, and its whole stream fits in what
+googlevideo gives away. A 24-minute one (`GPoguKJpbsw`) does not: every
+client youtubei.js offers — IOS and ANDROID_VR, with a local or a fetched
+session — gets about a minute of it, then `403` whatever the window size:
+
+```
+itag 140, 22.7 MiB    1 MiB windows: HTTP 403 at window 2 (bytes 1048576-2097151)
+itag 136, 285.2 MiB   1 MiB windows: HTTP 403 at window 12 (bytes 11534336-12582911)
+itag 140, no Range    HTTP 403   (the page's own request: the whole file at once)
+```
+
+yt-dlp's `visionos` client, which the server uses for video, is served whole
+with neither a token nor a challenge solved; its audio comes from a client
+whose challenge yt-dlp solves with Deno. So from a page today, a YouTube video
+longer than about a minute does not download: the page reads
+*rr5---….googlevideo.com answered 403*. Through your own server it does,
+and so does the split, where the server resolves with yt-dlp and the device
+downloads through its tunnel: the same video at 720p, in H.264 with its
+original French soundtrack, in 67 seconds, once the tunnel asked googlevideo
+for 10 MiB windows rather than the whole file it serves at 30 KB/s.
+
+`pipedapi.kavin.rocks` answered `HTTP 502 Bad gateway`, and every bundled
+Invidious instance shut its video endpoint as above (403 *Endpoint disabled*,
+403, 401, 303), so neither of those paths is a home connection's either.
+
+The server (`npm run test:server`, and the image through `docker compose`)
+downloaded the video, its MP3, a 720p clip, its subtitles as `.srt` and a
+seven-video playlist as a zip with no cookies, and the 24-minute one whole up
+to 2160p, from its own page and from the Pages deploy pointed at it. With
+SponsorBlock on, its 92.5-second sponsor went from the video (1471.1 s to
+1378.6 s); the MP3 kept six seconds of it until the cut was moved after the
+extraction, as yt-dlp orders it. With the provider beside it, a
+job pinned to `mweb` used a proof-of-origin token the provider minted. One
+playlist run lost two of its seven to `HTTP Error 403: Forbidden` on the
+video data and said nothing about it; the row now says how many did not
+arrive, and why.
 
 ## What follows
 
@@ -317,7 +387,8 @@ through a public instance or a relay on a datacentre IP. The code is correct up
 to the wall, checked request by request, and every suite that can run without
 YouTube's cooperation is green. From a home connection — `node relay/serve.mjs`
 on your own machine, its address in settings, or the bridge — that is the case
-the code is written for, and the one measurement a runner cannot make.
+the code is written for, and the one measurement a runner cannot make; it was
+made once, on 2026-10-01, and is quoted above.
 
 **The server is measured separately.** `npm run test:server` starts
 `server/app.py` on a runner and asks it for the same video, first plain and then
