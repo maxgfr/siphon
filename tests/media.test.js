@@ -98,6 +98,7 @@ globalThis.Worker = class {
     }
     const title = payload.args.find((arg) => String(arg).startsWith('title=')) || '';
     this.runs.push(title);
+    this.args = payload.args;
     this.busy = true;
     if (title === 'title=long') return undefined;
     setTimeout(() => {
@@ -167,4 +168,23 @@ test('a conversion cancelled while it waits its turn never reaches ffmpeg, and c
   await long.catch(() => {});
   assert.equal(await within(after, 1000), 'done');
   assert.ok(!workers.some((worker) => worker.runs.includes('title=waiting')));
+});
+
+/* ------------------------------------------------------------------ covers */
+
+test('a cover that is already a JPEG goes in as it is, and only another kind is encoded', async () => {
+  // ffmpeg.wasm never returned from re-encoding YouTube's own thumbnail as
+  // MJPEG: every MP3 and M4A of a YouTube video made on the device sat at
+  // "Converting…" for good. Native ffmpeg does it in no time; copying the
+  // JPEG that is already there does too, and loses nothing.
+  const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0x10]);
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const codec = async (cover, ext) => {
+    await toAudio({ source: { ext: 'm4a', data: new Uint8Array(4) }, ext, cover, tags: { title: `cover-${ext}` } });
+    const args = workers.at(-1).args;
+    return args[args.indexOf('-c:v') + 1];
+  };
+  assert.equal(await codec(jpeg, 'm4a'), 'copy');
+  assert.equal(await codec(jpeg, 'mp3'), 'copy');
+  assert.equal(await codec(png, 'm4a'), 'mjpeg');
 });
