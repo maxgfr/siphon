@@ -18,6 +18,7 @@ import functools
 import http.server
 import importlib
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -659,6 +660,17 @@ class TestResolvedFormat:
         audio = server_app.resolved_format({"format_id": "a", "url": "u", "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "tbr": 128})
         assert video["kind"] == "video" and video["label"] == "1080p"
         assert audio["kind"] == "audio" and audio["label"] == "audio" and audio["bitrate"] == 128000
+
+    def test_which_soundtrack_is_the_original_goes_with_it(self) -> None:
+        """
+        yt-dlp ranks a video's soundtracks — the original 10, a dub YouTube
+        made of it -1 — and takes the first. The page was told none of that,
+        and planned the English auto-dub of a French video.
+        """
+        original = server_app.resolved_format({"format_id": "140-1", "url": "u", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "language_preference": 10})
+        dub = server_app.resolved_format({"format_id": "140-0", "url": "u", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "language_preference": -1})
+        assert (original["languagePreference"], dub["languagePreference"]) == (10, -1)
+        assert "languagePreference" not in server_app.resolved_format({"format_id": "a", "url": "u", "ext": "m4a", "vcodec": "none", "acodec": "mp4a"})
 
     def test_hls_is_kept_and_dash_is_not(self) -> None:
         hls = server_app.resolved_format({"format_id": "h", "url": "u.m3u8", "protocol": "m3u8_native", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"})
@@ -2724,6 +2736,168 @@ class TestAPlaylistBehindTheBotWall:
         youtube["videos"] = 0
         job = _run("https://www.youtube.com/playlist?list=PLempty", is_playlist=True)
         assert (job.state, job.error, job.attempts) == ("error", "That playlist is empty.", 0)
+
+
+# ------------------------------------------- a stream refused part-way through
+
+
+@needs_ffmpeg
+class TestAStreamYouTubeRefuses:
+    """
+    googlevideo refuses a stream now and then with a 403, on a link it served
+    a moment before: a 24-minute video failed a job in three that way, as
+    "unable to download video data: HTTP Error 403" (or, for a clip, ffmpeg's
+    exit code 8), and the same job asked again went through. A refusal on the
+    stream is now answered with fresh links, twice at most; a site that is not
+    YouTube is not asked again, since its 403 is its answer.
+    """
+
+    @pytest.fixture()
+    def site(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sample_mp4: bytes) -> Iterator[dict]:
+        from yt_dlp.extractor.common import InfoExtractor
+
+        state: dict = {"refuse": 1, "fetches": 0, "extractions": 0}
+
+        class Media(_Quiet):
+            def do_GET(self) -> None:  # noqa: N802
+                state["fetches"] += 1
+                if state["refuse"] > 0:
+                    state["refuse"] -= 1
+                    self.send_response(403)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(len(sample_mp4)))
+                self.end_headers()
+                self.wfile.write(sample_mp4)
+
+        monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", True)
+        monkeypatch.setattr(server_app, "DOWNLOAD_ROOT", tmp_path / "jobs")
+        monkeypatch.setattr(server_app, "COOKIES_PATH", tmp_path / "no-cookies.txt")
+        with _serving(Media) as media:
+
+            class FakeYouTubeIE(InfoExtractor):
+                _VALID_URL = r"https://(?:www\.youtube\.com/watch\?v=|other\.example/v/)(?P<id>refused\d)"
+
+                def _real_extract(self, url: str) -> dict:
+                    state["extractions"] += 1
+                    return {
+                        "id": self._match_id(url),
+                        "title": "A stream refused now and then",
+                        "formats": [{"format_id": "18", "url": f"{media}/v.mp4?try={state['extractions']}", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}],
+                    }
+
+            _with_extractors(monkeypatch, FakeYouTubeIE)
+            yield state
+
+    def test_a_refused_stream_is_asked_for_again_with_fresh_links(self, site: dict) -> None:
+        job = _run("https://www.youtube.com/watch?v=refused1")
+        assert job.state == "done", job.error
+        assert site["extractions"] == 2
+        assert job.attempts == 1
+
+    def test_a_stream_refused_every_time_is_given_up_on_and_said(self, site: dict) -> None:
+        site["refuse"] = 99
+        job = _run("https://www.youtube.com/watch?v=refused2")
+        assert job.state == "error"
+        assert "403" in job.error
+        assert site["extractions"] == 3
+
+    def test_another_sites_refusal_is_its_answer(self, site: dict) -> None:
+        job = _run("https://other.example/v/refused3")
+        assert job.state == "error"
+        assert site["extractions"] == 1
+
+
+# ------------------------------------------------- a host that wants windows
+
+
+class TestATunnelToAHostThatWantsWindows:
+    """
+    googlevideo serves a request for a whole stream, or for one with no end,
+    at about 30 KB/s, and a bounded window of 10 MiB in a second. yt-dlp asks
+    for windows, as each YouTube format tells it to (http_chunk_size); the
+    tunnel passed the page's request on as it came, a whole file, and a
+    24-minute video's audio would have taken twelve minutes. It now asks for
+    the windows the format named and hands them on as one answer.
+    """
+
+    WINDOW = 1000
+
+    @pytest.fixture()
+    def host(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[dict]:
+        from yt_dlp.extractor.common import InfoExtractor
+
+        body = bytes(range(256)) * 10  # 2560 bytes: two whole windows and a part
+        state: dict = {"asked": [], "body": body}
+        window = self.WINDOW
+
+        class Media(_Quiet):
+            def do_GET(self) -> None:  # noqa: N802
+                asked = self.headers.get("Range")
+                state["asked"].append(asked)
+                match = re.fullmatch(r"bytes=(\d+)-(\d+)", asked or "")
+                if not match or int(match[2]) - int(match[1]) + 1 > window:
+                    # The stand-in for the crawl: no bounded window, no bytes.
+                    self.send_response(403)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                start, end = int(match[1]), min(int(match[2]), len(body) - 1)
+                self.send_response(206)
+                self.send_header("Content-Type", "audio/mp4")
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(body)}")
+                self.send_header("Content-Length", str(end - start + 1))
+                self.end_headers()
+                self.wfile.write(body[start : end + 1])
+
+        monkeypatch.setattr(server_app, "ALLOW_PRIVATE_HOSTS", True)
+        monkeypatch.setattr(server_app, "TUNNEL_HOSTS", {})
+        monkeypatch.setattr(server_app, "TUNNEL_WINDOWS", {})
+        with _serving(Media) as media:
+            state["url"] = f"{media}/videoplayback?itag=140"
+
+            class Windowed(InfoExtractor):
+                _VALID_URL = r"https://windowed\.example/v/(?P<id>\w+)"
+
+                def _real_extract(self, url: str) -> dict:
+                    chunk = {"http_chunk_size": window} if self._match_id(url) == "chunked" else {}
+                    return {
+                        "id": self._match_id(url),
+                        "title": "A stream asked for a window at a time",
+                        "formats": [{"format_id": "140", "url": state["url"], "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "downloader_options": chunk}],
+                    }
+
+            _with_extractors(monkeypatch, Windowed)
+            yield state
+
+    def test_a_whole_file_is_fetched_a_window_at_a_time(self, client: TestClient, host: dict) -> None:
+        assert client.post("/api/resolve", json={"url": "https://windowed.example/v/chunked"}).status_code == 200
+        answer = client.get("/api/tunnel", params={"url": host["url"]})
+        assert answer.status_code == 200, answer.text
+        assert answer.content == host["body"]
+        assert answer.headers["content-length"] == str(len(host["body"]))
+        assert host["asked"] == ["bytes=0-999", "bytes=1000-1999", "bytes=2000-2559"]
+
+    def test_a_range_with_no_end_is_answered_as_that_range(self, client: TestClient, host: dict) -> None:
+        client.post("/api/resolve", json={"url": "https://windowed.example/v/chunked"})
+        answer = client.get("/api/tunnel", params={"url": host["url"]}, headers={"Range": "bytes=1500-"})
+        assert answer.status_code == 206, answer.text
+        assert answer.content == host["body"][1500:]
+        assert answer.headers["content-range"] == f"bytes 1500-2559/{len(host['body'])}"
+
+    def test_a_window_the_page_asked_for_goes_as_it_is(self, client: TestClient, host: dict) -> None:
+        client.post("/api/resolve", json={"url": "https://windowed.example/v/chunked"})
+        answer = client.get("/api/tunnel", params={"url": host["url"]}, headers={"Range": "bytes=10-19"})
+        assert answer.status_code == 206 and answer.content == host["body"][10:20]
+        assert host["asked"] == ["bytes=10-19"]
+
+    def test_a_host_no_format_asked_windows_for_is_asked_as_the_page_asked(self, client: TestClient, host: dict) -> None:
+        client.post("/api/resolve", json={"url": "https://windowed.example/v/plain"})
+        client.get("/api/tunnel", params={"url": host["url"]})
+        assert host["asked"] == [None]
 
 
 # ------------------------------------------------------ a clip's subtitles
