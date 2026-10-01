@@ -282,19 +282,51 @@ export async function mux({ video, audio, subtitle = null, ext = 'mp4', tags = {
 }
 
 /**
+ * Keep only these spans of a file, by copying them one after another: no
+ * re-encoding, so a phone can afford it, and a cut lands where the container
+ * lets it — the keyframe before, for a picture — as yt-dlp's own cut does on
+ * a server. `keep` is [[from, to], …] in seconds; a `to` of null runs to the
+ * end.
+ */
+export async function cutOut({ source, ext, keep, tags = {}, onProgress, signal }) {
+  const name = `source.${source.ext || ext}`;
+  const list = keep
+    .map(([from, to]) => `file '${name}'\ninpoint ${from}\n${to === null ? '' : `outpoint ${to}\n`}`)
+    .join('');
+  const inputs = [
+    { name, data: source.data },
+    { name: 'keep.txt', data: new TextEncoder().encode(list) },
+  ];
+  const output = `out.${ext}`;
+  const args = ['-f', 'concat', '-safe', '0', '-i', 'keep.txt', '-map', '0', '-c', 'copy'];
+  if (ext === 'mp4' || ext === 'm4a') args.push('-movflags', '+faststart');
+  args.push(...metadataArgs(tags), '-y', output);
+  return transform({ inputs, args, output, onProgress, signal });
+}
+
+/**
  * Pull an audio-only file out of whatever arrived.
  *
  * `copy: true` is the case where the source is already AAC and the request was
  * M4A: changing the container keeps the original samples, where re-encoding
  * would throw away quality to arrive at the same format.
  */
-export async function toAudio({ source, ext = 'mp3', copy = false, tags = {}, cover = null, onProgress, signal }) {
+export async function toAudio({ source, ext = 'mp3', copy = false, tags = {}, cover = null, drop = [], onProgress, signal }) {
   const inputs = [{ name: `source.${source.ext || 'mp4'}`, data: source.data }];
   const args = ['-i', `source.${source.ext || 'mp4'}`];
 
   if (cover) {
     inputs.push({ name: 'cover.jpg', data: cover });
     args.push('-i', 'cover.jpg');
+  }
+
+  // Spans to leave out, a sponsor's. An encode drops exactly them, where a
+  // copy (cutOut) can only cut where the container lets it: on YouTube's
+  // WebM, six seconds of a sponsor stayed. After every input, or ffmpeg
+  // reads it as an option of the one that follows.
+  if (drop.length && !copy) {
+    const spans = drop.map(([from, to]) => `between(t,${from},${to})`).join('+');
+    args.push('-af', `aselect='not(${spans})',asetpts=N/SR/TB`);
   }
 
   if (copy) args.push('-c:a', 'copy');

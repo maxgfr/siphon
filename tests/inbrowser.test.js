@@ -10,7 +10,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 
-import { BrowserBackend } from '../web/inbrowser.js';
+import { BrowserBackend, sponsorSpans, keptSpans } from '../web/inbrowser.js';
 
 /** A host serving `routes` by path; a segment is anything else, `segmentBytes` long, after `delay` ms. */
 async function host(routes, { segmentBytes, delay }) {
@@ -118,4 +118,38 @@ test('a list queued on this device without a probe says it is a list, not that i
   assert.equal(state.state, 'error');
   assert.match(String(state.error), /is a list/);
   assert.doesNotMatch(String(state.error), /no downloadable formats/);
+});
+
+test("SponsorBlock's answer becomes the spans to drop, overlaps joined and kept inside the video", () => {
+  const answer = [
+    { category: 'sponsor', actionType: 'skip', segment: [623.539, 716.021], videoDuration: 1471.101 },
+    { category: 'selfpromo', actionType: 'skip', segment: [700, 730] },
+    { category: 'interaction', actionType: 'skip', segment: [1460, 1500] },
+    { category: 'sponsor', actionType: 'mute', segment: [100, 110] },
+    { category: 'sponsor', actionType: 'skip', segment: [5, 5.2] },
+  ];
+  assert.deepEqual(sponsorSpans(answer, 1471.101), [[623.539, 730], [1460, 1471.101]]);
+  assert.deepEqual(keptSpans([[623.539, 730], [1460, 1471.101]], 1471.101), [[0, 623.539], [730, 1460]]);
+  assert.deepEqual(keptSpans([[0, 12.5]], 100), [[12.5, null]]);
+  assert.deepEqual(sponsorSpans([], 100), []);
+});
+
+test('the large-file warning is said beside what the row already said, not over it', async () => {
+  // It replaced the note: the sponsors cut, or why the subtitles went in the
+  // video rather than beside it, were gone from a long download's row.
+  const server = await host({
+    '/show/master.m3u8': '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080\nv/index.m3u8\n',
+    '/show/v/index.m3u8': playlist(1200, 6),
+  }, { segmentBytes: 1000, delay: 5000 });
+  const backend = new BrowserBackend();
+  const { id } = await backend.start(`${server.base}/show/master.m3u8`, 'video_best', { subs: 'files' });
+  try {
+    await sleep(500);
+    const early = await backend.poll(id);
+    assert.match(String(early.note), /Large file/);
+    assert.match(String(early.note), /No subtitles were offered/);
+  } finally {
+    await backend.cancel(id);
+    server.close();
+  }
 });
