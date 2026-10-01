@@ -1150,8 +1150,8 @@ class TestJobOptions:
     """
 
     @staticmethod
-    def _job(**kwargs) -> "server_app.Job":
-        return server_app.Job(id="o1", url="https://www.youtube.com/watch?v=abc", preset="video_720", **kwargs)
+    def _job(preset: str = "video_720", **kwargs) -> "server_app.Job":
+        return server_app.Job(id="o1", url="https://www.youtube.com/watch?v=abc", preset=preset, **kwargs)
 
     @pytest.mark.parametrize(
         ("text", "seconds"),
@@ -1196,6 +1196,21 @@ class TestJobOptions:
         # The preset's own steps still follow.
         assert any(pp["key"] == "FFmpegMetadata" for pp in pps[2:])
         assert "SponsorBlock" not in [pp["key"] for pp in server_app.build_options(self._job(), None)["postprocessors"]]
+
+    @pytest.mark.parametrize("preset", ["audio_mp3", "audio_m4a"])
+    def test_audio_is_cut_once_it_is_the_file_handed_over(self, preset: str) -> None:
+        """
+        Cut first, the audio was YouTube's WebM, which a copy cannot cut where
+        it is told: the seek lands on the cluster before the segment's end and
+        what lies between is kept. A real 24-minute video lost its 92.5-second
+        sponsor as a video and kept six seconds of it as an MP3. yt-dlp's own
+        order cuts the extracted file, which cuts true.
+        """
+        keys = [pp["key"] for pp in server_app.build_options(self._job(preset=preset, sponsorblock=True), None)["postprocessors"]]
+        assert keys[0] == "SponsorBlock"
+        assert keys.index("ModifyChapters") == keys.index("FFmpegExtractAudio") + 1
+        # And the tags and the cover go on the file as cut.
+        assert keys.index("ModifyChapters") < keys.index("FFmpegMetadata") < keys.index("EmbedThumbnail")
 
     def test_a_clip_fetches_only_its_span(self) -> None:
         """

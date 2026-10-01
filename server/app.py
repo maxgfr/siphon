@@ -1340,11 +1340,17 @@ def build_options(job: Job, client: str | None) -> dict[str, Any]:
         options["cookiefile"] = cookies
     if job.sponsorblock:
         # The community's segment list is fetched after the video is chosen,
-        # and the cuts are made before anything else touches the file.
+        # and the cuts are made before anything else touches the file — but
+        # after the audio is extracted, in yt-dlp's own order. Cut first, the
+        # audio was YouTube's WebM, which a copy cannot cut where it is told:
+        # the seek lands on the cluster before the segment's end, and an MP3
+        # kept six seconds of a sponsor the video of it had lost.
+        steps = list(options.get("postprocessors", []))
+        extract = next((i + 1 for i, step in enumerate(steps) if step["key"] == "FFmpegExtractAudio"), 0)
+        steps.insert(extract, {"key": "ModifyChapters", "remove_sponsor_segments": SPONSOR_CATEGORIES, "force_keyframes": False})
         options["postprocessors"] = [
             {"key": "SponsorBlock", "categories": SPONSOR_CATEGORIES, "when": "after_filter"},
-            {"key": "ModifyChapters", "remove_sponsor_segments": SPONSOR_CATEGORIES, "force_keyframes": False},
-            *options.get("postprocessors", []),
+            *steps,
         ]
     if clipped:
         # Only the span asked for is fetched: yt-dlp hands it to ffmpeg,
