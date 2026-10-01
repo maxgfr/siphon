@@ -21,6 +21,8 @@ import {
   extensionOf,
   innertubeFetch,
   extract,
+  playableFormats,
+  answeringClient,
 } from '../web/extract.js';
 import { BackendError } from '../web/errors.js';
 import { Fetcher } from '../web/net.js';
@@ -1187,4 +1189,84 @@ test('a file on a host that refuses the page goes to a resolver that can take it
   } finally {
     globalThis.fetch = real;
   }
+});
+
+/* ----------------------------------------------------- YouTube's own clients */
+
+test('a client whose formats carry no URL is no answer, so the next client is asked', () => {
+  // YouTube's web client now lists every format with neither a URL nor a
+  // cipher, for its own streaming protocol only. The ladder took fourteen
+  // such formats as an answer, never asked IOS, and every download failed
+  // with youtubei.js's "No valid URL to decipher".
+  const web = {
+    formats: [],
+    adaptive_formats: [{ itag: 137 }, { itag: 140 }],
+    server_abr_streaming_url: 'https://rr1.googlevideo.com/videoplayback?sabr=1',
+  };
+  assert.deepEqual(playableFormats(web), []);
+  const ios = {
+    formats: [{ itag: 18, url: 'https://rr1.googlevideo.com/videoplayback?itag=18' }],
+    adaptive_formats: [{ itag: 140, signature_cipher: 's=abc&url=https%3A%2F%2Frr1.googlevideo.com' }, { itag: 251 }],
+  };
+  assert.deepEqual(playableFormats(ios).map((format) => format.itag), [18, 140]);
+  assert.deepEqual(playableFormats(undefined), []);
+});
+
+/** A youtubei.js session whose clients answer as `answers` says, by name. */
+function session(answers) {
+  const asked = [];
+  return {
+    asked,
+    session: { player: {} },
+    async getBasicInfo(id, options) {
+      const client = options?.client || 'default';
+      asked.push(client);
+      const answer = answers[client];
+      if (answer instanceof Error) throw answer;
+      return answer;
+    },
+  };
+}
+
+const playable = (formats) => ({ playability_status: { status: 'OK' }, streaming_data: { formats: [], adaptive_formats: formats } });
+const format = (itag, decipher) => ({ itag, url: `https://rr1.googlevideo.com/videoplayback?itag=${itag}`, decipher });
+const needsEvaluator = async () => {
+  throw new Error('To decipher URLs, you must provide your own JavaScript evaluator.');
+};
+
+test('a client whose formats this page cannot decipher is passed over for one it can', async () => {
+  // youtubei.js deciphers nothing without a JavaScript evaluator, which this
+  // page does not give it. On the days YouTube hands the web client formats
+  // that need one, the ladder stopped there and every download failed with
+  // "To decipher URLs, you must provide your own JavaScript evaluator";
+  // IOS, next but one, hands out URLs that need nothing.
+  const youtube = session({
+    default: playable([format(140, needsEvaluator)]),
+    TV_EMBEDDED: new Error('This video is unavailable'),
+    IOS: playable([format(140, async () => 'https://rr1.googlevideo.com/videoplayback?itag=140&n=ok')]),
+  });
+  const answer = await answeringClient(youtube, 'jNQXAC9IVRw');
+  assert.equal(answer.client, 'IOS');
+  assert.deepEqual(youtube.asked, ['default', 'TV_EMBEDDED', 'IOS']);
+  assert.equal(answer.raw.length, 1);
+});
+
+test('and when no client is usable, the last reason is kept for the person to read', async () => {
+  const wall = { playability_status: { status: 'LOGIN_REQUIRED', reason: 'Sign in to confirm you are not a bot' } };
+  const youtube = session({
+    default: playable([{ itag: 140 }]),
+    TV_EMBEDDED: new Error('This video is unavailable'),
+    IOS: wall,
+    ANDROID_VR: wall,
+    MWEB: playable([format(140, needsEvaluator)]),
+  });
+  const answer = await answeringClient(youtube, 'jNQXAC9IVRw');
+  assert.equal(answer.client, undefined);
+  assert.match(answer.lastReason, /JavaScript evaluator/);
+});
+
+test('a video YouTube says is gone is final, not a reason to try another client', async () => {
+  const youtube = session({ default: { playability_status: { status: 'ERROR', reason: 'Video unavailable' } } });
+  await assert.rejects(answeringClient(youtube, 'gone0000000'), (error) => error instanceof BackendError && /Video unavailable/.test(error.message));
+  assert.deepEqual(youtube.asked, ['default']);
 });

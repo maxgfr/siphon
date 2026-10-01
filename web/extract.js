@@ -749,6 +749,70 @@ async function youtubeSession(net) {
 /** Bot walls are worth another client; a private video is not. */
 const isBotWall = (reason) => /sign in|not a bot|confirm you|age|inappropriate/i.test(String(reason || ''));
 
+/**
+ * The formats of an answer that a page can fetch: those with a URL, or a
+ * cipher that makes one.
+ *
+ * YouTube's web client lists its formats with neither, for its own streaming
+ * protocol, which nothing here speaks. Counted as an answer, they stopped the
+ * ladder on the first client, and every download failed at the decipher.
+ */
+export function playableFormats(streaming) {
+  return [...(streaming?.formats || []), ...(streaming?.adaptive_formats || [])].filter(
+    (format) => format.url || format.signature_cipher || format.cipher,
+  );
+}
+
+/**
+ * Walk the clients until one gives an answer this page can download from.
+ *
+ * Resolves to `{ client, info, raw }`, or to `{ lastReason }` when every
+ * client was turned away; rejects only when YouTube says the video itself
+ * cannot be had, which no other client will change.
+ *
+ * One format is deciphered here, before the client is taken. youtubei.js
+ * deciphers nothing without a JavaScript evaluator, which this page does not
+ * give it, and on some days YouTube hands the default client formats that
+ * need one: the ladder stopped there, and the download failed later, at the
+ * decipher, with no other client tried. A client's formats all need the same
+ * thing, so one says enough.
+ */
+export async function answeringClient(youtube, id, clients = YT_CLIENTS) {
+  let lastReason = '';
+  for (const client of clients) {
+    let info;
+    try {
+      info = await youtube.getBasicInfo(id, client ? { client } : undefined);
+    } catch (error) {
+      lastReason = error?.message || String(error);
+      continue;
+    }
+
+    const status = info?.playability_status;
+    if (status && status.status !== 'OK') {
+      lastReason = status.reason || status.status;
+      if (!isBotWall(lastReason)) {
+        throw new BackendError(`YouTube says: ${lastReason}`, { retryable: false });
+      }
+      continue;
+    }
+
+    const raw = playableFormats(info.streaming_data);
+    if (raw.length === 0) {
+      lastReason = lastReason || 'no formats with a usable URL were offered';
+      continue;
+    }
+    try {
+      if (!(await raw[0].decipher(youtube.session.player))) throw new Error('a format came back with no URL');
+    } catch (error) {
+      lastReason = error?.message || String(error);
+      continue;
+    }
+    return { client, info, raw };
+  }
+  return { lastReason };
+}
+
 async function extractYouTube(url, context) {
   const id = youtubeId(url);
   if (!id) {
@@ -802,33 +866,8 @@ async function extractYouTube(url, context) {
   }
 
   const youtube = await youtubeSession(context.net);
-  let lastReason = '';
-
-  for (const client of YT_CLIENTS) {
-    let info;
-    try {
-      info = await youtube.getBasicInfo(id, client ? { client } : undefined);
-    } catch (error) {
-      lastReason = error?.message || String(error);
-      continue;
-    }
-
-    const status = info?.playability_status;
-    if (status && status.status !== 'OK') {
-      lastReason = status.reason || status.status;
-      if (!isBotWall(lastReason)) {
-        throw new BackendError(`YouTube says: ${lastReason}`, { retryable: false });
-      }
-      continue;
-    }
-
-    const streaming = info.streaming_data;
-    const raw = [...(streaming?.formats || []), ...(streaming?.adaptive_formats || [])];
-    if (raw.length === 0) {
-      lastReason = lastReason || 'no formats were offered';
-      continue;
-    }
-
+  const { client, info, raw, lastReason } = await answeringClient(youtube, id);
+  if (raw) {
     const basic = info.basic_info || {};
     return {
       id,
