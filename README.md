@@ -125,7 +125,10 @@ as if there were no bridge. It runs on your IP, which YouTube treats far
 more gently than a datacentre's. It fetches public http(s) addresses only,
 with GET, HEAD or POST — never this machine or your network — because its
 `localhost:8000` match cannot tell siphon from anything else served on that
-port.
+port. YouTube is the exception to "every extractor": since 2026-10 googlevideo
+serves the clients a page can use about a minute of a stream and refuses the
+rest, so a longer YouTube video needs your own server, alone or resolving for
+this device ([docs/youtube.md](docs/youtube.md)).
 
 A userscript manager hands a response over only once all of it has arrived,
 so the page asks the bridge for a file a few megabytes at a time: the bar
@@ -364,7 +367,8 @@ Secrets), which no later deploy can drop, set to your page's origin
 (`https://you.github.io`, no path) so nobody else spends your quota.
 `ALLOWED_HOSTS` keeps it from being an open proxy. With a relay set, the
 bundled Invidious list is walked through it first — the instances refuse a
-*page*, not a plain client — and InnerTube through the relay is the fallback.
+*page*, not a plain client — and InnerTube through the relay is the fallback,
+for YouTube videos of about a minute at most (see the bridge, above).
 `node relay/serve.mjs` runs the same file on your own machine with no account,
 on your home IP, for the browser on that machine: the page is HTTPS, and a
 browser lets it call plain http on `127.0.0.1` only, so a phone needs the

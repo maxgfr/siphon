@@ -351,7 +351,11 @@ yt-dlp's `visionos` client, which the server uses for video, is served whole
 with neither a token nor a challenge solved; its audio comes from a client
 whose challenge yt-dlp solves with Deno. So from a page today, a YouTube video
 longer than about a minute does not download: the page reads
-*rr5---….googlevideo.com answered 403*. Through your own server it does.
+*rr5---….googlevideo.com answered 403*. Through your own server it does,
+and so does the split, where the server resolves with yt-dlp and the device
+downloads through its tunnel: the same video at 720p, in H.264 with its
+original French soundtrack, in 67 seconds, once the tunnel asked googlevideo
+for 10 MiB windows rather than the whole file it serves at 30 KB/s.
 
 `pipedapi.kavin.rocks` answered `HTTP 502 Bad gateway`, and every bundled
 Invidious instance shut its video endpoint as above (403 *Endpoint disabled*,

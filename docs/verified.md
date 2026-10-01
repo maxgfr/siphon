@@ -286,7 +286,7 @@ On 2026-10-01 every suite above ran on one machine on a residential IP, and
 the image was built and driven through its API and its page: a direct file,
 a YouTube video, its MP3, a clip, its subtitles, a playlist, the resolve and
 the tunnel, the access key, CORS, the address guard, the cookie upload, and
-the proof-of-origin provider. Four defects only the real thing could show:
+the proof-of-origin provider. Eight defects only the real thing could show:
 
 - **The browser mode stopped at the first YouTube client with any formats.**
   YouTube now gives the default client formats with no URL, or with URLs only
@@ -306,6 +306,25 @@ the proof-of-origin provider. Four defects only the real thing could show:
   where it is told: a 92.5-second sponsor lost in full from the video kept six
   seconds in the MP3. The cut now comes after the extraction, in yt-dlp's own
   order.
+- **A stream googlevideo refused once failed the job.** It does that now and
+  then on a link it served a moment before — `HTTP Error 403` on the video
+  data, or ffmpeg's exit code 8 for a clip — and the same job asked again
+  went through. Such a refusal is now answered with fresh links, twice at most.
+- **The tunnel crawled.** googlevideo serves a whole stream at about 30 KB/s
+  and a bounded window of 10 MiB in a second, which is why yt-dlp's YouTube
+  formats name a window (`http_chunk_size`). The tunnel passed the page's
+  request for the whole file on as it came; it now asks for the windows the
+  format named. A 24-minute video's audio and 720p video, 308 MiB, came
+  through in 37 seconds.
+- **The page took a dub over the original.** YouTube adds auto-dubbed
+  soundtracks, and the English one of a French video came first by bitrate:
+  every split download was in English, where yt-dlp took the French. A
+  resolve now passes on yt-dlp's rank of each soundtrack, the YouTube path
+  works it out from youtubei.js, and the planner takes the original first.
+- **The page took a picture its own .mp4 could not show.** At 720p it took
+  YouTube's VP9 for its bitrate and wrote it into an MP4, which QuickTime,
+  Safari and an iPhone do not play; H.264 of the same height was there. At
+  one height the planner now takes H.264, then HEVC, then AV1, then VP9.
 
 And one limit that is YouTube's: from a page, every client youtubei.js offers
 is served about a minute of a stream and then refused, so a YouTube video
