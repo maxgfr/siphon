@@ -278,4 +278,29 @@ that log is also what found the missing JavaScript runtime in the image.
 mode on a datacentre IP. The code is correct up to the wall, checked request by
 request. From a home connection — the bridge, or `node relay/serve.mjs` on
 your own machine — that is the case the code is written for, and the one
-measurement a runner cannot make.
+measurement a runner cannot make. It was made once, below.
+
+## What running everything from a home connection found
+
+On 2026-10-01 every suite above ran on one machine on a residential IP, and
+the image was built and driven through its API and its page: a direct file,
+a YouTube video, its MP3, a clip, its subtitles, a playlist, the resolve and
+the tunnel, the access key, CORS, the address guard, the cookie upload, and
+the proof-of-origin provider. Three defects only the real thing could show:
+
+- **The browser mode stopped at the first YouTube client with any formats.**
+  YouTube now gives the default client formats with no URL, or with URLs only
+  a JavaScript evaluator can decipher, which the page does not give
+  youtubei.js; every download failed at the decipher and IOS, whose URLs need
+  neither, was never asked. A client now counts only once a format of its own
+  has deciphered.
+- **ffmpeg.wasm never finished re-encoding YouTube's thumbnail as cover art**,
+  so an MP3 or M4A made on the device sat at "Converting…" for good. A JPEG
+  cover is now copied in as it is.
+- **A playlist that lost videos on the way said nothing.** YouTube refused two
+  of a real seven with a 403 and the job was done, a zip of five; with one
+  left it would have been that file alone. The row now says how many did not
+  arrive, and the last reason given.
+
+The rest of what that run measured, YouTube's and the public instances'
+answers included, is quoted in [youtube.md](youtube.md).

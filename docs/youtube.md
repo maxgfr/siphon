@@ -301,7 +301,52 @@ So from a datacentre IP, with the runtime and the provider both present,
 YouTube refuses every client until there is a session behind the request.
 yt-dlp's own advice on that machine is cookies, which is the second step of
 the README's three and the one a runner cannot take. On a home connection the
-same code is what the image is for; that measurement is yours to make.
+same code is what the image is for; that measurement is the next section.
+
+### From a home connection, 2026-10-01
+
+The same suites from a residential IP in France, no cookies. The bare probe
+(`npm run test:innertube`):
+
+```
+WEB          HTTP 200  playability=UNPLAYABLE (Video unavailable)  formats=0
+MWEB         HTTP 200  playability=UNPLAYABLE (The page needs to be reloaded.)  formats=0
+TV_EMBEDDED  HTTP 200  playability=ERROR (YouTube is no longer supported in this application or device.)
+IOS          HTTP 200  playability=OK  formats=16
+ANDROID_VR   HTTP 200  playability=LOGIN_REQUIRED (Sign in to confirm you're not a bot)  formats=0
+2/8 hand-built variants got a playable answer
+youtubei.js: default, IOS and MWEB playable; TV_EMBEDDED unavailable
+```
+
+Playable is not the same as downloadable. youtubei.js gave the default client
+fourteen formats with no URL at all, for YouTube's own streaming protocol;
+another run gave it formats with URLs that only a JavaScript evaluator can
+decipher, which the page does not give the library. IOS's URLs need neither.
+The page took the first client with any formats, so every download failed at
+the decipher, and IOS was never asked. It now takes the first client with a
+format it can actually use, and both from the browser through
+`node relay/serve.mjs` then arrived:
+
+```
+ok   video_480 produced real video via youtube (IOS) — 320x240
+ok   audio_m4a produced AAC audio via youtube (IOS) — Me at the zoo.m4a
+```
+
+The M4A first sat at "Converting…" for good: ffmpeg.wasm never comes back
+from re-encoding YouTube's thumbnail as cover art, where native ffmpeg takes
+no time. A JPEG cover is now copied in as it is.
+
+`pipedapi.kavin.rocks` answered `HTTP 502 Bad gateway`, and every bundled
+Invidious instance shut its video endpoint as above (403 *Endpoint disabled*,
+403, 401, 303), so neither of those paths is a home connection's either.
+
+The server (`npm run test:server`, and the image through `docker compose`)
+downloaded the video, its MP3, a 720p clip, its subtitles as `.srt` and a
+seven-video playlist as a zip with no cookies. With the provider beside it, a
+job pinned to `mweb` used a proof-of-origin token the provider minted. One
+playlist run lost two of its seven to `HTTP Error 403: Forbidden` on the
+video data and said nothing about it; the row now says how many did not
+arrive, and why.
 
 ## What follows
 
@@ -317,7 +362,8 @@ through a public instance or a relay on a datacentre IP. The code is correct up
 to the wall, checked request by request, and every suite that can run without
 YouTube's cooperation is green. From a home connection — `node relay/serve.mjs`
 on your own machine, its address in settings, or the bridge — that is the case
-the code is written for, and the one measurement a runner cannot make.
+the code is written for, and the one measurement a runner cannot make; it was
+made once, on 2026-10-01, and is quoted above.
 
 **The server is measured separately.** `npm run test:server` starts
 `server/app.py` on a runner and asks it for the same video, first plain and then
