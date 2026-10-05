@@ -56,6 +56,8 @@ jobs:
           git push
       # A push made with GITHUB_TOKEN does not trigger other workflows.
       - if: steps.diff.outputs.changed == 'true'
-        run: gh workflow run pages.yml
+        run: |
+          gh workflow run pages.yml
+          gh workflow run image.yml
         env:
           GH_TOKEN: ${{ github.token }}

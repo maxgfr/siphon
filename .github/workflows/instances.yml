@@ -53,9 +53,11 @@ jobs:
           git pull --rebase origin main
           git push
       # A push made with GITHUB_TOKEN does not trigger other workflows, so the
-      # Pages deploy is asked for directly — otherwise the fresh list would sit
-      # on main and never reach the site.
+      # Pages deploy and the image build are asked for directly — otherwise the
+      # fresh list would sit on main and reach neither the site nor the image.
       - if: steps.diff.outputs.changed == 'true'
-        run: gh workflow run pages.yml
+        run: |
+          gh workflow run pages.yml
+          gh workflow run image.yml
         env:
           GH_TOKEN: ${{ github.token }}
