@@ -10,13 +10,10 @@ name: Publish the server image
 # leave running at home.
 
 on:
+  # Every push to main publishes, whatever it touched, so the image's sha tag
+  # always names the head of main.
   push:
     branches: [main]
-    paths:
-      - "server/**"
-      - "web/**"
-      - "scripts/vendor_ffmpeg.py"
-      - ".github/workflows/image.yml"
     tags: ["v*"]
   # yt-dlp is what YouTube breaks, and it releases about monthly. An image
   # built once and pulled months later carries a stale extractor, which is the
