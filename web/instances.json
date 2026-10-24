@@ -1,12 +1,11 @@
 {
-  "updated": "2026-09-17",
+  "updated": "2026-10-24",
   "source": "api.invidious.io + seed",
   "invidious": [
-    "https://invidious.f5.si",
+    "https://yt.chocolatemoo53.com",
     "https://inv.nadeko.net",
     "https://yewtu.be",
     "https://invidious.nerdvpn.de",
-    "https://yt.chocolatemoo53.com",
     "https://invidious.tiekoetter.com",
     "https://inv.thepixora.com"
   ],
@@ -17,6 +16,11 @@
     "https://pipedapi.leptons.xyz",
     "https://pipedapi.ducks.party"
   ],
-  "open": [],
-  "measured": "2026-09-17"
+  "open": [
+    {
+      "url": "https://yt.chocolatemoo53.com",
+      "kind": "invidious"
+    }
+  ],
+  "measured": "2026-10-24"
 }
