@@ -1,7 +1,7 @@
 {
-  "relay": "https://api.allorigins.win/raw?url={url}",
-  "relayKind": "public",
-  "instance": "https://yt.chocolatemoo53.com",
+  "relay": "",
+  "relayKind": "",
+  "instance": "",
   "cobalt": "",
-  "checked": "2026-10-27"
+  "checked": "2026-10-28"
 }
