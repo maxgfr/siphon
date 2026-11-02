@@ -23,6 +23,8 @@ const SHELL = [
   // The in-browser extractor. Small enough to precache, and the reason the app
   // can do anything at all with no network to a server of ours.
   './inbrowser.js', './extract.js', './net.js', './m3u8.js', './media.js', './store.js', './ffmpeg-worker.js',
+  // The access key's encrypted keeping, which app.js imports.
+  './secret.js',
 ];
 
 self.addEventListener('install', (event) => {
@@ -33,7 +35,9 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches
       .keys()
-      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key))))
+      // Only our own: maxgfr.github.io is one origin shared by every project
+      // site of the account, and caches.keys() lists all of theirs too.
+      .then((keys) => Promise.all(keys.filter((key) => key.startsWith('siphon-') && key !== CACHE).map((key) => caches.delete(key))))
       .then(() => self.clients.claim()),
   );
 });

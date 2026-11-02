@@ -1119,7 +1119,7 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   check('and after a reload too, not a UUID ending in .txt', second === 'clip.mp4', second);
 
   const stored = () => page.evaluate(async () => {
-    const folder = await (await navigator.storage.getDirectory()).getDirectoryHandle('downloads', { create: true });
+    const folder = await (await navigator.storage.getDirectory()).getDirectoryHandle('siphon-downloads', { create: true });
     const names = [];
     for await (const [name] of folder.entries()) names.push(name);
     return names;
