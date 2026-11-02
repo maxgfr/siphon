@@ -13,7 +13,7 @@ tests/.split/
 tests/.server/
 
 # ffmpeg.wasm, put beside the app by scripts/vendor_ffmpeg.py at deploy time
-web/vendor/
+web/vendor/ffmpeg/
 
 # Working artifacts of the impeccable design skill (screenshots, reports).
 .impeccable/

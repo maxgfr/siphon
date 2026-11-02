@@ -586,6 +586,33 @@ function serveFull(port) {
 /* ---------------------------------------------------------------------- checking */
 
 const results = [];
+/**
+ * Where an access key sits once saved: sealed (AES-GCM, name bound) in
+ * siphon-sealed, and in clear nowhere — not in localStorage, which every
+ * site on maxgfr.github.io shares, nor in the sealed record's bytes.
+ */
+function keyAtRest(tab, key) {
+  return tab.evaluate(async (key) => {
+    const record = await new Promise((resolve) => {
+      const open = indexedDB.open('siphon-sealed');
+      open.onupgradeneeded = () => open.transaction.abort();
+      open.onerror = () => resolve(null);
+      open.onsuccess = () => {
+        const get = open.result.transaction('kv').objectStore('kv').get('access-key');
+        get.onsuccess = () => resolve(get.result ?? null);
+        get.onerror = () => resolve(null);
+      };
+    });
+    const bytes = record?.ciphertext ? new TextDecoder().decode(record.ciphertext) : '';
+    const stored = Object.keys(localStorage).map((name) => localStorage.getItem(name)).join('\n');
+    return {
+      sealed: record?.v === 2 && record.iv instanceof Uint8Array && record.ciphertext instanceof ArrayBuffer,
+      clear: bytes.includes(key) || stored.includes(key),
+      databases: (await indexedDB.databases()).map((db) => db.name).filter((name) => name.startsWith('siphon')).sort(),
+    };
+  }, key);
+}
+
 function check(name, condition, detail = '') {
   results.push({ name, ok: Boolean(condition) });
   console.log(`${condition ? 'ok  ' : 'FAIL'} ${name}${detail ? ` — ${detail}` : ''}`);
@@ -1360,6 +1387,8 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
   await page.click('#saveSettings');
   await page.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 15_000 });
   check('your own server is saved with its access key', /your server/.test((await page.textContent('#backendLabel')) || ''), await page.textContent('#backendLabel'));
+  const atRest = await keyAtRest(page, OWN_KEY);
+  check('the key is sealed by llm-connect, nowhere in clear text', atRest.sealed && !atRest.clear, JSON.stringify(atRest));
   const guide = (await page.textContent('#tourYoutube')) || '';
   check('and the guide says YouTube is ready, rather than what to set up for it', /^Ready\./.test(guide) && await page.evaluate(() => document.getElementById('tourOptions').hidden), guide.slice(0, 80));
   await page.click('#openSettings');
@@ -1709,6 +1738,72 @@ const source = readFileSync(join(MEDIA_DIR, 'clip.mp4'));
 
   check('no uncaught errors with your own server', errors.length === 0, errors.slice(0, 2).join(' ; '));
   await own.close();
+}
+
+/* A key sealed by an earlier version of siphon's own code moves into llm-connect's sealed store. */
+{
+  const earlier = await browser.newContext();
+  const tab = await earlier.newPage();
+  await tab.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  const LEGACY_KEY = 'KEY-SEALED-BY-AN-EARLIER-VERSION';
+  await tab.evaluate(async ({ key, endpoint }) => {
+    const db = await new Promise((resolve, reject) => {
+      const open = indexedDB.open('siphon-secret', 1);
+      open.onupgradeneeded = () => open.result.createObjectStore('kv');
+      open.onsuccess = () => resolve(open.result);
+      open.onerror = () => reject(open.error);
+    });
+    const cryptoKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, new TextEncoder().encode(key));
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('kv', 'readwrite');
+      tx.objectStore('kv').put(cryptoKey, 'crypto-key');
+      tx.objectStore('kv').put({ iv, data }, 'access-key');
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+    localStorage.setItem('siphon:settings', JSON.stringify({
+      endpoint, keyed: true, helper: { kind: 'siphon', label: 'yt-dlp 2026.09.01', ffmpeg: true, keyAccepted: true, hasCookies: false, capabilities: ['jobs', 'resolve', 'tunnel'] },
+      preset: 'video_best', subs: 'off',
+    }));
+  }, { key: LEGACY_KEY, endpoint: FULL });
+  await tab.reload({ waitUntil: 'networkidle' });
+  await tab.waitForFunction(async () => !(await indexedDB.databases()).some((db) => db.name === 'siphon-secret'), null, { timeout: 10_000 }).catch(() => {});
+  const moved = await keyAtRest(tab, LEGACY_KEY);
+  check('a key sealed by an earlier version is moved into the sealed store, and the old database dropped',
+    moved.sealed && !moved.clear && moved.databases.join() === 'siphon-sealed', JSON.stringify(moved));
+  await tab.reload({ waitUntil: 'networkidle' });
+  await tab.click('#openSettings');
+  const field = await tab.inputValue('#endpointKey');
+  check('and it is still the key after a reload', field === LEGACY_KEY, JSON.stringify(field));
+  await earlier.close();
+}
+
+/* A key the browser will not store is not said to be saved. */
+{
+  const full = await browser.newContext();
+  await full.addInitScript(() => {
+    const quota = () => {
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+    };
+    IDBObjectStore.prototype.put = quota;
+    IDBObjectStore.prototype.add = quota;
+  });
+  const tab = await full.newPage();
+  await tab.goto(`http://127.0.0.1:${APP_PORT}/app/index.html`, { waitUntil: 'networkidle' });
+  await tab.click('#openSettings');
+  await tab.fill('#endpoint', '');
+  await tab.fill('#endpointKey', OWN_KEY);
+  await tab.locator('#endpoint').pressSequentially(OWN);
+  await tab.click('#saveSettings');
+  await tab.waitForFunction(() => !document.getElementById('settings').open, null, { timeout: 15_000 });
+  const said = (await tab.locator('[role="alert"]').allTextContents()).join(' ');
+  check('a key that cannot be kept says it will not be remembered', /Not remembered/.test(said), said.slice(0, 90));
+  const rest = await keyAtRest(tab, OWN_KEY);
+  check('and it is not left in clear text instead', !rest.clear, JSON.stringify(rest));
+  await full.close();
 }
 
 check('no uncaught errors in the page', consoleErrors.length === 0, consoleErrors.slice(0, 2).join(' ; '));
