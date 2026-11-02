@@ -851,6 +851,15 @@ for (const [old, expected] of [
   await page.waitForTimeout(1200);
   check('and so does a shared link, with no network',
     broke === null && (await page.locator('#url').count()) === 1 && (await page.inputValue('#url')) === `${BASE}/shared.mp4`, broke || '');
+
+  // Cache Storage is the origin's, and maxgfr.github.io is every project
+  // site's: a page another one cached under our address is never served.
+  const planted = await page.evaluate(async () => {
+    const url = new URL('planted.js', location.href).href;
+    await (await caches.open('another-site')).put(url, new Response('planted'));
+    return (await fetch(url)).text().catch((error) => String(error));
+  });
+  check("offline, the worker never serves what another site cached under our address", planted !== 'planted', planted.slice(0, 60));
   await context.setOffline(false);
   await context.close();
 }

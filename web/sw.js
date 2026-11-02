@@ -23,8 +23,9 @@ const SHELL = [
   // The in-browser extractor. Small enough to precache, and the reason the app
   // can do anything at all with no network to a server of ours.
   './inbrowser.js', './extract.js', './net.js', './m3u8.js', './media.js', './store.js', './ffmpeg-worker.js',
-  // The access key's encrypted keeping, which app.js imports.
-  './secret.js',
+  // The access key's encrypted keeping, which app.js imports, and the
+  // llm-connect module it seals with.
+  './secret.js', './vendor/llm-connect-sealed-store.js',
 ];
 
 self.addEventListener('install', (event) => {
@@ -69,6 +70,8 @@ self.addEventListener('fetch', (event) => {
         }
         return response;
       })
-      .catch(() => caches.match(key || request).then((hit) => hit || caches.match('./index.html'))),
+      // Our cache only, never caches.match(): it searches every cache of the
+      // origin, and any other site on it could plant a page under our URLs.
+      .catch(() => caches.open(CACHE).then(async (cache) => (await cache.match(key || request)) || cache.match('./index.html'))),
   );
 });
