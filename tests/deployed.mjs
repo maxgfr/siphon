@@ -310,9 +310,18 @@ for (const [old, expected] of [
   await page.waitForTimeout(1500);
   const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('siphon:settings') || '{}'));
   check(`an old "${old.mode}" setup becomes a ${expected.kind} helper`,
-    saved.helper?.kind === expected.kind && saved.endpoint === expected.endpoint && (expected.key ? saved.key === expected.key : true),
-    JSON.stringify({ helper: saved.helper?.kind, endpoint: saved.endpoint, key: saved.key }));
+    saved.helper?.kind === expected.kind && saved.endpoint === expected.endpoint && saved.keyed === Boolean(expected.key),
+    JSON.stringify({ helper: saved.helper?.kind, endpoint: saved.endpoint, keyed: saved.keyed }));
   check('and the unrelated preferences survive the move', saved.preset === 'audio_mp3', saved.preset);
+  if (expected.key) {
+    // The origin's localStorage is shared with every other site on it: the
+    // key leaves it, encrypted elsewhere, and comes back on the next visit.
+    check('the access key is no longer in clear text in localStorage', !('key' in saved), JSON.stringify(saved));
+    await page.reload({ waitUntil: 'networkidle' });
+    await page.click('#openSettings');
+    const field = await page.inputValue('#endpointKey');
+    check('and it is still there after a reload', field === expected.key, JSON.stringify(field));
+  }
   await context.close();
 }
 

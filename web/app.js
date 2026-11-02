@@ -14,6 +14,7 @@
 import { PRESETS, BackendError, makeBackend, detectEndpoint, findInstance, bundledInfo, privacyNote, describeEndpoint, servesPages, withScheme, phoneRoute } from './api.js';
 import { asLink, looksLikeUrl, urlsIn } from './links.js';
 import { validateYtdlp, fromAdvanced } from './options.js';
+import { readSecret, writeSecret } from './secret.js';
 
 const SETTINGS_KEY = 'siphon:settings';
 const POLL_MS = 700;
@@ -71,8 +72,12 @@ const recent = [];
 function loadSettings() {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    const saved = migrate(JSON.parse(raw || '{}'));
-    return { settings: { ...DEFAULT_SETTINGS, ...saved }, firstVisit: !raw };
+    const parsed = JSON.parse(raw || '{}');
+    const saved = migrate(parsed && typeof parsed === 'object' ? parsed : {});
+    // The key used to be saved here in clear text; one that still is gets
+    // moved into secret.js by init, and only then taken out of here.
+    const { keyed, ...rest } = saved;
+    return { settings: { ...DEFAULT_SETTINGS, ...rest, key: typeof rest.key === 'string' ? rest.key : '' }, firstVisit: !raw, keyed: keyed === true };
   } catch {
     return { settings: { ...DEFAULT_SETTINGS }, firstVisit: true };
   }
@@ -224,13 +229,42 @@ const hostOf = (url) => {
   }
 };
 
+/**
+ * The access key as last kept by writeSecret, so a change of quality or
+ * subtitles does not re-encrypt it every time.
+ */
+let keptKey = '';
+
+/**
+ * Remember the settings, and say whether they will survive a reload.
+ *
+ * The access key is not in what goes to localStorage: this origin's storage
+ * is shared with every other site on maxgfr.github.io, so the key goes to
+ * secret.js, encrypted. `keyed` is what tells the next visit there is one to
+ * read back. Never throws: private mode or a full storage leaves the session
+ * working, and the Save button says it will not be remembered.
+ *
+ * @returns {Promise<boolean>}
+ */
 function saveSettings() {
+  const { key, ...rest } = settings;
+  let stored = true;
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...rest, keyed: Boolean(key) }));
   } catch {
-    /* private mode — the session still works, it just won't be remembered */
+    stored = false;
   }
+  if (key === keptKey) return Promise.resolve(stored);
+  return writeSecret(key).then((kept) => {
+    if (kept) keptKey = key;
+    return stored && kept;
+  });
 }
+
+const NOT_KEPT =
+  '<div class="notice error" role="alert"><p><strong>Not remembered.</strong> ' +
+  'This browser would not store these settings — storage for this site is full or turned off. ' +
+  'They work until you reload this page, and are lost after that.</p></div>';
 
 /* ----------------------------------------------------------------- helpers */
 
@@ -867,6 +901,7 @@ function handOver(entry) {
 async function restoreQueue() {
   try {
     queue = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+    if (!Array.isArray(queue)) queue = [];
   } catch {
     queue = [];
   }
@@ -1543,13 +1578,20 @@ function readSharedLinks() {
   return links;
 }
 
-function init() {
+async function init() {
   const loaded = loadSettings();
   settings = loaded.settings;
+  if (settings.key) {
+    // A key written in clear text by an earlier version: encrypted first, and
+    // the clear copy dropped only once that worked, so it is never lost.
+    if (await writeSecret(settings.key)) keptKey = settings.key;
+  } else if (loaded.keyed) {
+    settings.key = keptKey = await readSecret();
+  }
   // Normalise what is stored: a settings blob written by an older version is
   // migrated on read, and leaving that only in memory means every reload does
   // it again and nothing else ever sees the current shape.
-  if (!loaded.firstVisit) saveSettings();
+  if (!loaded.firstVisit && settings.key === keptKey) saveSettings();
   applyBackend();
   renderQualities();
   renderAction();
@@ -1721,10 +1763,10 @@ function init() {
       return;
     }
     settings = { ...draftSettings(), helper };
-    saveSettings();
+    const kept = await saveSettings();
     applyBackend();
     $('settings').close();
-    renderFeedback('');
+    renderFeedback(kept ? '' : NOT_KEPT);
     syncSubFields();
     refreshBackendLabel();
     // The guide says what YouTube needs; with a helper just set, it needs nothing.

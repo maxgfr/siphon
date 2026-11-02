@@ -13,7 +13,16 @@
  * That loses the survive-a-reload property and nothing else.
  */
 
-const FOLDER = 'downloads';
+/**
+ * Named after the app: the origin private file system belongs to the origin,
+ * and maxgfr.github.io is one origin for every project site of the account.
+ * A folder called "downloads" was anybody's, and the sweep below would have
+ * deleted their files too.
+ */
+const FOLDER = 'siphon-downloads';
+const LEGACY_FOLDER = 'downloads';
+/** A job id, as inbrowser.js makes it: `b-${time in base 36}-${random}`. */
+const OUR_FILE = /^b-[a-z0-9]+-[a-z0-9]+$/;
 const memory = new Map();
 let directoryPromise = null;
 
@@ -22,10 +31,49 @@ async function directory() {
   if (!directoryPromise) {
     directoryPromise = navigator.storage
       .getDirectory()
-      .then((root) => root.getDirectoryHandle(FOLDER, { create: true }))
+      .then(async (root) => {
+        const folder = await root.getDirectoryHandle(FOLDER, { create: true });
+        await adoptLegacy(root, folder);
+        return folder;
+      })
       .catch(() => null);
   }
   return directoryPromise;
+}
+
+/**
+ * Bring finished downloads kept by an earlier version into our folder.
+ *
+ * Only the files whose names are queue keys move; anything else in the old
+ * folder may be another site's, and the folder itself is left where it is.
+ * Best-effort and idempotent: a file that cannot be moved stays behind, and a
+ * moved one is no longer there to be moved again.
+ */
+async function adoptLegacy(root, folder) {
+  let legacy;
+  try {
+    legacy = await root.getDirectoryHandle(LEGACY_FOLDER);
+  } catch {
+    return;
+  }
+  if (!legacy.entries) return;
+  try {
+    for await (const [name, handle] of legacy.entries()) {
+      if (handle.kind !== 'file' || !OUR_FILE.test(name)) continue;
+      try {
+        const file = await handle.getFile();
+        const target = await folder.getFileHandle(name, { create: true });
+        const writable = await target.createWritable();
+        await writable.write(file);
+        await writable.close();
+        await legacy.removeEntry(name);
+      } catch {
+        /* quota, or no createWritable: left in place, and tried again next time */
+      }
+    }
+  } catch {
+    /* iterating is best-effort */
+  }
 }
 
 /** Keys come from queue entries, which are ours, but a path separator would still escape. */
