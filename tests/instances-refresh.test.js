@@ -8,8 +8,11 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-import { answersPage, fromDirectory, fromDocsPage, fromPipedDirectory, measure, onTheInternet, reachable, refresh, refreshPiped, API_URL, DOCS_URL, ORIGIN, PIPED_SEED, PIPED_URL, SAMPLE_ID, SEED } from '../scripts/instances.mjs';
+import { answersPage, fromDirectory, fromDocsPage, fromPipedDirectory, measure, onTheInternet, reachable, readBundled, refresh, refreshPiped, API_URL, DOCS_URL, ORIGIN, PIPED_SEED, PIPED_URL, SAMPLE_ID, SEED } from '../scripts/instances.mjs';
 
 /** A resolver that puts every name on the internet, for the tests about lists rather than DNS. */
 const anywhere = { resolve4: async () => ['203.0.113.1'], resolve6: async () => [] };
@@ -123,6 +126,51 @@ test('an API that answers an empty list is not trusted over the page', async () 
   assert.equal(found.source, 'docs.invidious.io + seed');
 });
 
+test('when the directory host is down the committed list is kept, said so, and nothing throws', async () => {
+  const warned = [];
+  const found = await refresh({
+    resolve: anywhere,
+    fetchImpl: async () => {
+      throw new TypeError('fetch failed', { cause: { code: 'ETIMEDOUT' } });
+    },
+    bundled: () => ({ source: 'api.invidious.io + seed', invidious: ['https://kept.example', ...SEED] }),
+    warn: (line) => warned.push(line),
+  });
+  assert.equal(found.source, 'api.invidious.io + seed', 'the source of the list kept, not a fresh claim');
+  assert.deepEqual(found.invidious, ['https://kept.example', ...SEED]);
+  assert.ok(warned.some((line) => /ETIMEDOUT/.test(line)), 'the reason is in the log');
+  assert.ok(warned.some((line) => /committed list/.test(line)));
+});
+
+test('with the directory down and no committed file, the seed is what is left', async () => {
+  const warned = [];
+  const found = await refresh({
+    resolve: anywhere,
+    fetchImpl: async () => {
+      throw new Error('fetch failed');
+    },
+    bundled: () => readBundled(join(tmpdir(), 'siphon-no-such-dir', 'instances.json')),
+    warn: (line) => warned.push(line),
+  });
+  assert.equal(found.source, 'seed');
+  assert.deepEqual(found.invidious, [...SEED]);
+  assert.ok(warned.some((line) => /the seed/.test(line)));
+});
+
+test('a committed file that does not parse, or holds no list, fails loudly instead of being replaced', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'siphon-instances-'));
+  const broken = join(dir, 'broken.json');
+  writeFileSync(broken, '{ "invidious": [');
+  assert.throws(() => readBundled(broken), SyntaxError);
+  const empty = join(dir, 'empty.json');
+  writeFileSync(empty, '{}');
+  assert.throws(() => readBundled(empty), /no invidious list/);
+  await assert.rejects(
+    () => refresh({ resolve: anywhere, fetchImpl: async () => '[]', bundled: () => readBundled(broken), warn: () => {} }),
+    SyntaxError,
+  );
+});
+
 test('a name whose only address is Yggdrasil is not on the internet, and is left out', async () => {
   const notFound = Object.assign(new Error('ENOTFOUND'), { code: 'ENOTFOUND' });
   const table = {
@@ -154,11 +202,17 @@ test('a name whose only address is Yggdrasil is not on the internet, and is left
   assert.ok(found.invidious.includes('https://inv.nadeko.net'));
 });
 
-test('nothing from either is an error, never an empty file', async () => {
-  await assert.rejects(
-    () => refresh({ resolve: anywhere, fetchImpl: async () => '<html></html>' }),
-    /not.*a single instance|neither/i,
-  );
+test('nothing from either keeps the committed list, never an empty file', async () => {
+  const warned = [];
+  const found = await refresh({
+    resolve: anywhere,
+    fetchImpl: async () => '<html></html>',
+    bundled: () => ({ source: 'docs.invidious.io + seed', invidious: ['https://kept.example'] }),
+    warn: (line) => warned.push(line),
+  });
+  assert.equal(found.source, 'docs.invidious.io + seed');
+  assert.deepEqual(found.invidious, ['https://kept.example', ...SEED]);
+  assert.ok(warned.some((line) => /neither the API nor the docs page/.test(line)), 'said, not silent');
 });
 
 /* ------------------------------------------------------------ measuring */

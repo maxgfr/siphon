@@ -186,8 +186,31 @@ export async function onTheInternet(url, resolve = dns) {
   return (v6 || []).some((address) => !/^[23][0-9a-f]{2}:/i.test(address));
 }
 
-/** Ask the API, then the page; say which one answered; the seed behind either. */
-export async function refresh({ fetchImpl = fetchText, resolve = dns } = {}) {
+/**
+ * The list committed last time, or null when there is no file to read. A
+ * file that is there but does not parse, or has no list in it, is a bug to
+ * see, not an outage to ride out, so it throws.
+ */
+export function readBundled(path = TARGET) {
+  let text;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch {
+    return null;
+  }
+  const bundled = JSON.parse(text);
+  if (!Array.isArray(bundled?.invidious) || typeof bundled?.source !== 'string') throw new Error(`${path} has no invidious list and source`);
+  return bundled;
+}
+
+const warnLine = (line) => console.warn(process.env.GITHUB_ACTIONS ? `::warning::${line}` : `warning: ${line}`);
+
+/**
+ * Ask the API, then the page; say which one answered; the seed behind either.
+ * Both are served by one host, so when it is down the list committed last
+ * time is kept, said so, and the Piped and cobalt measurement still runs.
+ */
+export async function refresh({ fetchImpl = fetchText, resolve = dns, bundled = readBundled, warn = warnLine } = {}) {
   let source = 'api.invidious.io';
   let list = [];
   try {
@@ -197,12 +220,22 @@ export async function refresh({ fetchImpl = fetchText, resolve = dns } = {}) {
   }
   if (list.length === 0) {
     source = 'docs.invidious.io';
-    list = fromDocsPage(await fetchImpl(DOCS_URL));
+    try {
+      list = fromDocsPage(await fetchImpl(DOCS_URL));
+    } catch (error) {
+      warn(`${DOCS_URL}: ${error?.cause?.code || error?.message || error}`);
+    }
   }
-  if (list.length === 0) throw new Error('neither the API nor the docs page listed a single instance');
+  let label = `${source} + seed`;
+  if (list.length === 0) {
+    const kept = bundled();
+    list = kept ? kept.invidious : [];
+    label = kept ? kept.source : 'seed';
+    warn(`neither the API nor the docs page listed a single instance; keeping ${kept ? `the committed list (${label})` : 'the seed'}`);
+  }
   const merged = unique([...list, ...SEED]);
   const reachableOnes = await Promise.all(merged.map((url) => onTheInternet(url, resolve)));
-  return { source: `${source} + seed`, invidious: merged.filter((_, i) => reachableOnes[i]) };
+  return { source: label, invidious: merged.filter((_, i) => reachableOnes[i]) };
 }
 
 /** Piped's directory, the seed behind it; a directory that is down costs only the directory. */
